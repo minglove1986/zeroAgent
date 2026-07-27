@@ -1,0 +1,124 @@
+openapi: 3.0.3
+info:
+  title: zeroAgent API
+  version: 0.7.3
+  description: |
+    机器可读契约骨架。完整语义以 docs/01-产品需求/API接口规范.md 为准。
+    硬约束：单租户；Agent 无 tool_ids；Web 对话 + 交互卡片；不做 OpenIM。
+servers:
+  - url: http://127.0.0.1:8000
+    description: 本地开发
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: 存活探针
+      operationId: getHealth
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    example: ok
+  /api/v1/conversations:
+    post:
+      tags: [conversations]
+      summary: 创建会话（Web 系统对话主入口）
+      operationId: createConversation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                agent_id:
+                  type: string
+                  description: 可空，空则智能路由
+                title:
+                  type: string
+      responses:
+        "201":
+          description: 已创建
+  /api/v1/messages/send:
+    post:
+      tags: [conversations]
+      summary: 发送消息（SSE 流式）
+      operationId: sendMessage
+      responses:
+        "200":
+          description: text/event-stream
+  /api/v1/messages/card-action:
+    post:
+      tags: [conversations]
+      summary: 提交交互卡片（Agent 提问/澄清等）并续跑
+      operationId: cardAction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [conversation_id, card_id, payload]
+              properties:
+                conversation_id:
+                  type: string
+                card_id:
+                  type: string
+                payload:
+                  type: object
+      responses:
+        "200":
+          description: 续跑结果或 SSE
+  /api/v1/documents/upload:
+    post:
+      tags: [documents]
+      summary: Web 上传 → OSS → Celery
+      operationId: uploadDocument
+      responses:
+        "200":
+          description: 已受理
+  /api/v1/agents:
+    post:
+      tags: [agents]
+      summary: 创建 Agent（禁止一等 tool_ids）
+      operationId: createAgent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentCreate"
+      responses:
+        "201":
+          description: 已创建
+        "422":
+          description: 含 tool_ids 等非法字段
+components:
+  schemas:
+    AgentCreate:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        skill_ids:
+          type: array
+          items:
+            type: string
+        kb_ids:
+          type: array
+          items:
+            type: string
+        callable_agent_ids:
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+      description: 不得包含 tool_ids

@@ -1,0 +1,23 @@
+# zeroAgent — Python / 本地 / IDE
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.env
+deploy/.env
+.data/
+*.log
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.codegraph/
