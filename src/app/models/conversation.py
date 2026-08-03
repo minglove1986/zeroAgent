@@ -1,7 +1,7 @@
 """会话 / 消息 / 交互卡片模型。
 
 @author 赵振明
-@date 2026-07-21 16:39:22
+@date 2026-07-30 11:21:08
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ class Conversation(Base):
     agent_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     title: Mapped[str | None] = mapped_column(String(200), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="active")
+    # 会话级选用的 model_name；空则走系统/Agent 默认
+    selected_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
     total_prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

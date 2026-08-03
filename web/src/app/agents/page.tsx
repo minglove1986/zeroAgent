@@ -36,6 +36,7 @@ export default function AgentsPage() {
   const [agentName, setAgentName] = useState("HR助手");
   const [memoryAccess, setMemoryAccess] = useState("all");
   const [canModifyMemory, setCanModifyMemory] = useState(false);
+  const [inheritSystemPersona, setInheritSystemPersona] = useState(true);
   const [fallbackModels, setFallbackModels] = useState("");
   const [templates, setTemplates] = useState<
     { id: string; name: string; status: string; variables_schema?: { name: string; required: boolean; label: string }[] }[]
@@ -118,6 +119,7 @@ export default function AgentsPage() {
           skill_ids: selectedSkillIds,
           memory_access: memoryAccess,
           can_modify_memory: canModifyMemory,
+          inherit_system_persona: inheritSystemPersona,
           fallback_model_ids: fallbackModels
             .split(",")
             .map((s) => s.trim())
@@ -290,6 +292,23 @@ export default function AgentsPage() {
                 onChange={(e) => setCanModifyMemory(e.target.checked)}
               />
               can_modify_memory（允许对话后自动写入用户记忆，默认关）
+            </label>
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                marginBottom: "1rem",
+                color: "var(--muted)",
+                fontSize: "0.9rem",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={inheritSystemPersona}
+                onChange={(e) => setInheritSystemPersona(e.target.checked)}
+              />
+              继承系统人格（管理后台「系统人格」提示词，默认开）
             </label>
             <div style={{ marginBottom: "1rem" }}>
               <div style={{ color: "var(--muted)", fontSize: "0.85rem", marginBottom: 8 }}>

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from collections.abc import AsyncIterator
 from typing import Annotated, Any, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -27,9 +28,14 @@ from app.modules.conversation.context_blocks import (
     build_turn_context_blocks,
     label_third_party_observation,
 )
+from app.modules.conversation.process_narration import (
+    StageId,
+    iter_stage_enter,
+    iter_stage_leave,
+)
 from app.modules.intent.rules import _match_doc_analyze, match_l2_rules
 from app.modules.knowledge.lookup import parse_rag_query, run_kb_lookup
-from app.modules.llm.lc_chat import get_chat_model
+from app.modules.llm.gateway import get_chat_model
 
 PlanStepKind = Literal["rag_search", "execute_skill", "call_agent", "respond"]
 
@@ -65,10 +71,24 @@ class AgentState(TypedDict, total=False):
     usage: dict[str, Any]
     max_steps: int
     context_system: str
+    llm_model: str | None
 
 
 def _runtime_ctx(config: RunnableConfig) -> dict[str, Any]:
     return dict(config.get("configurable") or {})
+
+
+def _resolve_llm_model(state: AgentState, config: RunnableConfig) -> str | None:
+    """从状态或 configurable 取本轮会话选定模型。
+
+    @author 赵振明
+    @date 2026-07-30 13:03:49
+    """
+    name = state.get("llm_model")
+    if name:
+        return str(name)
+    ctx_name = _runtime_ctx(config).get("llm_model")
+    return str(ctx_name) if ctx_name else None
 
 
 def _new_step_id() -> str:
@@ -226,12 +246,17 @@ async def _plan_with_llm(
     *,
     skill_catalog: list[dict[str, Any]],
     max_steps: int,
+    model: str | None = None,
 ) -> list[PlanStep]:
-    """真模型 JSON 计划；非法 JSON 降级单步 respond。"""
-    model = get_chat_model()
+    """真模型 JSON 计划；非法 JSON 降级单步 respond。
+
+    @author 赵振明
+    @date 2026-07-30 13:03:49
+    """
+    chat = get_chat_model(model=model)
     sys_prompt = _planner_system_prompt(skill_catalog)
     try:
-        ai = await model.ainvoke(
+        ai = await chat.ainvoke(
             [
                 SystemMessage(content=sys_prompt),
                 HumanMessage(content=user_content),
@@ -268,7 +293,10 @@ async def _node_plan(state: AgentState, config: RunnableConfig) -> dict[str, Any
         plan = _normalize_plan_steps(raw_steps, skill_catalog=catalog, max_steps=max_steps)
     else:
         plan = await _plan_with_llm(
-            user_content, skill_catalog=catalog, max_steps=max_steps
+            user_content,
+            skill_catalog=catalog,
+            max_steps=max_steps,
+            model=_resolve_llm_model(state, config),
         )
 
     return {
@@ -328,6 +356,7 @@ async def _execute_skill_step(
         department_ids=ctx.get("department_ids"),
         role_ids=ctx.get("role_ids"),
         is_platform_admin=bool(ctx.get("is_platform_admin")),
+        model=str(ctx.get("llm_model") or state.get("llm_model") or "") or None,
     )
     obs = str(result.get("answer") or "")
     if result.get("error"):
@@ -361,8 +390,8 @@ async def _execute_respond(state: AgentState, step: PlanStep) -> str:
     if preset:
         return preset
     user_content = str(args.get("query") or state.get("user_content") or "")
-    model = get_chat_model()
-    ai = await model.ainvoke(
+    chat = get_chat_model(model=str(state.get("llm_model") or "") or None)
+    ai = await chat.ainvoke(
         [
             SystemMessage(content=_respond_system_content(state)),
             HumanMessage(content=user_content),
@@ -477,7 +506,7 @@ async def _node_aggregate(state: AgentState, config: RunnableConfig) -> dict[str
         answer = "\n\n".join(parts) + cite_hint
         return {"final_answer": answer.strip(), "ok": True}
 
-    model = get_chat_model()
+    model = get_chat_model(model=str(state.get("llm_model") or "") or None)
     context_system = str(state.get("context_system") or "").strip()
     boundary = (
         context_system
@@ -569,7 +598,44 @@ async def load_agent_skill_catalog(
     return catalog
 
 
-async def run_plan_execute(
+_KIND_TO_STAGE: dict[str, StageId] = {
+    "rag_search": "retrieve",
+    "execute_skill": "skill",
+    "call_agent": "skill",
+    "respond": "respond",
+}
+
+
+def _skill_display_name(
+    catalog: list[dict[str, Any]],
+    skill_id: str | None,
+) -> str | None:
+    """从目录取技能展示名。"""
+    if not skill_id:
+        return None
+    for item in catalog:
+        if str(item.get("id") or "") == str(skill_id):
+            return str(item.get("name") or skill_id)
+    return str(skill_id)
+
+
+def _build_plan_result(final: dict[str, Any]) -> dict[str, Any]:
+    """将图终态整理为对外 result。"""
+    result: dict[str, Any] = {
+        "ok": bool(final.get("ok", True)) and not final.get("error"),
+        "answer": str(final.get("final_answer") or ""),
+        "citations": list(final.get("citations") or []),
+        "plan": list(final.get("plan") or []),
+    }
+    if final.get("deferred_card"):
+        result["deferred_card"] = dict(final["deferred_card"])
+    if final.get("error"):
+        result["error"] = str(final["error"])
+        result["ok"] = False
+    return result
+
+
+async def stream_plan_execute(
     *,
     db: AsyncSession,
     agent_id: str,
@@ -581,11 +647,12 @@ async def run_plan_execute(
     is_platform_admin: bool = False,
     max_steps: int | None = None,
     memory_access: str = "all",
-) -> dict[str, Any]:
-    """执行 Plan-Execute 主图并返回结构化结果。
+    model: str | None = None,
+) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    """流式执行 Plan-Execute：yield stage/thought_delta，最后 yield (__result__, result)。
 
     @author 赵振明
-    @date 2026-07-27 10:06:11
+    @date 2026-07-30 13:03:49
     """
     settings = get_settings()
     catalog = await load_agent_skill_catalog(db, agent_id)
@@ -598,47 +665,154 @@ async def run_plan_execute(
             user_id=user_id,
             conversation_id=conversation_id,
             memory_access=memory_access,
+            agent_id=agent_id,
         )
         context_system = "\n\n".join(blocks.system_sections())
 
-    graph = get_plan_execute_graph()
-    final = await graph.ainvoke(
-        {
-            "agent_id": agent_id,
-            "user_id": user_id,
-            "user_content": user_content,
-            "skill_catalog": catalog,
-            "plan": [],
-            "plan_cursor": 0,
-            "citations": [],
-            "final_answer": "",
-            "max_steps": steps_cap,
-            "context_system": context_system,
-        },
-        config={
-            "configurable": {
-                "db": db,
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "agent_id": agent_id,
-                "department_ids": department_ids,
-                "role_ids": role_ids,
-                "is_platform_admin": is_platform_admin,
-                "memory_access": memory_access,
-                "context_system": context_system,
-            }
-        },
-    )
-
-    result: dict[str, Any] = {
-        "ok": bool(final.get("ok", True)) and not final.get("error"),
-        "answer": str(final.get("final_answer") or ""),
-        "citations": list(final.get("citations") or []),
-        "plan": list(final.get("plan") or []),
+    llm_model = str(model).strip() if model else None
+    initial: dict[str, Any] = {
+        "agent_id": agent_id,
+        "user_id": user_id,
+        "user_content": user_content,
+        "skill_catalog": catalog,
+        "plan": [],
+        "plan_cursor": 0,
+        "citations": [],
+        "final_answer": "",
+        "max_steps": steps_cap,
+        "context_system": context_system,
+        "llm_model": llm_model,
     }
-    if final.get("deferred_card"):
-        result["deferred_card"] = dict(final["deferred_card"])
-    if final.get("error"):
-        result["error"] = str(final["error"])
-        result["ok"] = False
+    config: RunnableConfig = {
+        "configurable": {
+            "db": db,
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "agent_id": agent_id,
+            "department_ids": department_ids,
+            "role_ids": role_ids,
+            "is_platform_admin": is_platform_admin,
+            "memory_access": memory_access,
+            "context_system": context_system,
+            "llm_model": llm_model,
+        }
+    }
+
+    for item in iter_stage_enter("understand"):
+        yield item
+    for item in iter_stage_leave("understand", ok=True):
+        yield item
+
+    for item in iter_stage_enter("plan"):
+        yield item
+
+    graph = get_plan_execute_graph()
+    final_state: dict[str, Any] = dict(initial)
+    saw_respond_stage = False
+    plan_left = False
+
+    async for update in graph.astream(initial, config=config, stream_mode="updates"):
+        if not isinstance(update, dict):
+            continue
+        for node_name, partial in update.items():
+            if isinstance(partial, dict):
+                final_state.update(partial)
+
+            if node_name == "plan":
+                if not plan_left:
+                    for item in iter_stage_leave("plan", ok=True):
+                        yield item
+                    plan_left = True
+                continue
+
+            if node_name == "execute":
+                if not plan_left:
+                    for item in iter_stage_leave("plan", ok=True):
+                        yield item
+                    plan_left = True
+                plan = list(final_state.get("plan") or [])
+                cursor = int(final_state.get("plan_cursor") or 0)
+                if cursor <= 0 or cursor > len(plan):
+                    continue
+                step = dict(plan[cursor - 1] or {})
+                kind = str(step.get("kind") or "")
+                stage_id = _KIND_TO_STAGE.get(kind)
+                if stage_id is None:
+                    continue
+                ok = str(step.get("status") or "") != "failed"
+                skill_name = None
+                if stage_id == "skill":
+                    skill_name = _skill_display_name(
+                        catalog, step.get("skill_id")  # type: ignore[arg-type]
+                    )
+                if stage_id == "respond":
+                    saw_respond_stage = True
+                for item in iter_stage_enter(stage_id, skill_name=skill_name):
+                    yield item
+                for item in iter_stage_leave(
+                    stage_id, ok=ok, skill_name=skill_name
+                ):
+                    yield item
+                continue
+
+            if node_name == "aggregate":
+                if not plan_left:
+                    for item in iter_stage_leave("plan", ok=True):
+                        yield item
+                    plan_left = True
+                if not saw_respond_stage:
+                    for item in iter_stage_enter("respond"):
+                        yield item
+                    agg_ok = not bool(final_state.get("error"))
+                    for item in iter_stage_leave("respond", ok=agg_ok):
+                        yield item
+                    saw_respond_stage = True
+
+    if not plan_left:
+        for item in iter_stage_leave("plan", ok=True):
+            yield item
+
+    yield ("__result__", _build_plan_result(final_state))
+
+
+async def run_plan_execute(
+    *,
+    db: AsyncSession,
+    agent_id: str,
+    user_content: str,
+    user_id: str | None = None,
+    conversation_id: str | None = None,
+    department_ids: list[str] | None = None,
+    role_ids: list[str] | None = None,
+    is_platform_admin: bool = False,
+    max_steps: int | None = None,
+    memory_access: str = "all",
+    model: str | None = None,
+) -> dict[str, Any]:
+    """执行 Plan-Execute 主图并返回结构化结果。
+
+    @author 赵振明
+    @date 2026-07-30 13:03:49
+    """
+    result: dict[str, Any] = {
+        "ok": False,
+        "answer": "",
+        "citations": [],
+        "plan": [],
+    }
+    async for ev, data in stream_plan_execute(
+        db=db,
+        agent_id=agent_id,
+        user_content=user_content,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        department_ids=department_ids,
+        role_ids=role_ids,
+        is_platform_admin=is_platform_admin,
+        max_steps=max_steps,
+        memory_access=memory_access,
+        model=model,
+    ):
+        if ev == "__result__":
+            result = data
     return result

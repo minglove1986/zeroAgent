@@ -32,6 +32,8 @@ class Agent(Base):
     prompt_template_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # Prompt 变量插值：Agent 自定义键值 JSON
     variables_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 运行时是否继承系统人格提示词（非创建时拷贝）
+    inherit_system_persona: Mapped[int] = mapped_column(Integer, default=1)
     created_by: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 

@@ -19,7 +19,7 @@ from typing_extensions import TypedDict
 
 from app.core.config import get_settings
 from app.models.agent import Skill, SkillTool
-from app.modules.llm.lc_chat import get_chat_model
+from app.modules.llm.gateway import get_chat_model
 from app.modules.tool.executor import (
     execute_builtin_tool,
     execute_builtin_tool_async,
@@ -93,9 +93,14 @@ def _tool_call_records(ai_msg: AIMessage) -> list[dict[str, Any]]:
 
 
 async def _node_reason(state: SkillReactState, config: RunnableConfig) -> dict[str, Any]:
-    """调用 LLM（bind_tools）产生下一步 assistant 消息。"""
+    """调用 LLM（bind_tools）产生下一步 assistant 消息。
+
+    @author 赵振明
+    @date 2026-07-30 13:03:49
+    """
     tools = list(state.get("openai_tools") or [])
-    model = get_chat_model().bind_tools(tools)
+    llm_name = _runtime_ctx(config).get("llm_model")
+    model = get_chat_model(model=str(llm_name) if llm_name else None).bind_tools(tools)
     messages = list(state.get("messages") or [])
     try:
         ai_msg = await model.ainvoke(messages)
@@ -268,11 +273,12 @@ async def run_skill_react(
     department_ids: list[str] | None = None,
     role_ids: list[str] | None = None,
     is_platform_admin: bool = False,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """执行单个技能内的 ReAct 小循环。
 
     @author 赵振明
-    @date 2026-07-27 09:12:46
+    @date 2026-07-30 13:03:49
     """
     _ = conversation_id  # P1 接 card-action 恢复时使用
     skill = await db.get(Skill, skill_id)
@@ -315,6 +321,7 @@ async def run_skill_react(
                 "department_ids": department_ids,
                 "role_ids": role_ids,
                 "is_platform_admin": is_platform_admin,
+                "llm_model": str(model).strip() if model else None,
             }
         },
     )

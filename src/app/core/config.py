@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     kb_chunk_overlap: int = 100
     memory_summary_char_threshold: int = 12000
     memory_dedupe_threshold: float = 0.9
+    memory_extract_idle_seconds: int = 180
+    memory_extract_window_turns: int = 12
 
     openim_api_url: str = ""
     openim_secret: str = ""
@@ -71,8 +73,16 @@ class Settings(BaseSettings):
     # Plan-Execute 主图最大计划步数
     agent_plan_max_steps: int = 5
 
-    # 上下文窗口展示上限（tokens，对齐 PRD 滑动窗口）
+    # 上下文窗口展示上限（tokens，对齐 PRD 滑动窗口；目录缺窗时回落）
     context_window_tokens: int = 8000
+
+    # 上下文摘要压缩（相对模型窗口 + 回合后异步）
+    context_compress_trigger_ratio: float = 0.75
+    context_compress_target_ratio: float = 0.15
+    context_compress_target_max: int = 2000
+    context_compress_keep_recent_turns: int = 4
+    context_compress_model: str = ""
+    context_compress_dedup_seconds: int = 60
 
     # 文档理解子图 token 预算（DocAnalyze LangGraph）
     doc_analyze_context_tokens: int = 8000

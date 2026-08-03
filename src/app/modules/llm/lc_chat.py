@@ -1,13 +1,14 @@
-"""LangChain Chat 统一入口（经 LiteLLM Proxy）。
+"""LangChain Chat 底层工厂（仅供 LlmGateway 内部使用）。
 
-本模块禁止直接使用 httpx 调用 chat completions。
+业务请经 ``app.modules.llm.gateway.get_chat_model``；禁止直接使用 httpx。
 
 @author 赵振明
-@date 2026-07-27 09:03:03
+@date 2026-07-30 11:15:53
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from langchain_core.callbacks import (
@@ -20,6 +21,8 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_openai import ChatOpenAI
 
 from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 def _litellm_openai_base_url(proxy_url: str) -> str:
@@ -72,6 +75,7 @@ def get_chat_model(*, model: str | None = None) -> BaseChatModel:
     """返回 LangChain Chat 模型；MOCK_EXTERNAL 时不发真实网络请求。"""
     settings = get_settings()
     use_model = model or settings.litellm_model
+    logger.info("llm.get_chat_model model=%s", use_model)
 
     if settings.mock_external:
         return _MockChatModel()

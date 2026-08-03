@@ -46,17 +46,19 @@ async def run_doc_analyze(
     task: TaskKindArg = "summarize",
     query: str = "",
     user_id: str | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """执行整篇文档理解；仅允许 published 且未软删文档。
 
     @author 赵振明
-    @date 2026-07-27 09:07:52
+    @date 2026-07-30 13:20:41
     """
     _ = user_id  # P0 仅校验 Document.status；完整 KB 权限后续对齐 kb_lookup
     doc, chunks, load_err = await _load_published_doc(db, doc_id)
     if load_err:
         return {"ok": False, "error": load_err, "citations": []}
 
+    llm_model = str(model).strip() if model else None
     graph = get_doc_analyze_graph()
     final = await graph.ainvoke(
         {
@@ -65,8 +67,9 @@ async def run_doc_analyze(
             "query": query or "",
             "title": doc.title if doc else "",
             "chunks": chunks,
+            "llm_model": llm_model,
         },
-        config={"configurable": {"db": db}},
+        config={"configurable": {"db": db, "llm_model": llm_model}},
     )
     if final.get("error"):
         return {

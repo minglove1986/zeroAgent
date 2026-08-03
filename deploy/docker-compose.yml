@@ -61,6 +61,24 @@ services:
       timeout: 10s
       retries: 8
 
+  # LiteLLM Admin UI 专用库（与业务 MySQL 分离；Prisma/Postgres）
+  litellm-db:
+    image: postgres:15
+    container_name: zeroagent-litellm-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${LITELLM_DB_NAME:-litellm}
+      POSTGRES_USER: ${LITELLM_DB_USER:-litellm}
+      POSTGRES_PASSWORD: ${LITELLM_DB_PASSWORD:-litellmpass}
+    volumes:
+      - ${DOCKER_DATA_DIR:-D:/dockers/zeroagent}/litellm-pg:/var/lib/postgresql/data
+    # 不映射宿主机端口，仅 compose 内网访问
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LITELLM_DB_USER:-litellm} -d ${LITELLM_DB_NAME:-litellm}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   litellm:
     image: ghcr.io/berriai/litellm:main-latest
     container_name: zeroagent-litellm
@@ -69,18 +87,26 @@ services:
       - "4000:4000"
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-litellm-dev}
+      # Admin UI 必需：独立 Postgres（切勿复用业务 MySQL DATABASE_URL）
+      DATABASE_URL: postgresql://${LITELLM_DB_USER:-litellm}:${LITELLM_DB_PASSWORD:-litellmpass}@litellm-db:5432/${LITELLM_DB_NAME:-litellm}
+      STORE_MODEL_IN_DB: ${LITELLM_STORE_MODEL_IN_DB:-True}
+      UI_USERNAME: ${LITELLM_UI_USERNAME:-admin}
+      UI_PASSWORD: ${LITELLM_UI_PASSWORD:-sk-litellm-dev}
       MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
       MINIMAX_API_BASE: ${MINIMAX_API_BASE:-https://api.minimaxi.com/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     volumes:
       - ./litellm/config.yaml:/app/config.yaml:ro
     command: ["--config", "/app/config.yaml", "--port", "4000"]
+    depends_on:
+      litellm-db:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4000/health/liveliness"]
       interval: 15s
       timeout: 5s
       retries: 10
-      start_period: 30s
+      start_period: 60s
 
   # 可选：无线上 OSS 时启动
   minio-biz:
@@ -150,6 +176,65 @@ services:
       - etcd
       - minio-milvus
 
+  # 业务 API（固定宿主机 :8000；一键部署入口）
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: zeroagent-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      PYTHONPATH: /app/src
+      # 容器内必须用 compose 服务名，覆盖 .env 里的 127.0.0.1
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-zeroagent}:${RABBITMQ_PASSWORD:-rabbitpass}@rabbitmq:5672//
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redispass}@redis:6379/0
+      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-zeroagent}:${MYSQL_PASSWORD:-zeropass}@mysql:3306/${MYSQL_DATABASE:-zeroagent}
+      LITELLM_PROXY_URL: http://litellm:4000
+      MOCK_EXTERNAL: ${MOCK_EXTERNAL:-false}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      litellm:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+
+  # ========== 管理后台 (独立 Next.js 应用) ==========
+  admin_web:
+    build:
+      context: ..
+      dockerfile: admin-web/Dockerfile
+    container_name: zeroagent-admin-web
+    restart: unless-stopped
+    ports:
+      - "3001:3000"  # 宿主机:容器
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      NEXT_PUBLIC_API_PROXY_TARGET: http://api:8000  # 内部 compose 服务名
+      # 前端自身不需要 Python 变量，但可注入用于调试
+      NODE_ENV: production
+    # Note: Session Cookie 跨域问题 – 前后端同域名不同端口需设置 SameSite=None;Secure(生产用 HTTPS)
+    # 开发环境可通过浏览器禁用 SameSite 或使用反向代理统一域名
+
   worker:
     build:
       context: ..
@@ -163,6 +248,7 @@ services:
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-zeroagent}:${RABBITMQ_PASSWORD:-rabbitpass}@rabbitmq:5672//
       REDIS_URL: redis://:${REDIS_PASSWORD:-redispass}@redis:6379/0
       DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-zeroagent}:${MYSQL_PASSWORD:-zeropass}@mysql:3306/${MYSQL_DATABASE:-zeroagent}
+      LITELLM_PROXY_URL: http://litellm:4000
       MOCK_EXTERNAL: ${MOCK_EXTERNAL:-false}
     command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
     depends_on:
@@ -185,6 +271,7 @@ services:
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-zeroagent}:${RABBITMQ_PASSWORD:-rabbitpass}@rabbitmq:5672//
       REDIS_URL: redis://:${REDIS_PASSWORD:-redispass}@redis:6379/0
       DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-zeroagent}:${MYSQL_PASSWORD:-zeropass}@mysql:3306/${MYSQL_DATABASE:-zeroagent}
+      LITELLM_PROXY_URL: http://litellm:4000
       MOCK_EXTERNAL: ${MOCK_EXTERNAL:-false}
     command: celery -A app.workers.celery_app beat --loglevel=info
     depends_on:

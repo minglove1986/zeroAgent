@@ -39,3 +39,21 @@ def test_meta_reply_is_l2_chitchat() -> None:
     d2 = match_l2_rules("我怎么是尹庆为？")
     assert d2 is not None
     assert d2.intent == "chitchat"
+
+
+def test_ambiguous_utterances_defer_to_l3() -> None:
+    """含糊说法 L2 不得短路；显式口令 / 词典实体仍可 L2。"""
+    for q in (
+        "我是谁",
+        "我到底是谁啊",
+        "你知道我是谁吗",
+        "我的名字是什么",
+        "你是谁？",
+        "我的资料呢",
+    ):
+        assert match_l2_rules(q) is None, q
+
+    explicit = match_l2_rules("查知识库：差旅报销")
+    assert explicit is not None
+    assert explicit.intent == "kb_lookup"
+    assert explicit.reason == "explicit_kb_prefix"

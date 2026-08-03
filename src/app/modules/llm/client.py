@@ -1,12 +1,16 @@
-"""LiteLLM Proxy 客户端（业务禁止直连厂商）。
+"""LiteLLM Proxy HTTP 客户端（仅供 LlmGateway 内部使用）。
+
+业务模块禁止直接 import 本模块的 ``stream_*`` / ``chat_*``；
+请统一经 ``app.modules.llm.gateway``。本模块亦禁止直连厂商 API。
 
 @author 赵振明
-@date 2026-07-22 10:15:31
+@date 2026-07-30 11:15:53
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from typing import Any, AsyncIterator
 
@@ -17,6 +21,8 @@ from app.modules.llm.tokens import (
     estimate_turn_usage,
     parse_litellm_usage,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _tools_result(
@@ -51,6 +57,7 @@ async def stream_chat_completion(
     """
     settings = get_settings()
     use_model = model or settings.litellm_model
+    logger.info("llm.stream_chat model=%s", use_model)
 
     if settings.mock_external:
         # 单测：模型名以 fail 开头则模拟上游失败
@@ -196,6 +203,7 @@ async def chat_completion_with_tools(
     """
     settings = get_settings()
     use_model = model or settings.litellm_model
+    logger.info("llm.chat_with_tools model=%s", use_model)
     tool_names = {
         (t.get("function") or {}).get("name")
         for t in tools
@@ -397,6 +405,7 @@ async def chat_completion_json(
     """非流式补全，返回完整文本（供记忆 JSON 抽取）。"""
     settings = get_settings()
     use_model = model or settings.litellm_model
+    logger.info("llm.chat_json model=%s", use_model)
 
     if settings.mock_external:
         return "[]"

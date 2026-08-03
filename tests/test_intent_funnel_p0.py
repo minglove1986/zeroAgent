@@ -1,10 +1,12 @@
 """意图漏斗 P0：规则判定测试。
 
 @author 赵振明
-@date 2026-07-23 16:40:50
+@date 2026-07-27 12:04:56
 """
 
 from __future__ import annotations
+
+import pytest
 
 from app.modules.intent.funnel import evaluate_intent_funnel
 
@@ -36,13 +38,31 @@ def test_weather_is_chitchat() -> None:
     assert d.confidence < 0.75
 
 
-def test_person_career_company_is_kb() -> None:
-    d = evaluate_intent_funnel("帮我搜索赵世龙曾经在职的公司")
+def test_person_career_company_defers_l2_then_l3_kb() -> None:
+    """含糊「在职公司」问法：L2 不猜；同步漏斗无 L3 时回落闲聊属预期。
+
+    完整链路见 async：由 L3 Mock/真模型判为 kb_lookup。
+    """
+    from app.modules.intent.rules import match_l2_rules
+
+    assert match_l2_rules("帮我搜索赵世龙曾经在职的公司") is None
+
+
+@pytest.mark.asyncio
+async def test_person_career_company_l3_is_kb(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MOCK_EXTERNAL", "true")
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+    from app.modules.intent.funnel import evaluate_intent_funnel_async
+
+    d = await evaluate_intent_funnel_async("帮我搜索赵世龙曾经在职的公司")
     assert d.intent == "kb_lookup"
     assert d.confidence >= 0.75
     assert "赵世龙" in d.query
     filters = (d.slots or {}).get("filters") or {}
     assert "hr.resume" in (filters.get("category_codes") or [])
+    get_settings.cache_clear()
 
 
 def test_kb_search_zhao_shilong_is_kb() -> None:

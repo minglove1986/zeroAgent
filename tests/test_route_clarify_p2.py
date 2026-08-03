@@ -70,7 +70,7 @@ async def test_mid_conf_emits_route_clarify_card(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "app.modules.conversation.runtime.evaluate_intent_funnel_async",
+        "app.modules.conversation.route.evaluate_intent_funnel_async",
         AsyncMock(
             return_value=IntentDecision(
                 intent="route_clarify",
@@ -113,7 +113,7 @@ async def test_kb_confirm_chitchat_skips_rag(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "app.modules.conversation.runtime.evaluate_intent_funnel_async",
+        "app.modules.conversation.route.evaluate_intent_funnel_async",
         AsyncMock(
             return_value=IntentDecision(
                 intent="route_clarify",
@@ -159,7 +159,7 @@ async def test_kb_confirm_lookup_hits_d14_without_docs(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "app.modules.conversation.runtime.evaluate_intent_funnel_async",
+        "app.modules.conversation.route.evaluate_intent_funnel_async",
         AsyncMock(
             return_value=IntentDecision(
                 intent="route_clarify",

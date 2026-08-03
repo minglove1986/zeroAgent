@@ -99,7 +99,12 @@ async def list_long_memories(
 
 
 def build_memory_system_prompt(memories: list[UserMemory]) -> str:
-    """注入 System Prompt 的用户记忆块（PRD 15.7）。"""
+    """注入 System Prompt 的用户记忆块（仅白名单 field_key）。"""
+    from app.modules.memory.extract_catalog_cache import allowed_field_keys
+
+    allowed = allowed_field_keys()
+    if allowed:
+        memories = [m for m in memories if str(m.memory_key) in allowed]
     if not memories:
         return ""
     prefs = [m for m in memories if m.memory_type == "preference"]
@@ -163,24 +168,27 @@ async def upsert_memory(
 
 
 def parse_auto_extract_rules(text: str) -> list[dict[str, Any]]:
-    """MOCK / 轻量规则抽取（含可选 summary）。"""
+    """MOCK / 轻量规则抽取（仅白名单 key）。"""
+    from app.modules.memory.extract_catalog_cache import allowed_field_keys
+
+    allowed = allowed_field_keys()
     found: list[dict[str, Any]] = []
-    if "我叫" in text:
+    if "我叫" in text and "display_name" in allowed:
         idx = text.find("我叫")
         name = text[idx + 2 : idx + 20].split("，")[0].split("。")[0].split(" ")[0].strip()
         if name:
             found.append(
-                {"memory_type": "fact", "memory_key": "name", "memory_value": name}
+                {"memory_type": "fact", "memory_key": "display_name", "memory_value": name}
             )
-    if "以后请" in text or "请用" in text or "习惯" in text:
+    if ("以后请" in text or "请用" in text or "习惯" in text) and "brevity" in allowed:
         found.append(
             {
                 "memory_type": "preference",
-                "memory_key": "style",
+                "memory_key": "brevity",
                 "memory_value": text.strip()[:200],
             }
         )
-    if "我是" in text and "部门" in text:
+    if "我是" in text and "部门" in text and "department" in allowed:
         idx = text.find("我是")
         dept = text[idx + 2 : idx + 40].split("，")[0].split("。")[0].strip()
         if dept:
@@ -191,11 +199,31 @@ def parse_auto_extract_rules(text: str) -> list[dict[str, Any]]:
                     "memory_value": dept,
                 }
             )
-    _maybe_append_summary(text, found)
+    if ("爱好" in text or "喜欢" in text) and "hobby" in allowed:
+        found.append(
+            {
+                "memory_type": "fact",
+                "memory_key": "hobby",
+                "memory_value": text.strip()[:200],
+                "confidence": 0.7,
+            }
+        )
+    _maybe_append_summary(text, found, allowed)
     return found
 
 
-def _maybe_append_summary(text: str, found: list[dict[str, Any]]) -> None:
+def _maybe_append_summary(
+    text: str,
+    found: list[dict[str, Any]],
+    allowed: set[str] | None = None,
+) -> None:
+    """仅当白名单启用 conv_digest 且超阈值时追加摘要。"""
+    if allowed is None:
+        from app.modules.memory.extract_catalog_cache import allowed_field_keys
+
+        allowed = allowed_field_keys()
+    if "conv_digest" not in allowed:
+        return
     threshold = get_settings().memory_summary_char_threshold
     if len(text) < threshold:
         return
@@ -214,15 +242,30 @@ def _maybe_append_summary(text: str, found: list[dict[str, Any]]) -> None:
     )
 
 
-_EXTRACT_SYSTEM = """你是用户记忆抽取器。从用户话语中提取事实(fact)、偏好(preference)；
-当对话很长时也可生成一条摘要(summary，memory_key=conv_digest)。
-只输出 JSON 数组，不要 Markdown，不要解释。无信息输出 []。
-每项字段：memory_type, memory_key, memory_value, confidence(0~1)。
-memory_type 只能是 fact、preference 或 summary。"""
+def _build_extract_system_prompt() -> str:
+    """按白名单组装抽取 system prompt。"""
+    from app.modules.memory.extract_catalog_cache import get_extract_fields_catalog
+
+    fields = get_extract_fields_catalog()
+    lines = [
+        "你是用户记忆抽取器。只抽取下列白名单字段；禁止发明其它 memory_key。",
+        "只输出 JSON 数组，不要 Markdown。无信息输出 []。",
+        "每项字段：memory_type, memory_key, memory_value, confidence(0~1)。",
+        "memory_type 必须与字段 category 一致（fact|preference|summary）。",
+        "禁止抽取第三人名、知识库检索意图、纠正/否定话术。",
+        "允许字段：",
+    ]
+    for f in fields:
+        lines.append(
+            f"- {f.get('field_key')} ({f.get('category')}): {f.get('label')} — {f.get('description')}"
+        )
+    return "\n".join(lines)
 
 
 def parse_memory_json(raw: str) -> list[dict[str, Any]]:
-    """解析 LLM 返回的记忆 JSON；非法则返回空列表。"""
+    """解析 LLM 返回的记忆 JSON；非法或非白名单 key 丢弃。"""
+    from app.modules.memory.extract_catalog_cache import allowed_field_keys, get_extract_fields_catalog
+
     text = (raw or "").strip()
     if not text:
         return []
@@ -245,19 +288,26 @@ def parse_memory_json(raw: str) -> list[dict[str, Any]]:
             return []
     if not isinstance(data, list):
         return []
+    allowed = allowed_field_keys()
+    cat_by_key = {
+        str(f.get("field_key")): str(f.get("category"))
+        for f in get_extract_fields_catalog()
+        if f.get("field_key")
+    }
     out: list[dict[str, Any]] = []
     for item in data:
         if not isinstance(item, dict):
             continue
-        mtype = str(item.get("memory_type") or "").strip()
-        if mtype not in {"fact", "preference", "summary"}:
-            continue
         key = str(item.get("memory_key") or "").strip()
         value = str(item.get("memory_value") or "").strip()
-        if not key or not value:
+        if not key or not value or key not in allowed:
             continue
-        if mtype == "summary" and not key:
-            key = "conv_digest"
+        mtype = str(item.get("memory_type") or cat_by_key.get(key) or "").strip()
+        if mtype not in {"fact", "preference", "summary"}:
+            continue
+        expect = cat_by_key.get(key)
+        if expect and mtype != expect:
+            mtype = expect
         conf = item.get("confidence", 0.8)
         try:
             confidence = float(conf)
@@ -274,8 +324,16 @@ def parse_memory_json(raw: str) -> list[dict[str, Any]]:
     return out
 
 
-async def extract_memories_from_transcript(transcript: str) -> list[dict[str, Any]]:
-    """编排：Mock 用规则；真模型走 LLM JSON，失败回落规则；补 summary。"""
+async def extract_memories_from_transcript(
+    transcript: str,
+    *,
+    model: str | None = None,
+) -> list[dict[str, Any]]:
+    """编排：Mock 用规则；真模型走白名单 LLM JSON，失败回落规则。
+
+    @author 赵振明
+    @date 2026-07-30 13:20:41
+    """
     text = (transcript or "").strip()
     if not text:
         return []
@@ -283,15 +341,16 @@ async def extract_memories_from_transcript(transcript: str) -> list[dict[str, An
     if settings.mock_external:
         return parse_auto_extract_rules(text)
 
-    from app.modules.llm import client as llm_client
+    from app.modules.llm.gateway import chat_json
 
     items: list[dict[str, Any]] = []
     try:
-        raw = await llm_client.chat_completion_json(
+        raw = await chat_json(
             messages=[
-                {"role": "system", "content": _EXTRACT_SYSTEM},
+                {"role": "system", "content": _build_extract_system_prompt()},
                 {"role": "user", "content": text},
-            ]
+            ],
+            model=model,
         )
         items = parse_memory_json(raw)
     except Exception:  # noqa: BLE001
@@ -299,7 +358,9 @@ async def extract_memories_from_transcript(transcript: str) -> list[dict[str, An
     if not items:
         items = parse_auto_extract_rules(text)
     else:
-        _maybe_append_summary(text, items)
+        from app.modules.memory.extract_catalog_cache import allowed_field_keys
+
+        _maybe_append_summary(text, items, allowed_field_keys())
     return items
 
 

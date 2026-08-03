@@ -60,9 +60,36 @@ def test_intent_person_emits_hr_resume_filter() -> None:
 
 
 def test_intent_policy_emits_hr_policy() -> None:
-    d = evaluate_intent_funnel("差旅报销怎么报？")
+    """制度问法由 L3 判 kb 后，filters 应带 hr.policy（不再靠 L2 模糊政策正则）。"""
+    from app.modules.intent.decision import IntentDecision
+
+    d = IntentDecision(
+        intent="kb_lookup",
+        confidence=0.75,
+        funnel_layer="L3",
+        query="差旅报销怎么报？",
+        reason="policy_doc",
+        features=["mock:policy_doc"],
+    )
     filters = build_retrieval_filters(d)
     assert "hr.policy" in filters.get("category_codes", [])
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_policy_question_uses_l3(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MOCK_EXTERNAL", "true")
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+    from app.modules.intent.funnel import evaluate_intent_funnel_async
+    from app.modules.intent.rules import match_l2_rules
+
+    assert match_l2_rules("差旅报销怎么报？") is None
+    d = await evaluate_intent_funnel_async("差旅报销怎么报？")
+    assert d.intent == "kb_lookup"
+    filters = build_retrieval_filters(d)
+    assert "hr.policy" in filters.get("category_codes", [])
+    get_settings.cache_clear()
 
 
 def test_soft_fallback_drops_metadata_keeps_category() -> None:

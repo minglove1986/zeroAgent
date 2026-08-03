@@ -1,7 +1,7 @@
-"""L3 轻量意图分类：LiteLLM JSON / Mock 回落。
+"""意图分类器 L3：LiteLLM JSON / fixture Mock。
 
 @author 赵振明
-@date 2026-07-24 09:51:45
+@date 2026-07-27 12:32:32
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import re
 from typing import Any
 
 from app.modules.intent.decision import IntentDecision
+from app.modules.intent.l3_fixtures import lookup_l3_fixture
 
 _VALID_INTENTS = frozenset(
     {
@@ -32,21 +33,12 @@ intent 枚举：kb_lookup | ask_user_form | skill_task | call_agent | route_clar
 - 制度/报销/差旅/规范询问 → kb_lookup
 - 请假/休假 → ask_user_form
 - 闲聊/天气/问候 → chitchat
+- 用户问自己是谁/自己叫什么/自己的身份 → chitchat，禁止 kb_lookup
+- 用户纠正/否定上轮行为（如「我没让你总结」「不要总结」）→ chitchat，禁止 kb_lookup / doc 任务
+- 拿不准是否查库时 confidence 取 0.5~0.7，intent 可用 route_clarify 或 kb_lookup（由 L4 出澄清卡）
 - 禁止编造 citation 或工具调用
 - confidence 不确定时取 0.5~0.7
 """
-
-# Mock：软人物检索（L2 未覆盖的说法）
-_MOCK_SOFT_PERSON = re.compile(
-    r"(?:搜|搜索|查|找|看看|了解|介绍|说说|讲讲)(?:一下|下)?\s*"
-    r"([\u4e00-\u9fff]{2,4})"
-    r"|([\u4e00-\u9fff]{2,4})"
-    r"(?:这个人|这位同事|同事|的情况|背景|资料|简历|怎么样|如何)"
-)
-
-_MOCK_LEAVE = re.compile(r"(请假|休假|年假|调休|事假|病假)")
-_MOCK_POLICY = re.compile(r"(制度|规章|规范|报销|差旅|入职|离职)")
-_MOCK_CHITCHAT = re.compile(r"(天气|你好|您好|哈哈|聊聊|讲个笑话)")
 
 
 def _clamp_conf(v: Any, default: float = 0.5) -> float:
@@ -101,21 +93,10 @@ def parse_intent_json(raw: str) -> IntentDecision | None:
     )
 
 
-def _mock_person_query(text: str) -> str | None:
-    m = _MOCK_SOFT_PERSON.search(text)
-    if not m:
-        return None
-    name = (m.group(1) or m.group(2) or "").strip()
-    # 排除口语助词被当成姓名
-    if name in {"一下", "什么", "怎么", "如何", "今天", "明天", "天气", "这个", "那个"}:
-        return None
-    return name or None
-
-
 def classify_intent_mock(text: str, *, recent_summary: str = "") -> IntentDecision:
-    """Mock 分类器：覆盖 L2 未命中的软问法；单测与 MOCK_EXTERNAL 使用。"""
+    """Mock 分类器：仅黄金用例表；未命中回落低置信闲聊（禁止软正则冒充 L3）。"""
     raw = (text or "").strip()
-    _ = recent_summary  # 预留上下文，P1 Mock 暂不用
+    _ = recent_summary
     if not raw:
         return IntentDecision(
             intent="chitchat",
@@ -123,61 +104,20 @@ def classify_intent_mock(text: str, *, recent_summary: str = "") -> IntentDecisi
             funnel_layer="L3",
             query="",
             reason="empty",
-            features=["mock:empty"],
+            features=["mock:fixture_miss", "mock:empty"],
         )
 
-    if _MOCK_LEAVE.search(raw):
-        return IntentDecision(
-            intent="ask_user_form",
-            confidence=0.85,
-            funnel_layer="L3",
-            query=raw,
-            reason="leave_request",
-            features=["mock:leave_request"],
-            slots={"form": "leave"},
-        )
-
-    # 闲聊优先于软人物，避免「今天天气怎么样」误进 kb
-    if _MOCK_CHITCHAT.search(raw):
-        return IntentDecision(
-            intent="chitchat",
-            confidence=0.7,
-            funnel_layer="L3",
-            query=raw,
-            reason="chitchat",
-            features=["mock:chitchat"],
-        )
-
-    name = _mock_person_query(raw)
-    if name:
-        return IntentDecision(
-            intent="kb_lookup",
-            confidence=0.8,
-            funnel_layer="L3",
-            query=name,
-            reason="person_dossier",
-            features=["mock:person_dossier", "llm:kb_lookup"],
-        )
-
-    if _MOCK_POLICY.search(raw) and (
-        "怎么" in raw or "如何" in raw or "什么" in raw or "？" in raw or "?" in raw
-    ):
-        return IntentDecision(
-            intent="kb_lookup",
-            confidence=0.75,
-            funnel_layer="L3",
-            query=raw,
-            reason="policy_doc",
-            features=["mock:policy_doc", "llm:kb_lookup"],
-        )
+    hit = lookup_l3_fixture(raw)
+    if hit is not None:
+        return hit
 
     return IntentDecision(
         intent="chitchat",
-        confidence=0.35,
+        confidence=0.3,
         funnel_layer="L3",
         query=raw,
-        reason="fallback_chitchat",
-        features=["mock:fallback"],
+        reason="fixture_miss",
+        features=["mock:fixture_miss"],
     )
 
 
@@ -186,8 +126,9 @@ async def classify_intent_l3(
     *,
     recent_summary: str = "",
     kb_names: list[str] | None = None,
+    model: str | None = None,
 ) -> IntentDecision:
-    """L3 分类：Mock 短路；真模型 JSON；失败回落 chitchat 0.3。"""
+    """L3 分类：Mock fixture；真模型 JSON；失败回落 chitchat 0.3。"""
     raw = (text or "").strip()
     from app.core.config import get_settings
 
@@ -195,7 +136,7 @@ async def classify_intent_l3(
     if settings.mock_external:
         return classify_intent_mock(raw, recent_summary=recent_summary)
 
-    from app.modules.llm import client as llm_client
+    from app.modules.llm.gateway import chat_json
 
     user_parts = [f"用户消息：{raw}"]
     if recent_summary.strip():
@@ -204,11 +145,12 @@ async def classify_intent_l3(
         user_parts.append("可访问知识库：" + "、".join(kb_names[:20]))
 
     try:
-        out = await llm_client.chat_completion_json(
+        out = await chat_json(
             messages=[
                 {"role": "system", "content": _L3_SYSTEM},
                 {"role": "user", "content": "\n".join(user_parts)},
-            ]
+            ],
+            model=model,
         )
         parsed = parse_intent_json(out)
         if parsed is not None:

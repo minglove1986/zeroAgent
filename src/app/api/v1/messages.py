@@ -21,12 +21,14 @@ from app.core.actor import get_actor, is_department_admin, is_platform_admin
 from app.core.response import fail, ok
 from app.models.conversation import Conversation, Message, MessageCard, MessageFeedback
 from app.modules.conversation.runtime import (
+    cancel_pending_cards,
     has_pending_required_card,
     stream_after_card_action,
     stream_mock_reply,
 )
 from app.modules.knowledge.permissions import load_user_department_ids
-from app.modules.llm.model_chain import resolve_agent_model_chain
+from app.modules.llm.gateway import llm_gateway
+from app.modules.llm.model_resolve import ModelResolveError
 from app.modules.llm.tokens import estimate_messages_tokens
 from app.modules.memory.service import load_short_memory, resolve_agent_memory_policy
 from app.modules.usage.redact import redact_text
@@ -34,6 +36,25 @@ from app.shared.db import get_db
 from app.core.config import get_settings
 
 router = APIRouter(prefix="/api/v1", tags=["messages"])
+
+
+async def _resolve_model_ids(
+    db: AsyncSession, conv: Conversation | None
+) -> list[str] | JSONResponse:
+    """经 Gateway 解析会话模型链；失败返回 400 JSONResponse。"""
+    target = conv
+    if target is None:
+
+        class _EmptyConv:
+            agent_id = None
+            selected_model = None
+
+        target = _EmptyConv()  # type: ignore[assignment]
+    try:
+        resolved = await llm_gateway.resolve_for_conversation(db, target)
+    except ModelResolveError as exc:
+        return JSONResponse(status_code=400, content=fail(40031, str(exc)))
+    return resolved.as_chain()
 
 
 class ConversationCreate(BaseModel):
@@ -44,6 +65,18 @@ class ConversationCreate(BaseModel):
 class MessageSend(BaseModel):
     conversation_id: str
     content: str
+    supersede_pending_card: bool = False
+
+
+class DismissCardBody(BaseModel):
+    """作废会话中 pending 交互卡。
+
+    @author 赵振明
+    @date 2026-07-30 14:41:54
+    """
+
+    conversation_id: str
+    card_id: str | None = None
 
 
 class CardAction(BaseModel):
@@ -93,11 +126,22 @@ async def list_conversations(
     user_id: str | None = None,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """对话列表。部门管理员：内容脱敏只读（D26）。"""
+    """对话列表。部门管理员：内容脱敏只读（D26）。已删除会话不返回。"""
     actor = get_actor(request)
-    stmt = select(Conversation).order_by(Conversation.updated_at.desc())
+    stmt = (
+        select(Conversation)
+        .where(Conversation.status == "active")
+        .order_by(Conversation.updated_at.desc())
+    )
+    # 普通用户只看自己的；平台管理员可传 user_id 或看全部
     if user_id:
+        if not is_platform_admin(actor) and user_id != actor.user_id:
+            return JSONResponse(
+                status_code=403, content=fail(40301, "cannot list other users")
+            )
         stmt = stmt.where(Conversation.user_id == user_id)
+    elif not is_platform_admin(actor):
+        stmt = stmt.where(Conversation.user_id == actor.user_id)
     convs = (await db.execute(stmt)).scalars().all()
     items: list[dict[str, Any]] = []
     for c in convs:
@@ -129,6 +173,26 @@ async def list_conversations(
     return ok({"items": items})
 
 
+@router.delete("/conversations/{conversation_id}", response_model=None)
+async def delete_conversation(
+    conversation_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict | JSONResponse:
+    """软删会话：status=deleted；仅本人或平台管理员。"""
+    actor = get_actor(request)
+    conv = await db.get(Conversation, conversation_id)
+    if conv is None or conv.status == "deleted":
+        return JSONResponse(status_code=404, content=fail(40401, "conversation not found"))
+    if conv.user_id != actor.user_id and not is_platform_admin(actor):
+        return JSONResponse(
+            status_code=403, content=fail(40301, "cannot delete others conversation")
+        )
+    conv.status = "deleted"
+    await db.commit()
+    return ok({"id": conversation_id, "deleted": True})
+
+
 @router.get("/conversations/{conversation_id}")
 async def get_conversation(
     conversation_id: str,
@@ -138,7 +202,7 @@ async def get_conversation(
     """单会话详情：消息 + 待答卡片（供前端切页后恢复）。"""
     actor = get_actor(request)
     conv = await db.get(Conversation, conversation_id)
-    if conv is None:
+    if conv is None or conv.status == "deleted":
         return JSONResponse(status_code=404, content=fail(40401, "conversation not found"))
 
     msgs = (
@@ -199,11 +263,21 @@ async def get_conversation(
         [{"role": t.get("role"), "content": t.get("content")} for t in short]
     )
     window = int(get_settings().context_window_tokens)
+    try:
+        resolved = await llm_gateway.resolve_for_conversation(db, conv)
+        if resolved.max_input_tokens and int(resolved.max_input_tokens) > 0:
+            window = int(resolved.max_input_tokens)
+    except ModelResolveError:
+        from app.modules.llm.model_resolve import resolve_window_tokens
+
+        window = resolve_window_tokens(getattr(conv, "selected_model", None))
 
     return ok(
         {
             "id": conv.id,
             "title": conv.title,
+            "agent_id": conv.agent_id,
+            "selected_model": getattr(conv, "selected_model", None),
             "messages": messages,
             "pending_cards": pending_cards,
             "feedbacks": feedback_map,
@@ -223,16 +297,27 @@ async def send_message(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    """发送用户消息（SSE）；所有权校验须在 supersede/cancel 之前。
+
+    @author 赵振明
+    @date 2026-07-30 15:07:46
+    """
     actor = get_actor(request)
     conv = await db.get(Conversation, body.conversation_id)
     if conv is None:
         return JSONResponse(status_code=404, content=fail(40401, "conversation not found"))
+    # 与 dismiss_card 一致：非主人且非平台管理员不得 send（含 supersede 作废卡）
+    if conv.user_id != actor.user_id and not is_platform_admin(actor):
+        return JSONResponse(status_code=403, content=fail(40301, "forbidden"))
 
     if await has_pending_required_card(db, body.conversation_id):
-        return JSONResponse(
-            status_code=422,
-            content=fail(42213, "pending required card; submit card-action first"),
-        )
+        if body.supersede_pending_card:
+            await cancel_pending_cards(db, conversation_id=body.conversation_id)
+        else:
+            return JSONResponse(
+                status_code=422,
+                content=fail(42213, "pending required card; submit card-action first"),
+            )
 
     db.add(
         Message(
@@ -248,7 +333,9 @@ async def send_message(
     memory_access, allow_memory_write = await resolve_agent_memory_policy(
         db, conv.agent_id
     )
-    model_ids = await resolve_agent_model_chain(db, conv.agent_id)
+    model_ids = await _resolve_model_ids(db, conv)
+    if isinstance(model_ids, JSONResponse):
+        return model_ids
     dept_ids = await load_user_department_ids(
         db, actor.user_id, extra_department_id=actor.department_id
     )
@@ -277,6 +364,29 @@ async def send_message(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post("/messages/dismiss-card")
+async def dismiss_card(
+    body: DismissCardBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """作废会话 pending 交互卡（可指定 card_id；幂等）。
+
+    @author 赵振明
+    @date 2026-07-30 14:41:54
+    """
+    actor = get_actor(request)
+    conv = await db.get(Conversation, body.conversation_id)
+    if conv is None:
+        return JSONResponse(status_code=404, content=fail(40401, "conversation not found"))
+    if conv.user_id != actor.user_id and not is_platform_admin(actor):
+        return JSONResponse(status_code=403, content=fail(40301, "forbidden"))
+    dismissed = await cancel_pending_cards(
+        db, conversation_id=body.conversation_id, card_id=body.card_id
+    )
+    return ok({"dismissed_ids": dismissed})
 
 
 @router.post("/messages/card-action")
@@ -316,6 +426,9 @@ async def card_action(
     dept_ids = await load_user_department_ids(
         db, actor.user_id, extra_department_id=actor.department_id
     )
+    model_ids = await _resolve_model_ids(db, conv)
+    if isinstance(model_ids, JSONResponse):
+        return model_ids
 
     return StreamingResponse(
         _sse_from_events(
@@ -329,6 +442,7 @@ async def card_action(
                 department_ids=dept_ids,
                 role_ids=[] if admin else [actor.role],
                 is_platform_admin=admin,
+                model_ids=model_ids,
             )
         ),
         media_type="text/event-stream",
@@ -380,12 +494,19 @@ async def submit_feedback(
     await db.commit()
     await db.refresh(row)
 
-    # P3：赞/踩校准意图阈值（失败忽略，不影响反馈落库）
+    # 副作用（阈值校准 / 差评通知）异步执行；投递失败不影响落库响应
     try:
-        meta_obj = json.loads(msg.meta_json) if msg.meta_json else {}
-        from app.modules.intent.thresholds import apply_feedback_from_message_meta
+        from app.workers.tasks.process_message_feedback import (
+            process_message_feedback_task,
+        )
 
-        apply_feedback_from_message_meta(rating=body.rating, meta=meta_obj)
+        process_message_feedback_task.delay(
+            row.id,
+            row.message_id,
+            row.rating,
+            row.user_id,
+            row.conversation_id,
+        )
     except Exception:  # noqa: BLE001
         pass
 
@@ -441,7 +562,9 @@ async def retry_message(
     memory_access, allow_memory_write = await resolve_agent_memory_policy(
         db, conv.agent_id if conv else None
     )
-    model_ids = await resolve_agent_model_chain(db, conv.agent_id if conv else None)
+    model_ids = await _resolve_model_ids(db, conv)
+    if isinstance(model_ids, JSONResponse):
+        return model_ids
     dept_ids = await load_user_department_ids(
         db, actor.user_id, extra_department_id=actor.department_id
     )

@@ -92,6 +92,7 @@ async def test_memory_access_none_skips_memory_block(db_session, seed_user):
         user_id=seed_user.id,
         conversation_id="c2",
         memory_access="none",
+        include_persona=False,
     )
     assert blocks.memory_text == ""
     joined = "\n".join(blocks.system_sections())
@@ -105,7 +106,7 @@ async def test_memory_access_all_includes_preference(db_session, seed_user):
         db_session,
         user_id=seed_user.id,
         memory_type="preference",
-        memory_key="reply_style",
+        memory_key="hobby",
         memory_value="简洁优先",
         source="manual",
     )
@@ -115,6 +116,7 @@ async def test_memory_access_all_includes_preference(db_session, seed_user):
         user_id=seed_user.id,
         conversation_id="c3",
         memory_access="all",
+        include_persona=False,
     )
     assert "简洁优先" in blocks.memory_text
 
@@ -162,7 +164,7 @@ async def test_execute_respond_uses_context_system(monkeypatch):
             captured.extend(messages)
             return AIMessage(content="ok")
 
-    monkeypatch.setattr(pe, "get_chat_model", lambda: FakeModel())
+    monkeypatch.setattr(pe, "get_chat_model", lambda **_k: FakeModel())
     state = {
         "user_content": "你好",
         "context_system": (
@@ -227,21 +229,24 @@ async def test_execute_skill_step_labels_third_party(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_stream_plan_execute_passes_memory_access(monkeypatch):
-    """runtime._stream_plan_execute 须把 memory_access 传给 run_agent_turn。"""
+    """runtime._stream_plan_execute 须把 memory_access 传给 stream_agent_turn。"""
     from app.modules.conversation import runtime as rt
 
     captured: dict = {}
 
-    async def fake_run_agent_turn(*_a, **kwargs):
+    async def fake_stream_agent_turn(*_a, **kwargs):
         captured.update(kwargs)
-        return {
-            "ok": True,
-            "answer": "你好",
-            "citations": [],
-            "plan": [{"kind": "respond"}],
-        }
+        yield (
+            "__result__",
+            {
+                "ok": True,
+                "answer": "你好",
+                "citations": [],
+                "plan": [{"kind": "respond"}],
+            },
+        )
 
-    monkeypatch.setattr(rt, "run_agent_turn", fake_run_agent_turn)
+    monkeypatch.setattr(rt, "stream_agent_turn", fake_stream_agent_turn)
 
     async def fake_persist(*_a, **_k):
         return ("msg_1", None)

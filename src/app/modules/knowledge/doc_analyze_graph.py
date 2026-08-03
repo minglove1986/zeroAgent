@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.models.knowledge import Document, DocumentChunk
-from app.modules.llm.lc_chat import get_chat_model
+from app.modules.llm.gateway import get_chat_model
 from app.modules.llm.tokens import estimate_tokens
 
 TaskKind = Literal["dump", "summarize", "critique"]
@@ -39,6 +39,7 @@ class DocAnalyzeState(TypedDict, total=False):
     citations: list[dict[str, Any]]
     stats: dict[str, Any]
     error: str | None
+    llm_model: str | None
 
 
 def _full_text(chunks: list[dict[str, Any]]) -> str:
@@ -105,14 +106,25 @@ def _task_user_prompt(*, task: TaskKind, title: str, body: str, query: str) -> s
     return f"{head}\n请总结以下文档：\n\n{body}"
 
 
-async def _llm_complete(*, task: TaskKind, title: str, body: str, query: str) -> str:
-    """单次 LLM 调用（仅经 get_chat_model）。"""
-    model = get_chat_model()
+async def _llm_complete(
+    *,
+    task: TaskKind,
+    title: str,
+    body: str,
+    query: str,
+    model: str | None = None,
+) -> str:
+    """单次 LLM 调用（仅经 get_chat_model；优先会话选定模型）。
+
+    @author 赵振明
+    @date 2026-07-30 13:20:41
+    """
+    chat = get_chat_model(model=model)
     messages = [
         SystemMessage(content=_task_system_prompt(task)),
         HumanMessage(content=_task_user_prompt(task=task, title=title, body=body, query=query)),
     ]
-    resp = await model.ainvoke(messages)
+    resp = await chat.ainvoke(messages)
     content = resp.content
     return content if isinstance(content, str) else str(content or "")
 
@@ -219,7 +231,13 @@ async def _node_single(state: DocAnalyzeState) -> dict[str, Any]:
     title = str(state.get("title") or "")
     query = str(state.get("query") or "")
     body = _full_text(state.get("chunks") or [])
-    answer = await _llm_complete(task=task, title=title, body=body, query=query)  # type: ignore[arg-type]
+    answer = await _llm_complete(
+        task=task,  # type: ignore[arg-type]
+        title=title,
+        body=body,
+        query=query,
+        model=str(state.get("llm_model") or "") or None,
+    )
     stats = dict(state.get("stats") or {})
     stats["mode"] = "single"
     return {"answer": answer, "stats": stats}
@@ -232,10 +250,17 @@ async def _node_map(state: DocAnalyzeState) -> dict[str, Any]:
     task = str(state.get("task") or "summarize")
     title = str(state.get("title") or "")
     query = str(state.get("query") or "")
+    llm_model = str(state.get("llm_model") or "") or None
     partials: list[str] = []
     for idx, seg in enumerate(state.get("segment_texts") or [], start=1):
         seg_title = f"{title}（第{idx}段）"
-        part = await _llm_complete(task=task, title=seg_title, body=seg, query=query)  # type: ignore[arg-type]
+        part = await _llm_complete(
+            task=task,  # type: ignore[arg-type]
+            title=seg_title,
+            body=seg,
+            query=query,
+            model=llm_model,
+        )
         partials.append(part)
     stats = dict(state.get("stats") or {})
     stats["mode"] = "map_reduce"
@@ -263,6 +288,7 @@ async def _node_reduce(state: DocAnalyzeState) -> dict[str, Any]:
         title=title,
         body=body,
         query=query or "请合并以上分段结果，给出完整回答",
+        model=str(state.get("llm_model") or "") or None,
     )
     stats = dict(state.get("stats") or {})
     stats["mode"] = "map_reduce"

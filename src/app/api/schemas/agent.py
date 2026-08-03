@@ -30,3 +30,4 @@ class AgentCreate(BaseModel):
     variables: dict[str, str] = Field(default_factory=dict)
     memory_access: MemoryAccess = "all"
     can_modify_memory: bool = False
+    inherit_system_persona: bool = True

@@ -1,7 +1,7 @@
 """对话运行时：记忆注入 + 技能 FC + Mock/真 LLM 流 + ask_user → 提问卡。
 
 @author 赵振明
-@date 2026-07-27 10:12:09
+@date 2026-07-27 12:42:37
 """
 
 from __future__ import annotations
@@ -15,12 +15,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.conversation import Conversation, Message, MessageCard
-from app.modules.agent.graph.build import run_agent_turn
+from app.modules.agent.graph.build import run_agent_turn, stream_agent_turn
 from app.modules.agent.skill_prompt import build_agent_skill_system_prompt
 from app.modules.agent.skill_tools import load_agent_openai_tools
-from app.modules.llm.client import (
-    chat_completion_with_tools,
-    stream_chat_completion_with_fallback,
+from app.modules.llm.gateway import (
+    chat_with_tools as chat_completion_with_tools,
+    stream_chat as stream_chat_completion_with_fallback,
 )
 from app.modules.llm.prompt_template import load_agent_prompt_template
 from app.modules.llm.tokens import (
@@ -32,11 +32,14 @@ from app.modules.conversation.context_blocks import (
     TurnContextBlocks,
     build_turn_context_blocks,
 )
+from app.modules.conversation.process_narration import (
+    iter_stage_enter,
+    iter_stage_leave,
+)
 from app.modules.memory.service import (
     append_short_memory,
-    extract_memories_from_transcript,
-    persist_extracted_memories,
 )
+from app.modules.conversation.route import resolve_route
 from app.modules.intent.funnel import evaluate_intent_funnel, evaluate_intent_funnel_async
 from app.modules.knowledge.lookup import parse_rag_query, run_kb_lookup
 from app.modules.knowledge.doc_analyze import run_doc_analyze
@@ -51,12 +54,27 @@ ASK_USER_TOOL = ASK_USER
 TZ_CN = timezone(timedelta(hours=8))
 
 
-def _context_info(messages: list[dict[str, Any]]) -> dict[str, Any]:
-    from app.core.config import get_settings
+def _context_info(
+    messages: list[dict[str, Any]],
+    *,
+    model_name: str | None = None,
+    window_tokens: int | None = None,
+) -> dict[str, Any]:
+    """估算当前 messages 占用，并附带当前应用模型的上下文窗。
 
+    @author 赵振明
+    @date 2026-07-30 13:36:32
+    """
+    from app.modules.llm.model_resolve import resolve_window_tokens
+
+    window = (
+        int(window_tokens)
+        if window_tokens is not None and int(window_tokens) > 0
+        else resolve_window_tokens(model_name)
+    )
     return {
         "tokens": estimate_messages_tokens(messages),
-        "window_tokens": int(get_settings().context_window_tokens),
+        "window_tokens": window,
     }
 
 
@@ -115,12 +133,25 @@ def mock_leave_ask_user_args() -> dict[str, Any]:
 
 
 def build_route_clarify_card(intent: Any) -> dict[str, Any]:
-    """路由澄清卡（不经 ask_user；D33 / PRD route_clarify）。"""
-    slots = getattr(intent, "slots", None) or {}
-    kind = str(slots.get("clarify_kind") or "agent_pick")
+    """路由澄清卡（不经 ask_user；D33 / PRD route_clarify）。
+
+    兼容 IntentDecision 与 RouteDecision。
+    """
+    slots = dict(getattr(intent, "slots", None) or {})
+    route_kind = getattr(intent, "kind", None)
+    if route_kind == "clarify_kb":
+        kind = "kb_confirm"
+    elif route_kind == "clarify_agent":
+        kind = "agent_pick"
+    else:
+        kind = str(slots.get("clarify_kind") or "agent_pick")
     query = str(getattr(intent, "query", "") or "")
     conf = float(getattr(intent, "confidence", 0.5) or 0.5)
-    candidates = list(getattr(intent, "agent_candidates", None) or [])
+    candidates = list(
+        getattr(intent, "agent_candidates", None)
+        or slots.get("agent_candidates")
+        or []
+    )
 
     if kind == "kb_confirm":
         title = "是否检索知识库？"
@@ -260,6 +291,39 @@ async def has_pending_required_card(db: AsyncSession, conversation_id: str) -> b
     return row is not None
 
 
+async def cancel_pending_cards(
+    db: AsyncSession,
+    *,
+    conversation_id: str,
+    card_id: str | None = None,
+) -> list[str]:
+    """将 pending 卡标为 cancelled；返回实际作废的 id 列表。
+
+    @author 赵振明
+    @date 2026-07-30 14:41:54
+    """
+    stmt = select(MessageCard).where(
+        MessageCard.conversation_id == conversation_id,
+        MessageCard.status == "pending",
+    )
+    if card_id:
+        stmt = stmt.where(MessageCard.id == card_id)
+    rows = list((await db.execute(stmt)).scalars().all())
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    ids: list[str] = []
+    for row in rows:
+        row.status = "cancelled"
+        row.submitted_at = now
+        row.result = json.dumps(
+            {"dismissed": True, "reason": "user_supersede"},
+            ensure_ascii=False,
+        )
+        ids.append(row.id)
+    if ids:
+        await db.commit()
+    return ids
+
+
 async def persist_assistant_and_card(
     db: AsyncSession,
     *,
@@ -309,19 +373,32 @@ async def _enqueue_extract(
     conversation_id: str,
     transcript: str,
     allow_memory_write: bool = True,
+    route_reason: str = "",
+    route_kind: str = "",
+    model_name: str | None = None,
 ) -> None:
-    """对话结束后抽取并落库。
+    """对话结束后异步调度记忆抽取与上下文压缩（禁止 await LLM）。
 
-    必须在请求内同步落库，避免仅依赖 Celery Worker 时「新对话失忆」。
-    conversation_id 保留供后续审计/异步补抽。
+    @author 赵振明
+    @date 2026-07-30 14:03:22
     """
-    if not allow_memory_write:
-        return
-    _ = conversation_id
-    items = await extract_memories_from_transcript(transcript)
-    if not items:
-        return
-    await persist_extracted_memories(db, user_id=user_id, items=items)
+    _ = db
+    from app.modules.conversation.compress_scheduler import schedule_context_compress
+    from app.modules.memory.extract_scheduler import schedule_memory_extract
+
+    schedule_memory_extract(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        transcript=transcript,
+        allow_memory_write=allow_memory_write,
+        route_reason=route_reason,
+        route_kind=route_kind,
+    )
+    schedule_context_compress(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        model_name=model_name,
+    )
 
 
 def _build_llm_messages(
@@ -330,23 +407,36 @@ def _build_llm_messages(
     tpl_block: str,
     skill_block: str,
     blocks: TurnContextBlocks,
+    model_name: str | None = None,
+    max_input_tokens: int | None = None,
+    max_output_tokens: int | None = None,
 ) -> list[dict[str, Any]]:
-    """用 TurnContextBlocks 组装 legacy/闲聊 LLM messages。
+    """用 TurnContextBlocks 组装 LLM messages，并按上下文窗优先级截断。
 
     短记忆切面：调用方若已在本轮 append_short_memory(user)，则 short_turns
     末条即当前用户句，须 short_turns[:-1] 再追加本轮 user，避免重复。
     """
-    llm_messages: list[dict[str, Any]] = [
-        {"role": "system", "content": sec} for sec in blocks.system_sections()
+    from app.modules.llm.context_budget import pack_turn_messages
+    from app.modules.llm.model_resolve import resolve_window_tokens
+
+    history = [
+        {"role": turn["role"], "content": turn["content"]}
+        for turn in (blocks.short_turns[:-1] if blocks.short_turns else [])
     ]
-    if tpl_block:
-        llm_messages.append({"role": "system", "content": tpl_block})
-    if skill_block:
-        llm_messages.append({"role": "system", "content": skill_block})
-    for turn in blocks.short_turns[:-1] if blocks.short_turns else []:
-        llm_messages.append({"role": turn["role"], "content": turn["content"]})
-    llm_messages.append({"role": "user", "content": user_content})
-    return llm_messages
+    extra = [b for b in (tpl_block, skill_block) if b]
+    win = max_input_tokens
+    if win is None or int(win) <= 0:
+        win = resolve_window_tokens(model_name)
+    packed = pack_turn_messages(
+        model_name=model_name or "default",
+        sections=blocks.system_sections(),
+        history=history,
+        user_content=user_content,
+        max_input_tokens=win,
+        max_output_tokens=max_output_tokens,
+        extra_system=extra,
+    )
+    return packed.messages
 
 
 async def _stream_skill_fc(
@@ -377,22 +467,30 @@ async def _stream_skill_fc(
         user_id=user_id,
         conversation_id=conversation_id,
         memory_access=memory_access,
+        agent_id=agent_id,
     )
     skill_block = await build_agent_skill_system_prompt(db, agent_id)
     tpl_block = await load_agent_prompt_template(db, agent_id, user_id=user_id)
+    primary = (model_ids or [None])[0]
+    primary = str(primary).strip() if primary else None
     llm_messages = _build_llm_messages(
         user_content=user_content,
         tpl_block=tpl_block,
         skill_block=skill_block,
         blocks=blocks,
+        model_name=primary,
     )
 
-    primary = (model_ids or [None])[0]
     max_rounds = max(1, int(get_settings().skill_fc_max_rounds))
     model_used: str | None = None
     tools_used: list[str] = []
     fc_rounds = 0
     usage_acc: dict[str, Any] | None = None
+
+    for item in iter_stage_enter("understand"):
+        yield item
+    for item in iter_stage_leave("understand", ok=True):
+        yield item
 
     for round_idx in range(1, max_rounds + 1):
         fc_rounds = round_idx
@@ -425,12 +523,16 @@ async def _stream_skill_fc(
         usage_acc = merge_usage(usage_acc, result.get("usage"))
         model_used = result.get("model") or model_used
         tool_calls = result.get("tool_calls") or []
-        ctx = _context_info(llm_messages)
+        ctx = _context_info(llm_messages, model_name=primary)
 
         if not tool_calls:
+            for item in iter_stage_enter("respond"):
+                yield item
             text = str(result.get("content") or "")
             for ch in text:
                 yield "content_delta", {"delta": ch}
+            for item in iter_stage_leave("respond", ok=True):
+                yield item
             meta = {**(msg_meta or {}), "usage": usage_acc, "context": ctx}
             msg_id, _ = await persist_assistant_and_card(
                 db,
@@ -461,21 +563,34 @@ async def _stream_skill_fc(
                 conversation_id=conversation_id,
                 transcript=user_content,
                 allow_memory_write=allow_memory_write,
+                model_name=primary,
             )
             return
 
         for tc in tool_calls:
+            tname = str(tc.get("name") or "")
+            if tname and tname != ASK_USER_TOOL:
+                for item in iter_stage_enter("skill", skill_name=tname):
+                    yield item
             yield "tool_call", {
                 "id": tc.get("id"),
                 "name": tc.get("name"),
                 "arguments": tc.get("arguments") or {},
                 "round": round_idx,
             }
-            if tc.get("name"):
-                tools_used.append(str(tc["name"]))
+            if tname:
+                tools_used.append(tname)
+            if tname and tname != ASK_USER_TOOL:
+                for item in iter_stage_leave("skill", ok=True, skill_name=tname):
+                    yield item
 
         ask = next((tc for tc in tool_calls if tc.get("name") == ASK_USER_TOOL), None)
         if ask is not None:
+            for item in iter_stage_enter("skill", skill_name="向用户提问"):
+                yield item
+            yield "thought_delta", {"delta": "需要你补充信息。"}
+            for item in iter_stage_leave("skill", ok=True, skill_name="向用户提问"):
+                yield item
             lead = str(result.get("content") or "请补充信息。")
             for ch in lead:
                 yield "content_delta", {"delta": ch}
@@ -584,6 +699,7 @@ async def _stream_skill_fc(
                 conversation_id=conversation_id,
                 transcript=user_content,
                 allow_memory_write=allow_memory_write,
+                model_name=primary,
             )
             return
 
@@ -601,9 +717,15 @@ async def _stream_plan_execute(
     department_ids: list[str] | None = None,
     role_ids: list[str] | None = None,
     is_platform_admin: bool = False,
+    model: str | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-    """Plan-Execute 主图 SSE：citations + answer + 可选 deferred_card。"""
-    result = await run_agent_turn(
+    """Plan-Execute 主图 SSE：过程事件 + citations + answer + 可选 deferred_card。
+
+    @author 赵振明
+    @date 2026-07-30 13:03:49
+    """
+    result: dict[str, Any] | None = None
+    async for ev, data in stream_agent_turn(
         db,
         agent_id,
         user_content,
@@ -613,13 +735,23 @@ async def _stream_plan_execute(
         role_ids=role_ids,
         is_platform_admin=is_platform_admin,
         memory_access=memory_access,
-    )
+        model=model,
+    ):
+        if ev == "__result__":
+            result = data
+            continue
+        yield ev, data
+
+    if result is None:
+        result = {"ok": False, "answer": "", "citations": [], "plan": [], "error": "empty_result"}
 
     plan = list(result.get("plan") or [])
     used_rag = any(str(s.get("kind") or "") == "rag_search" for s in plan)
     citations = list(result.get("citations") or [])
 
     if used_rag and not evaluate_rag_citation_gate(used_rag=True, citations=citations):
+        for item in iter_stage_leave("retrieve", ok=False):
+            yield item
         notice = "本轮检索未产生有效引用，已拒绝展示最终答案（D14）。"
         for ch in notice:
             yield "content_delta", {"delta": ch}
@@ -651,7 +783,7 @@ async def _stream_plan_execute(
     deferred_card = result.get("deferred_card")
     msgs = [{"role": "user", "content": user_content}]
     usage = estimate_turn_usage(msgs, answer)
-    ctx = _context_info(msgs)
+    ctx = _context_info(msgs, model_name=model)
     meta = {
         **(msg_meta or {}),
         "usage": usage,
@@ -698,7 +830,27 @@ async def _stream_plan_execute(
             conversation_id=conversation_id,
             transcript=user_content,
             allow_memory_write=allow_memory_write,
+            model_name=model,
         )
+
+
+def _build_recent_summary(*, user_id: str, conversation_id: str) -> str:
+    """近轮摘要供 L3：≤6 条，总长截断 500。"""
+    from app.modules.memory.service import load_short_memory
+
+    turns = load_short_memory(user_id=user_id, conversation_id=conversation_id)
+    # 去掉本轮刚 append 的 user，避免摘要自指
+    if turns and turns[-1].get("role") == "user":
+        turns = turns[:-1]
+    lines: list[str] = []
+    for t in turns[-6:]:
+        role = str(t.get("role") or "")
+        content = str(t.get("content") or "").strip().replace("\n", " ")
+        if not content:
+            continue
+        prefix = "user" if role == "user" else "assistant"
+        lines.append(f"{prefix}:{content[:120]}")
+    return "\n".join(lines)[:500]
 
 
 async def stream_mock_reply(
@@ -716,25 +868,71 @@ async def stream_mock_reply(
     role_ids: list[str] | None = None,
     is_platform_admin: bool = False,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-    """对话流：技能 FC / 记忆注入 / ask_user 捷径 / RAG / 普通 LLM。"""
+    """对话流：RouteResolver → Dispatcher（澄清 / System / Agent）。"""
     append_short_memory(
         user_id=user_id, conversation_id=conversation_id, role="user", content=user_content
     )
-    msg_meta = {"retry_of": retry_of} if retry_of else None
+    msg_meta: dict[str, Any] | None = {"retry_of": retry_of} if retry_of else None
     try:
         from app.modules.intent.lexicon import refresh_lexicon_if_stale
 
         await refresh_lexicon_if_stale(db)
     except Exception:  # noqa: BLE001
         pass
-    intent = await evaluate_intent_funnel_async(user_content)
-    intent_meta = intent.to_meta()
 
     from app.core.config import get_settings
 
     settings = get_settings()
+    summary = _build_recent_summary(user_id=user_id, conversation_id=conversation_id)
+    primary = None
+    if model_ids:
+        for mid in model_ids:
+            name = str(mid or "").strip()
+            if name:
+                primary = name
+                break
+    route = await resolve_route(
+        user_content,
+        agent_id=agent_id,
+        recent_summary=summary,
+        kb_names=None,
+        model=primary,
+    )
+    route_meta = route.to_meta()
+    msg_meta = {**(msg_meta or {}), **route_meta}
+
+    if route.handler == "clarify":
+        lead = "需要您确认一下意图，请选择："
+        for ch in lead:
+            yield "content_delta", {"delta": ch}
+        card = build_route_clarify_card(route)
+        msgs = [{"role": "user", "content": user_content}]
+        usage = estimate_turn_usage(msgs, lead)
+        ctx = _context_info(msgs, model_name=primary)
+        meta = {**(msg_meta or {}), "usage": usage, "context": ctx}
+        msg_id, _ = await persist_assistant_and_card(
+            db,
+            conversation_id=conversation_id,
+            assistant_text=lead,
+            card_payload=card,
+            meta=meta,
+        )
+        append_short_memory(
+            user_id=user_id, conversation_id=conversation_id, role="assistant", content=lead
+        )
+        yield "card", card
+        yield "message_end", {
+            "message_id": msg_id,
+            "status": "awaiting_card",
+            "path": "route_clarify",
+            "usage": usage,
+            "context": ctx,
+            **route_meta,
+        }
+        return
+
     tools = await load_agent_openai_tools(db, agent_id)
-    if agent_id and settings.agent_runtime == "langgraph":
+    if route.handler == "agent" and agent_id and settings.agent_runtime == "langgraph":
         async for ev in _stream_plan_execute(
             db,
             conversation_id=conversation_id,
@@ -747,11 +945,12 @@ async def stream_mock_reply(
             department_ids=department_ids,
             role_ids=role_ids,
             is_platform_admin=is_platform_admin,
+            model=primary,
         ):
             yield ev
         return
 
-    if agent_id and tools:
+    if route.handler == "agent" and agent_id and tools:
         async for ev in _stream_skill_fc(
             db,
             conversation_id=conversation_id,
@@ -770,15 +969,15 @@ async def stream_mock_reply(
             yield ev
         return
 
-    if intent.intent == "ask_user_form":
+    if route.kind == "ask_form":
         lead = "好的，请先确认请假类型。"
         for ch in lead:
             yield "content_delta", {"delta": ch}
         card = ask_user_to_card_payload(mock_leave_ask_user_args())
         msgs = [{"role": "user", "content": user_content}]
         usage = estimate_turn_usage(msgs, lead)
-        ctx = _context_info(msgs)
-        meta = {**(msg_meta or {}), "usage": usage, "context": ctx, **intent_meta}
+        ctx = _context_info(msgs, model_name=primary)
+        meta = {**(msg_meta or {}), "usage": usage, "context": ctx}
         msg_id, _ = await persist_assistant_and_card(
             db,
             conversation_id=conversation_id,
@@ -796,7 +995,7 @@ async def stream_mock_reply(
             "tool": ASK_USER_TOOL,
             "usage": usage,
             "context": ctx,
-            **intent_meta,
+            **route_meta,
         }
         await _enqueue_extract(
             db,
@@ -804,43 +1003,16 @@ async def stream_mock_reply(
             conversation_id=conversation_id,
             transcript=user_content,
             allow_memory_write=allow_memory_write,
+            route_reason=str(route.reason or ""),
+            route_kind=str(route.kind or ""),
+            model_name=primary,
         )
         return
 
-    if intent.intent == "route_clarify":
-        lead = "需要您确认一下意图，请选择："
-        for ch in lead:
-            yield "content_delta", {"delta": ch}
-        card = build_route_clarify_card(intent)
-        msgs = [{"role": "user", "content": user_content}]
-        usage = estimate_turn_usage(msgs, lead)
-        ctx = _context_info(msgs)
-        meta = {**(msg_meta or {}), "usage": usage, "context": ctx, **intent_meta}
-        msg_id, _ = await persist_assistant_and_card(
-            db,
-            conversation_id=conversation_id,
-            assistant_text=lead,
-            card_payload=card,
-            meta=meta,
-        )
-        append_short_memory(
-            user_id=user_id, conversation_id=conversation_id, role="assistant", content=lead
-        )
-        yield "card", card
-        yield "message_end", {
-            "message_id": msg_id,
-            "status": "awaiting_card",
-            "path": "route_clarify",
-            "usage": usage,
-            "context": ctx,
-            **intent_meta,
-        }
-        return
-
-    if intent.intent == "doc_analyze":
-        task = str((intent.slots or {}).get("task") or "summarize")
-        analyze_query = intent.query or user_content
-        doc_id = str((intent.slots or {}).get("doc_id") or "")
+    if route.kind == "doc_analyze":
+        task = str((route.slots or {}).get("task") or "summarize")
+        analyze_query = route.query or user_content
+        doc_id = str((route.slots or {}).get("doc_id") or "")
         if not doc_id:
             doc_id = await _resolve_doc_id_for_analyze(
                 db,
@@ -860,13 +1032,13 @@ async def stream_mock_reply(
                 conversation_id=conversation_id,
                 assistant_text=notice,
                 card_payload=None,
-                meta={**(msg_meta or {}), **intent_meta},
+                meta={**(msg_meta or {})},
             )
             yield "message_end", {
                 "message_id": msg_id,
                 "status": "doc_not_found",
                 "path": "doc_analyze",
-                **intent_meta,
+                **route_meta,
             }
             return
 
@@ -876,6 +1048,7 @@ async def stream_mock_reply(
             task=task,  # type: ignore[arg-type]
             query=analyze_query,
             user_id=user_id,
+            model=primary,
         )
         if not result.get("ok"):
             err = str(result.get("error") or "doc_analyze_failed")
@@ -887,13 +1060,13 @@ async def stream_mock_reply(
                 conversation_id=conversation_id,
                 assistant_text=notice,
                 card_payload=None,
-                meta={**(msg_meta or {}), **intent_meta},
+                meta={**(msg_meta or {})},
             )
             yield "message_end", {
                 "message_id": msg_id,
                 "status": "failed",
                 "path": "doc_analyze",
-                **intent_meta,
+                **route_meta,
             }
             return
 
@@ -907,13 +1080,13 @@ async def stream_mock_reply(
                 conversation_id=conversation_id,
                 assistant_text=notice,
                 card_payload=None,
-                meta={**(msg_meta or {}), **intent_meta},
+                meta={**(msg_meta or {})},
             )
             yield "message_end", {
                 "message_id": msg_id,
                 "status": "rejected_no_citation",
                 "reason": "D14",
-                **intent_meta,
+                **route_meta,
             }
             return
 
@@ -924,12 +1097,11 @@ async def stream_mock_reply(
             yield "content_delta", {"delta": ch}
         msgs = [{"role": "user", "content": user_content}]
         usage = estimate_turn_usage(msgs, answer)
-        ctx = _context_info(msgs)
+        ctx = _context_info(msgs, model_name=primary)
         meta = {
             **(msg_meta or {}),
             "usage": usage,
             "context": ctx,
-            **intent_meta,
             "doc_analyze_stats": result.get("stats"),
         }
         msg_id, _ = await persist_assistant_and_card(
@@ -948,7 +1120,7 @@ async def stream_mock_reply(
             "path": "doc_analyze",
             "usage": usage,
             "context": ctx,
-            **intent_meta,
+            **route_meta,
         }
         await _enqueue_extract(
             db,
@@ -956,79 +1128,59 @@ async def stream_mock_reply(
             conversation_id=conversation_id,
             transcript=user_content,
             allow_memory_write=allow_memory_write,
+            route_reason=str(route.reason or ""),
+            route_kind=str(route.kind or ""),
+            model_name=primary,
         )
         return
 
-    if intent.intent == "kb_lookup":
-        citations: list[dict[str, Any]] = []
-        if rag_stub_has_citation(user_content):
-            lookup = await run_kb_lookup(
-                db,
-                query=intent.query or parse_rag_query(user_content),
-                agent_id=agent_id,
-                top_k=5,
-                user_id=user_id,
-                department_ids=department_ids,
-                role_ids=role_ids,
-                is_platform_admin=is_platform_admin,
-                filters=(intent.slots or {}).get("filters"),
-            )
-            citations = list(lookup.get("citations") or [])
-        if not evaluate_rag_citation_gate(used_rag=True, citations=citations):
-            notice = "本轮检索未产生有效引用，已拒绝展示最终答案（D14）。"
-            for ch in notice:
-                yield "content_delta", {"delta": ch}
-            msg_id, _ = await persist_assistant_and_card(
-                db,
-                conversation_id=conversation_id,
-                assistant_text=notice,
-                card_payload=None,
-                meta={**(msg_meta or {}), **intent_meta},
-            )
-            yield "message_end", {
-                "message_id": msg_id,
-                "status": "rejected_no_citation",
-                "reason": "D14",
-                **intent_meta,
-            }
-            return
+    if route.kind == "kb_lookup":
+        from app.modules.conversation.handlers.kb_lookup import handle_system_kb_lookup
 
-        for c in citations:
-            yield "citation", c
-        # 无 LLM：用命中片段拼简答（D14 已有引用）
-        snippets = [str(c.get("snippet") or "") for c in citations if c.get("snippet")]
-        answer = "根据知识库：" + ("；".join(snippets[:3]) if snippets else "已找到相关条目。")
-        for ch in answer:
+        async for ev in handle_system_kb_lookup(
+            db,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            user_content=user_content,
+            route=route,
+            agent_id=agent_id,
+            department_ids=department_ids,
+            role_ids=role_ids,
+            is_platform_admin=is_platform_admin,
+            memory_access=memory_access,
+            allow_memory_write=allow_memory_write,
+            msg_meta=msg_meta,
+            model=primary,
+        ):
+            yield ev
+        return
+
+    if route.kind == "reject":
+        notice = "该请求暂时无法处理，请换一种说法或联系管理员。"
+        for ch in notice:
             yield "content_delta", {"delta": ch}
         msgs = [{"role": "user", "content": user_content}]
-        usage = estimate_turn_usage(msgs, answer)
-        ctx = _context_info(msgs)
-        meta = {**(msg_meta or {}), "usage": usage, "context": ctx, **intent_meta}
+        usage = estimate_turn_usage(msgs, notice)
+        ctx = _context_info(msgs, model_name=primary)
+        meta = {**(msg_meta or {}), "usage": usage, "context": ctx}
         msg_id, _ = await persist_assistant_and_card(
             db,
             conversation_id=conversation_id,
-            assistant_text=answer,
+            assistant_text=notice,
             card_payload=None,
             meta=meta,
         )
         append_short_memory(
-            user_id=user_id, conversation_id=conversation_id, role="assistant", content=answer
+            user_id=user_id, conversation_id=conversation_id, role="assistant", content=notice
         )
         yield "message_end", {
             "message_id": msg_id,
-            "status": "completed",
-            "path": "rag",
+            "status": "rejected",
+            "path": "reject",
             "usage": usage,
             "context": ctx,
-            **intent_meta,
+            **route_meta,
         }
-        await _enqueue_extract(
-            db,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            transcript=user_content,
-            allow_memory_write=allow_memory_write,
-        )
         return
 
     blocks = await build_turn_context_blocks(
@@ -1036,6 +1188,7 @@ async def stream_mock_reply(
         user_id=user_id,
         conversation_id=conversation_id,
         memory_access=memory_access,
+        agent_id=agent_id,
     )
     skill_block = await build_agent_skill_system_prompt(db, agent_id)
     tpl_block = await load_agent_prompt_template(db, agent_id, user_id=user_id)
@@ -1044,7 +1197,15 @@ async def stream_mock_reply(
         tpl_block=tpl_block,
         skill_block=skill_block,
         blocks=blocks,
+        model_name=primary,
     )
+
+    for item in iter_stage_enter("understand"):
+        yield item
+    for item in iter_stage_leave("understand", ok=True):
+        yield item
+    for item in iter_stage_enter("respond"):
+        yield item
 
     text_parts: list[str] = []
     model_used: str | None = None
@@ -1072,6 +1233,8 @@ async def stream_mock_reply(
                 text_parts.append(ch)
                 yield "content_delta", {"delta": ch}
     except Exception as exc:  # noqa: BLE001
+        for item in iter_stage_leave("respond", ok=False):
+            yield item
         reason = "llm_fallback_exhausted" if "fallback" in str(exc).lower() else "llm_upstream"
         notice = f"模型调用失败：{exc}"
         for ch in notice:
@@ -1090,6 +1253,9 @@ async def stream_mock_reply(
         }
         return
 
+    for item in iter_stage_leave("respond", ok=True):
+        yield item
+
     text = "".join(text_parts)
     replaced = sanitize_assistant_if_tool_leak(text)
     if replaced is not None:
@@ -1100,7 +1266,7 @@ async def stream_mock_reply(
         text = replaced
     if usage_acc is None:
         usage_acc = estimate_turn_usage(llm_messages, text)
-    ctx = _context_info(llm_messages)
+    ctx = _context_info(llm_messages, model_name=primary)
     meta_out = {**(msg_meta or {}), "usage": usage_acc, "context": ctx}
     msg_id, _ = await persist_assistant_and_card(
         db,
@@ -1117,6 +1283,7 @@ async def stream_mock_reply(
         "status": "completed",
         "usage": usage_acc,
         "context": ctx,
+        **route_meta,
     }
     if model_used:
         end_payload["model_used"] = model_used
@@ -1127,6 +1294,9 @@ async def stream_mock_reply(
         conversation_id=conversation_id,
         transcript=user_content,
         allow_memory_write=allow_memory_write,
+        route_reason=str(route.reason or ""),
+        route_kind=str(route.kind or ""),
+        model_name=primary,
     )
 
 
@@ -1141,10 +1311,22 @@ async def stream_after_card_action(
     department_ids: list[str] | None = None,
     role_ids: list[str] | None = None,
     is_platform_admin: bool = False,
+    model_ids: list[str] | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-    """卡片回传后续跑：请假确认 / 知识库澄清 / Agent 选择。"""
+    """卡片回传后续跑：请假确认 / 知识库澄清 / Agent 选择。
+
+    @author 赵振明
+    @date 2026-07-30 13:36:32
+    """
     selected = payload.get("selected_option_ids") or []
     choice = str(selected[0]) if selected else ""
+    primary: str | None = None
+    if model_ids:
+        for mid in model_ids:
+            name = str(mid or "").strip()
+            if name:
+                primary = name
+                break
 
     card_payload: dict[str, Any] = {}
     if card is not None and card.payload:
@@ -1209,7 +1391,7 @@ async def stream_after_card_action(
                 yield "content_delta", {"delta": ch}
             msgs = [{"role": "user", "content": query}]
             usage = estimate_turn_usage(msgs, answer)
-            ctx = _context_info(msgs)
+            ctx = _context_info(msgs, model_name=primary)
             meta_out = {**intent_meta, "usage": usage, "context": ctx}
             msg_id, _ = await persist_assistant_and_card(
                 db,

@@ -1,7 +1,7 @@
-"""对话轮次上下文分栏（身份 / 记忆 / 短记忆 / 来源边界）。
+"""对话轮次上下文分栏（安全 / 人格 / 身份 / 记忆 / 会话摘要 / 短记忆 / 来源边界）。
 
 @author 赵振明
-@date 2026-07-27 10:00:33
+@date 2026-07-30 14:03:22
 """
 
 from __future__ import annotations
@@ -12,11 +12,17 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.user import User
+from app.modules.conversation.context_compress import (
+    SUMMARY_PREFIX,
+    load_context_digest,
+)
 from app.modules.memory.service import (
     build_memory_system_prompt,
     list_long_memories,
     load_short_memory,
 )
+from app.modules.system.persona_store import get_persona_prompt_for_inject
+from app.modules.system.platform_safety import PLATFORM_SAFETY_RULE
 
 SOURCE_BOUNDARY_RULE = (
     "称呼与「当前用户是谁」只依据【当前用户身份】与【用户记忆】；"
@@ -35,13 +41,31 @@ class TurnContextBlocks:
     memory_text: str
     short_turns: list[dict[str, str]] = field(default_factory=list)
     boundary_text: str = SOURCE_BOUNDARY_RULE
+    persona_text: str | None = None
+    safety_text: str = PLATFORM_SAFETY_RULE
+    digest_text: str | None = None
 
     def system_sections(self) -> list[str]:
+        """按注入顺序：平台安全 → 人格 → 身份 → 记忆 → 会话摘要 → 边界。
+
+        @author 赵振明
+        @date 2026-07-30 14:03:22
+        """
         sections: list[str] = []
+        if self.safety_text:
+            sections.append(f"【平台安全】\n{self.safety_text}")
+        if self.persona_text:
+            sections.append("【系统人格】\n" + self.persona_text)
         if self.identity_text:
             sections.append(self.identity_text)
         if self.memory_text:
             sections.append(self.memory_text)
+        if self.digest_text:
+            text = self.digest_text.strip()
+            if text.startswith(SUMMARY_PREFIX):
+                sections.append(text)
+            else:
+                sections.append(f"{SUMMARY_PREFIX}\n{text}")
         if self.boundary_text:
             sections.append("【来源边界】\n" + self.boundary_text)
         return sections
@@ -63,8 +87,24 @@ async def build_turn_context_blocks(
     user_id: str,
     conversation_id: str,
     memory_access: str = "all",
+    include_persona: bool | None = None,
+    agent_id: str | None = None,
 ) -> TurnContextBlocks:
-    """每轮开聊前组装分栏上下文。"""
+    """每轮开聊前组装分栏上下文。
+
+    include_persona 显式优先；否则无 agent→True，有 agent→读 inherit_system_persona。
+    """
+    if include_persona is None:
+        if agent_id:
+            from app.models.agent import Agent
+
+            agent = await db.get(Agent, agent_id)
+            include_persona = True if agent is None else bool(
+                getattr(agent, "inherit_system_persona", 1)
+            )
+        else:
+            include_persona = True
+
     user = (
         await db.execute(select(User).where(User.id == user_id, User.deleted_at.is_(None)))
     ).scalar_one_or_none()
@@ -85,10 +125,19 @@ async def build_turn_context_blocks(
         if raw:
             memory_text = raw.replace("# 用户记忆（跨会话）", "【用户记忆】", 1)
 
-    short = load_short_memory(user_id=user_id, conversation_id=conversation_id)
+    digest = load_context_digest(user_id=user_id, conversation_id=conversation_id)
+    short_raw = load_short_memory(user_id=user_id, conversation_id=conversation_id)
+    short = [
+        t
+        for t in short_raw
+        if not str(t.get("content") or "").startswith(SUMMARY_PREFIX)
+    ]
+    persona_text = get_persona_prompt_for_inject(include=bool(include_persona))
     return TurnContextBlocks(
         identity_text=identity,
         memory_text=memory_text,
         short_turns=short,
         boundary_text=SOURCE_BOUNDARY_RULE,
+        persona_text=persona_text,
+        digest_text=digest,
     )

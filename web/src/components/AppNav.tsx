@@ -1,12 +1,13 @@
 /**
  * 控制台顶栏导航。
  * @author 赵振明
- * @date 2026-07-21 16:56:03
+ * @date 2026-07-29 16:29:19
  */
 "use client";
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { BrandMark } from "@/components/BrandMark";
 
 const LINKS = [
   { href: "/chat", label: "系统对话" },
@@ -33,7 +34,19 @@ export function AppNav() {
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: "1.25rem" }}>
-        <strong style={{ fontSize: "1.15rem" }}>zeroAgent</strong>
+        <Link
+          href="/chat"
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "0.55rem",
+            color: "inherit",
+            textDecoration: "none",
+          }}
+        >
+          <BrandMark size={28} priority />
+          <strong style={{ fontSize: "1.15rem" }}>zeroAgent</strong>
+        </Link>
         <nav style={{ display: "flex", gap: "0.85rem" }}>
           {LINKS.map((l) => {
             const active = pathname === l.href || pathname.startsWith(l.href + "/");

@@ -10,12 +10,12 @@
 
 | 项 | 值 |
 |---|---|
-| 更新时间 | 2026-07-27 10:17:05（东八区） |
-| 能力 | 上下文分栏（来源边界）Task1–4 已落地 |
-| 改动 | `build_turn_context_blocks`；Plan-Execute/legacy 分栏注入；RAG/技能第三人前缀；删症状 `_IDENTITY_GUARD`/`_RESPOND_SYSTEM` |
-| 测 | 上下文分栏回归 **23 passed**（boundary + plan_execute + chat_routing_hotfix + route_clarify_p2） |
-| 下一步 | 新开对话验证称呼与记忆偏好 |
-| 备注 | 规格 `2026-07-27-context-source-boundary-design.md` 已标「已实现」 |
+| 更新时间 | 2026-07-30 17:01:38（东八区） |
+| 能力 | 修复本机 Windows Celery prefork 崩溃 |
+| 改动 | `celery_app` Windows 默认 `worker_pool=solo`；`restart-dev.ps1 -WithCelery` 显式 `--pool=solo` |
+| 测 | 需关掉旧 zeroAgent-Celery 窗口后按下方命令重启 |
+| 下一步 | 重启 Celery 后复测反馈异步任务 |
+| 备注 | Docker Linux worker 仍用 prefork，不受影响 |
 
 ### 新会话开场（复制）
 
@@ -26,45 +26,239 @@
 ### 启动命令备忘
 
 ```powershell
-# 后端（必须用本机 Python3.12；当前临时 :8001，因 :8000 僵尸旧进程）
+# 一键 Docker 部署（api/worker/beat + 依赖；API 固定 :8000）
 cd D:\HermesWork\zeroAgent
-& "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" -m uvicorn app.main:app --app-dir src --reload --host 127.0.0.1 --port 8001
-# 前端代理：web/.env.local 中 API_PROXY_TARGET=http://127.0.0.1:8001
+.\scripts\deploy-docker.ps1
+# 可选：.\scripts\deploy-docker.ps1 -Full
+# 可选：.\scripts\deploy-docker.ps1 -Embed
+# 停止：.\scripts\deploy-docker.ps1 -Down
+
+# 本机热更新重启（API+Web 不在容器内开发时用）
+cd D:\HermesWork\zeroAgent
+.\scripts\restart-dev.ps1
+# 可选：.\scripts\restart-dev.ps1 -WithDeps
+# 可选：.\scripts\restart-dev.ps1 -WithCelery
+
+# 后端（必须用本机 Python3.12；固定 :8000，禁止随意改端口）
+cd D:\HermesWork\zeroAgent
+& "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" -m uvicorn app.main:app --app-dir src --reload --host 127.0.0.1 --port 8000
+# 前端代理：web/.env.local 中 API_PROXY_TARGET=http://127.0.0.1:8000
 
 # 前端
 cd D:\HermesWork\zeroAgent\web
 npm run dev
 
-# 依赖
+# 依赖（也可被 deploy-docker 一并拉起）
 cd D:\HermesWork\zeroAgent\deploy
 docker compose --env-file .env up -d mysql redis rabbitmq litellm
 
-# Milvus（profile full；需 .env 中 MILVUS_URI=http://127.0.0.1:19530）
-cd D:\HermesWork\zeroAgent\deploy
-docker compose --env-file .env --profile full up -d etcd minio-milvus milvus
-
-# Embedding/Rerank 独立服务（profile embed；默认 mock）
-cd D:\HermesWork\zeroAgent\deploy
-docker compose --env-file .env --profile embed up -d embed-rerank
-# 主仓 .env 增加：
-#   EMBED_SERVICE_URL=http://127.0.0.1:8088
-#   RERANK_SERVICE_URL=http://127.0.0.1:8088
-#   EMBED_DIM=512
-# 真模型（CPU）：compose 环境 EMBED_BACKEND=st EMBED_MODEL=BAAI/bge-small-zh-v1.5
-# （需在镜像内安装 sentence-transformers；换模型只改服务侧变量）
-
-# Celery Worker（本机）
+# 本机 Celery（Windows 必须 --pool=solo）
 cd D:\HermesWork\zeroAgent
-$env:PYTHONPATH="src"
-& "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" -m celery -A app.workers.celery_app worker --loglevel=info
-
-# Celery Beat（本机）
-& "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" -m celery -A app.workers.celery_app beat --loglevel=info
+$env:PYTHONPATH = "src"
+& "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" -m celery -A app.workers.celery_app worker --loglevel=info --pool=solo
 ```
 
 ---
 
 ## 断点日志（只追加）
+
+### 2026-07-30 17:01:38
+- 根因：本机 Windows Celery 默认 prefork → `tasks, accept, hostname = _loc` 解包失败；已改 solo（celery_app + restart-dev）；未 commit。
+
+### 2026-07-30 16:37:06
+- Web 登录页页脚居中增加内部版本号 `V0.0.1-B · 内部版本`；未 commit。
+
+### 2026-07-30 16:28:45
+- Web 登录页副文案改为「企业级智能体工作平台…」；去掉 SSE/交互卡片实现细节；未 commit。
+
+### 2026-07-30 16:26:49
+- 产品中文命名：全仓「零辖」→「灵辖」（README 主仓 + 3 worktree）；UI/工程代号 zeroAgent 未动；未 commit。
+
+### 2026-07-30 16:10:04
+- 部署重启：api/worker/beat rebuild 已起；迁移至 `0030_alert_webhooks`；admin-web :3001 Ready；`/health` ok。
+
+### 2026-07-30 16:03:14
+- 管理端反馈审阅/报表 + 员工端异步副作用已实现：`/admin/feedbacks*`、Celery 校准/差评通知/Webhook、admin-web「消息反馈」、迁移 `0030_alert_webhooks`；相关单测 11 passed；未 commit。
+
+### 2026-07-30 15:52:40
+- 反馈规格增补：员工端赞/踩落库快返回；Celery 异步做意图阈值校准；仅 down 发站内通知+Webhook。见 `2026-07-30-admin-feedback-review-design.md`；未 commit。
+
+### 2026-07-30 15:46:15
+- 管理端反馈审阅/报表：设计已确认并写入 `docs/superpowers/specs/2026-07-30-admin-feedback-review-design.md`；待用户审阅后出实现计划；未 commit。
+
+### 2026-07-30 15:15:51
+- 连续发送队列：api 已 rebuild 且 healthy；web :3000 可达；待浏览器硬刷新联调。
+
+### 2026-07-30 15:09:37
+- chat-queue final-fix：`ensureConversation(gen)` 防切会话绑错 id；`messages/send` 所有权 403 先于 supersede；`test_dismiss_card` 4 passed + `tsc` PASS；未 commit。
+
+### 2026-07-30 15:03:17
+- Task 1–5 连续发送队列收口：后端作废卡 + 前端 FIFO 队列/停止/焦点；dismiss 单测 3 + chatSendQueue 8 + tsc PASS；浏览器 E2E 待人工；规格已落地；未 commit。
+
+### 2026-07-30 14:43:04
+- Task 1 完成：`cancel_pending_cards` + `dismiss-card` + `supersede_pending_card`；pytest 3 passed；未 commit。
+
+### 2026-07-30 14:36:00
+- 连续发送队列规格已批准；实现计划写入 `docs/superpowers/plans/2026-07-30-chat-send-queue.md`，待选执行方式。
+
+### 2026-07-30 14:35:05
+- 连续发送队列设计定稿写入 `docs/superpowers/specs/2026-07-30-chat-send-queue-design.md`（含发送后聚焦输入框）；待用户审阅后出实现计划。
+
+### 2026-07-30 14:21:17
+- 重建 api/worker；`test_context_compress` 7 passed；容器冒烟压缩链路通过；Celery `compress_context` 已注册并可执行。
+
+### 2026-07-30 14:06:56
+- 上下文摘要压缩落地：相对窗 0.75 触发 / 目标 min(2000, 0.15窗)；异步 Celery；Redis digest + 短记忆改写；下轮注入【会话摘要】。
+- 单测 `test_context_compress`；顺带修 persona_trial / plan_execute mock 签名。
+
+### 2026-07-30 13:41:51
+- 切换模型跟随上下文窗：后端按 `max_input_tokens`；PATCH 返回 context；前端即时刷新。
+
+### 2026-07-30 13:23:14
+- 全链路审计：补 doc_analyze、记忆抽取、上下文打包；新增 `test_llm_session_model_threading` 防回退。
+- 非会话路径（chunk_clean/QA/试聊）保留环境默认。
+
+### 2026-07-30 13:11:54
+- 修：会话选 Agnes 但 LiteLLM 仍见 MiniMax。根因 L3/kb/Agent 图未带 `selected_model`。
+- 已贯通 `model` 参数；api/worker rebuild；相关单测 17 绿。
+
+### 2026-07-30 11:37:47
+- Task 6–9：员工选模 API/UI；管理端模型治理页；ContextBudgetPacker；API 规范 v0.8.2 §12.3。
+
+### 2026-07-30 11:32:34
+- Task 4：管理端 `GET/POST sync/PATCH llm-models`、`PUT agents/{id}/llm-models`；审计写入；PATCH 刷 Redis。
+- Task 5：`model_resolve` + Gateway.resolve；messages 发消息/重试走解析；停用/缺失拒绝。
+
+### 2026-07-30 11:26:10
+- Task 3：`litellm_sync`（缺窗 incomplete、缺失联动停用、管理员关闭不自动开）；启动钩子经 Gateway；单测绿。
+
+### 2026-07-30 11:23:42
+- Task 1：迁移 `0029_llm_model_governance`（`llm_models` / bindings / `selected_model`）；ORM `catalog_models`；MySQL upgrade 成功。
+- Task 2：`models_cache.py`（`za:llm:models:v1`）对齐 persona_cache；单测绿。
+
+### 2026-07-30 11:19:49
+- Task 0 完成：`LlmGateway` 全局门面；对话/记忆/意图/试聊/知识清洗与 QA/Agent 图均改走 Gateway。
+- `client.py`/`lc_chat.py` 标明仅内部；单测 `test_llm_gateway.py` 绿。
+
+### 2026-07-30 11:13:00
+- 规格/计划补强：**LlmGateway 全局统一封装**为业务唯一 LLM 入口；client 仅内部使用。
+
+### 2026-07-30 11:10:57
+- 用户确认 LLM 模型治理规格；写出实现计划 `docs/superpowers/plans/2026-07-30-llm-model-governance.md`。
+- 要点：启动+手动同步 LiteLLM→校验→MySQL→Redis；会话级选模；LiteLLM 缺失联动停用；P2 上下文预算防超窗。
+
+### 2026-07-29 16:56:39
+- 方案 B：Compose 增加 `litellm-db`（Postgres）并给 `litellm` 配独立 `DATABASE_URL`，以启用 `/ui`。
+- `.env.example` / 本地 `.env` / `环境与密钥.md` 已补 `LITELLM_DB_*`、`LITELLM_UI_*`。
+- 注意：本机 `docker pull postgres` 曾因网络卡住；镜像就绪后再 `up -d litellm-db litellm`。
+
+### 2026-07-29 16:32:21
+- 前后台 UI 挂载品牌标：`BrandMark`；员工端顶栏/登录/对话空态；管理端侧栏/登录/favicon/manifest。
+- `assets/brand` 同步到 `admin-web/public`；双端静态图标 HTTP 200。
+
+### 2026-07-29 16:30:00
+- 根据 `D:\HermesWork\zeroAgent.png` 制作透明背景 logo：
+  - `assets/brand/zeroagent-logo-master.png`（1440×1440 RGBA）
+  - `web/public/zeroagent-icon-{16,32,48,64,128,180,192,256,384,512,1024}.png`
+  - `web/public/favicon.ico`（16/24/32/48/64/128/256）、`favicon.png`、`apple-touch-icon.png`
+  - `web/public/icon-192.png` / `icon-512.png` / `site.webmanifest`（PWA）
+- 接入 `web/src/app/layout.tsx` 的 `metadata.icons` 与 `manifest`；`npm run build` 12 路由通过。
+
+### 2026-07-29 16:04:42
+- 本地验证：`docker compose up -d --build api worker beat`；OpenAPI 已含 `/test` `/reset-default`。
+- 登录 demo 后 GET 人格含 `platform_safety`；试聊返回 `used_persona=true` 且有模型回复。
+- admin-web `:3001` 可访问，待浏览器 UI 点验。
+
+### 2026-07-29 16:00:36
+- PRD v0.8.1：§12.1.3 提示词分层 + 第十六章 D43–D47；API 规范补 `/system/persona`。
+- 平台安全段 `platform_safety.py` 始终最前注入；停用人格仍保留安全段。
+- 试聊 `POST .../test`、恢复默认 `POST .../reset-default`；admin 页只读安全段 + 试聊区。
+- 单测 21 passed（`test_system_persona` + `test_context_source_boundary`）。
+
+### 2026-07-29 15:50:15
+- 系统人格：管理端 `/system/persona`；MySQL+Redis；system 路径必注入【系统人格】。
+- Agent 字段 `inherit_system_persona`（默认开）；员工端创建 Agent 可勾选；运行时引用非拷贝。
+- 迁移 `0028_system_persona`；规格 `2026-07-29-system-persona-design.md`。
+
+### 2026-07-29 15:19:45
+- Codegraph：`codegraph init -i`，300 files / 3657 nodes。
+- 管理后台：修复 `admin-web` 登录同源 Cookie、AuthProvider、概览解包；`:3001` 已起。
+- 迁移 `0027_admin_console_schema`：`config_audit_logs` + L2/记忆字段 origin 等治理列。
+
+### 2026-07-29 14:10:45
+- 修复删除会话 HTTP 405：本机多个孤儿 uvicorn worker 占 `127.0.0.1:8000`，请求未打到已含 DELETE 的 Docker API。
+- 已终止孤儿进程；`restart-dev.ps1` / `deploy-docker.ps1` 端口清理增加「幽灵 PID → 杀其子进程」。
+
+### 2026-07-29 11:40:21
+- 系统对话侧栏：历史会话支持删除；`DELETE /api/v1/conversations/{id}` 软删 `status=deleted`；列表仅 active。
+- 迁移 `0026_conversation_status_deleted`。
+
+### 2026-07-29 11:25:43
+- 记忆抽取：白名单 Catalog（DB+Redis+管理 API）；三触发异步（显式/空闲/窗口）；去掉请求内同步 LLM 抽取。
+- 注入侧过滤非白名单 key；迁移软删历史 `person_of_interest` 等脏 auto 记忆。
+- 工程约定：`docs/05-开发指南/配置类模块缓存约定.md`。
+
+### 2026-07-29 10:47:04
+- L2 否定门禁：「我没让你总结赵世龙的简历」→ `chitchat`，不再 `doc_analyze`。
+- 关键词真相源 MySQL `intent_l2_keywords` + 启动/CRUD 刷 Redis；管理 API `/api/v1/intent/l2-keywords`。
+- 规格/计划：`docs/superpowers/specs|plans/2026-07-29-l2-negation-catalog*`。
+
+### 2026-07-28 15:29:36
+- 新增 Docker 一键部署：`scripts/deploy-docker.ps1` / `deploy-docker.cmd`。
+- Compose 补 `api`（`:8000`）；Dockerfile 打包 `alembic.ini` + `migrations`；部署后自动 `alembic upgrade head`。
+- 与 `restart-dev.ps1` 分离：部署进容器 vs 本机热更新。前端仍本机 `:3000`。
+
+### 2026-07-28 11:17:13
+- 新增本地一键重启：`scripts/restart-dev.ps1` / `scripts/restart-dev.cmd`。
+- 行为：释放 8000/3000/8001/8002 → 写回 `API_PROXY_TARGET=8000` → 新窗口起 uvicorn + `npm run dev`；可选 `-WithDeps` / `-WithCelery`。
+
+### 2026-07-28 10:15:31
+- 用户裁定：**后端固定 `:8000` / 前端 `:3000`**，禁止因僵尸进程或临时联调改到 8001/8002。
+- 已写入 `.cursor/rules/zeroagent-ai-dev.mdc`；`web/.env.local` 与启动备忘均改回 `8000`。
+- 占用时先杀进程，再回 8000。
+
+### 2026-07-27 16:45:29
+- **Mock 回声**：用户问「你是什么模型」得到「收到：…【已注入用户记忆】」——`:8002` 进程继承了 `MOCK_EXTERNAL=true`。
+- 已用 `MOCK_EXTERNAL=false` 重启 `:8002`；直打验证返回 MiniMax-M3，非 Mock。
+
+### 2026-07-27 15:46:05
+- **过程阶段不可见根因**：`:8001` 被旧 uvicorn 僵尸占用（无 stage 代码）；新进程绑端口失败，前端仍代理到僵尸。
+- **绕过**：后端改 `:8002`，`web/.env.local` 指向 8002；实测 SSE 含 stage/thought_delta。
+- 验证：硬刷新聊天页，新发「你好」。
+
+### 2026-07-27 14:45:31
+- **过程面板可见性**：用户反馈页面找不到；加固正文合并不丢 process、面板样式更醒目；说明「深度思考」按钮是占位、与过程区无关。
+- 验证：硬刷新 `/chat`，新发「你好」，看助手气泡上方「处理过程」。
+
+### 2026-07-27 12:44:11
+- **路由收束实现完成**（inline T1–T6）：`resolve_route` → Dispatcher；有 Agent 禁系统 kb 捷径；System kb 模板合成 + D14；L3 Mock=fixture（含「我是谁」→chitchat）；`meta.route`。
+- 测：57 passed。未 commit。
+
+### 2026-07-27 12:24:05
+- **路由收束实现计划**：`docs/superpowers/plans/2026-07-27-conversation-route-resolver.md`（Task1–6）。
+- **下一刀**：用户选执行方式。未 commit。
+
+### 2026-07-27 12:17:13
+- **路由收束规格**：`docs/superpowers/specs/2026-07-27-conversation-route-resolver-design.md`（RouteResolver + Handler；禁拼片段捷径）。
+- **下一刀**：用户审阅规格。未 commit。
+
+### 2026-07-27 11:41:36
+- **联调热修**：`我是谁` 误入 `kb_lookup`（`(.+?)是谁`）→ 改为 `self_identity` 闲聊；`kb_lookup` 路径补 stage/thought；过程面板加「处理过程」标题。
+- 测：8 passed。浏览器需硬刷新后新开对话验证。
+
+### 2026-07-27 11:19:01
+- **过程可见 Task1–6 收口**：合成器 + Plan-Execute astream + runtime/legacy/闲聊 + 前端 ProcessPanel + API 文档。
+- 测：过程可见相关包 **34 passed**。未 commit。
+- **下一刀**：浏览器联调系统对话过程区。
+
+### 2026-07-27 11:06:03
+- **过程可见实现计划**：`docs/superpowers/plans/2026-07-27-chat-process-visibility.md`（Task1–6）。
+- **下一刀**：用户选 subagent-driven 或 inline 执行。未 commit。
+
+### 2026-07-27 10:30:18
+- **对话过程可见规格定稿**：`docs/superpowers/specs/2026-07-27-chat-process-visibility-design.md`。
+- 裁定：阶段胶囊+可折叠思考；合成叙述；不落库；方案一 SSE。
+- **下一刀**：用户审阅规格后写实现计划。未 commit。
 
 ### 2026-07-27 10:17:05
 - **上下文分栏 Task4 收口**：CHECKPOINT 更新；规格状态改「已实现」。

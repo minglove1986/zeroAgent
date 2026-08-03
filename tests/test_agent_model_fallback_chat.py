@@ -36,7 +36,12 @@ def _parse_sse(text: str) -> list[tuple[str, dict]]:
 
 
 @pytest.fixture()
-async def client():
+async def client(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MOCK_EXTERNAL", "true")
+    monkeypatch.setenv("AGENT_RUNTIME", "legacy")
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
@@ -53,6 +58,7 @@ async def client():
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
     await engine.dispose()
+    get_settings.cache_clear()
 
 
 @pytest.mark.asyncio

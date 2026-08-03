@@ -39,7 +39,7 @@
 | 42210 | 422 | 卡片重复提交（同一 `card_id`） |
 | 42211 | 422 | 卡片已过期 / 已取消 |
 | 42212 | 422 | 卡片 payload 校验失败（缺必填选项/字段） |
-| 42213 | 422 | 会话存在未完成的必填卡片，禁止直接 send（须先 card-action） |
+| 42213 | 422 | 会话存在未完成的必填卡片，禁止直接 send（须先 card-action，或 send 时传 `supersede_pending_card=true` 作废后继续） |
 | 42901 | 429 | 用户配额 |
 | 50002 | 502/500 | LLM fallback 用尽 |
 
@@ -227,8 +227,10 @@ Web 系统对话页绑定本组接口。
 | 方法 | 路径 |
 |---|---|
 | POST | `/conversations` | `{agent_id?, title}`；`agent_id` 可空则走智能路由 |
-| GET | `/conversations` · `.../messages` |
-| POST | `/messages/send` | SSE 流式（见下） |
+| GET | `/conversations` · `.../messages` | 列表仅 `status=active`；普通用户仅本人 |
+| DELETE | `/conversations/{id}` | 软删（`status=deleted`）；仅本人或平台管理员 |
+| POST | `/messages/send` | SSE 流式（见下）；可选 `supersede_pending_card` |
+| POST | `/messages/dismiss-card` | 作废 pending 交互卡（`{conversation_id, card_id?}` → `{dismissed_ids}`） |
 | POST | `/messages/card-action` | 用户提交卡片结果，续跑对话（可再开 SSE） |
 | POST | `/messages/{id}/feedback` | `up`/`down` |
 | POST | `/messages/{id}/retry` | 原模型重试 |
@@ -239,10 +241,31 @@ Web 系统对话页绑定本组接口。
 |---|---|
 | `content_delta` | 文本增量 |
 | `citation` | RAG 引用 |
+| `stage` | 过程阶段胶囊：`{id,label,status}`；`status`=`running`/`done`/`error`；仅流式，不落库 |
+| `thought_delta` | 合成思考叙述增量：`{delta}`；仅流式，不落库 |
 | `tool_call` / `skill_call` | 技能/工具调用进度（可选展示） |
 | `card` | **交互卡片**（结构化 JSON，见 10.2） |
 | `route_clarify` | 可并入 `card.type=route_clarify`；兼容保留 |
 | `message_end` | 本轮结束（若存在待答必填卡，`status=awaiting_card`） |
+
+用户默认 UI 以 `stage` / `thought_delta` 为主；`tool_call` / `skill_call` 仍可选，默认不展示 arguments。
+
+`POST /messages/send` 请求体：`{conversation_id, content, supersede_pending_card?}`。  
+若会话存在 pending 必填卡：未传 / `false` 仍返回 **42213**；`supersede_pending_card=true` 时先作废全部 pending 卡再发送。  
+`POST /messages/{id}/retry` **不支持** supersede，有 pending 必填卡时仍返回 42213。
+
+### 10.1.1 作废卡片（`/messages/dismiss-card`）
+
+```json
+{
+  "conversation_id": "conv_xxx",
+  "card_id": "crd_xxx"
+}
+```
+
+- `card_id` 可省略：作废该会话全部 `status=pending` 卡。
+- 成功：`{ "dismissed_ids": ["crd_xxx", ...] }`；无可作废卡时返回空数组（幂等）。
+- 仅会话本人或平台管理员。
 
 ### 10.2 卡片载荷（`card`）
 
@@ -331,11 +354,73 @@ Web 系统对话页绑定本组接口。
 |---|---|
 | `/providers` | LiteLLM 包装的 Provider/模型；单价可配 |
 | `/prompt-templates` | 模板版本化 |
+| `/intent/l2-keywords` | L2 意图关键词 CRUD（平台管理员；写库后刷 Redis） |
+| `/memory/extract-fields` | 记忆抽取字段白名单 CRUD（平台管理员；写库后刷 Redis） |
+| `/system/persona` | 系统人格 CRUD / 试聊 / 恢复默认（平台管理员；写库后刷 Redis） |
+| `/admin/llm-models` | LLM 模型目录同步/启停/系统白名单/Agent 绑定（平台管理员） |
+| `/admin/feedbacks` | 消息反馈审阅/汇总（平台管理员只读） |
+| `/llm-models/available` | 员工端按会话/Agent 可选模型列表 |
 | `/system-config/sensitive-words` | 敏感词 |
 | `/system-config/webhooks` | 告警 Webhook 列表 |
 | `/api-keys` | OpenAPI Key 配额 |
 
 LLM 调用一律经本地/集群 **LiteLLM Proxy**，业务禁止直连厂商。
+
+### 12.1 L2 关键词 `/intent/l2-keywords`
+
+权限：仅 `platform_admin` / `super_admin`。写操作成功后全量刷新 Redis `za:intent:l2_catalog:v1`。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/intent/l2-keywords` | 分页列表（DB）；可选 `category` |
+| POST | `/intent/l2-keywords` | 新增；body: category/phrase/match_mode/enabled/priority/remark |
+| PATCH | `/intent/l2-keywords/{id}` | 更新 |
+| DELETE | `/intent/l2-keywords/{id}` | 软删 |
+| POST | `/intent/l2-keywords/reload-cache` | 强制 DB→Redis |
+
+`match_mode`：`contains` \| `equals` \| `prefix`（禁止自定义 regex）。
+
+### 12.2 系统人格 `/system/persona`
+
+权限：仅 `platform_admin` / `super_admin`。写操作成功后刷新 Redis `za:system:persona:v1`。平台安全段为代码常量，管理端只读。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/system/persona` | 读配置 + 缓存状态 + `platform_safety` |
+| PUT | `/system/persona` | 更新 title/system_prompt/enabled；乐观锁 `expected_revision` |
+| POST | `/system/persona/reload-cache` | 强制 DB→Redis |
+| POST | `/system/persona/reset-default` | 恢复种子 title/prompt；enabled 保持 |
+| POST | `/system/persona/test` | 无副作用试聊；body: `message`, 可选 `system_prompt` |
+
+试聊仅拼：平台安全 + 人格 + 极简身份；不写记忆/会话；审计 `action=test`。
+
+### 12.3 LLM 模型治理
+
+权限：管理端仅 `platform_admin` / `super_admin`。目录 MySQL 权威，Redis `za:llm:models:v1` 热缓存。业务 LLM 调用统一经 `LlmGateway`。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/admin/llm-models` | 目录列表（含 `source_status`） |
+| POST | `/admin/llm-models/sync` | 从 LiteLLM 同步 |
+| PATCH | `/admin/llm-models/{id}` | 启停、补 `max_input_tokens`、系统白名单 |
+| GET | `/admin/agents/{agent_id}/llm-models` | 读 Agent 绑定 |
+| PUT | `/admin/agents/{agent_id}/llm-models` | 全量替换绑定（含默认） |
+| GET | `/llm-models/available` | 员工端可选列表；`conversation_id` 或 `agent_id` |
+| PATCH | `/conversations/{id}` | 更新 `selected_model`（白名单校验；`null` 清空） |
+
+`source_status`：`active` \| `incomplete` \| `missing_in_litellm`。LiteLLM 缺失强制 `enabled=false`；管理员关闭不同步自动打开。非法选模返回业务码 `40031`。
+
+### 12.4 消息反馈审阅 `/admin/feedbacks`
+
+权限：仅 `platform_admin` / `super_admin`。只读；不改 `message_feedbacks` 结构。员工端 `POST /messages/{id}/feedback` 落库后异步：意图阈值校准；仅 `down` 发站内 `alert` + `alert_webhooks`（事件 `message_feedback.down`）。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/admin/feedbacks/stats` | 汇总：total/up/down/with_comment/success_rate |
+| GET | `/admin/feedbacks` | 分页列表；筛选 start_date/end_date/rating/has_comment/agent_id/q |
+| GET | `/admin/feedbacks/{id}` | 详情 + 前后各 5 条 `context_messages`（`is_target`） |
+
+默认时间窗近 7 天；`page_size` 上限 100。
 
 ---
 
@@ -368,6 +453,11 @@ LLM 调用一律经本地/集群 **LiteLLM Proxy**，业务禁止直连厂商。
 
 | 版本 | 说明 |
 |---|---|
+| v0.8.4 | 管理端 `/admin/feedbacks` 审阅/汇总；员工端反馈 Celery 异步校准 + 仅踩站内通知/Webhook；`alert_webhooks` 表 |
+| v0.8.3 | 连续发送：`dismiss-card` + `supersede_pending_card`；42213 未 supersede 时仍返回 |
+| v0.8.2 | LLM 模型治理：`/admin/llm-models`、员工端可选列表与会话 `selected_model`；经 LlmGateway |
+| v0.8.1 | 系统人格 `/system/persona`（安全段只读、试聊、恢复默认）；对齐 PRD D43–D47 |
+| v0.7.5 | L2 关键词 `/intent/l2-keywords`（DB+Redis）；否定纠正门禁 |
 | v0.7.4 | 卡片错误码 42210–42213；`ask_user` 映射；对齐 D33 |
 | v0.7.3 | 交互卡片 SSE `card` + `/messages/card-action`；Agent 提问类型；对齐 D31–D32 |
 | v0.7.2 | 去掉 `/im/*`；对话主入口明确；通知/审批走 Web；对齐 PRD D27–D30 |

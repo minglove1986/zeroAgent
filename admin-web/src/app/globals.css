@@ -1,0 +1,116 @@
+:root {
+  --bg-surface: #ffffff;
+  --text-primary: #0f172a;
+  --text-secondary: #64748b;
+  --border-color: #e2e8f0;
+  --sidebar-bg: #f8fafc;
+  --header-bg: #ffffff;
+  --primary: #2d9cdb;
+  --primary-hover: #1d83cd;
+  --danger: #fa5252;
+}
+
+[data-theme="dark"] {
+  --bg-surface: #1e293b;
+  --text-primary: #f1f5f9;
+  --text-secondary: #94a3b8;
+  --border-color: #334155;
+  --sidebar-bg: #0f172a;
+  --header-bg: #1e293b;
+  --primary: #5bc0eb;
+  --primary-hover: #4ab0dc;
+  --danger: #ea5455;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-family: "Noto Sans SC", -apple-system, BlinkMacSystemFont, sans-serif;
+  transition: background 0.3s, color 0.3s;
+}
+
+/* 滚动条样式 */
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-surface);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--primary);
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: none;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.btn-primary {
+  background: var(--primary);
+  color: white;
+}
+.btn-primary:hover {
+  background: var(--primary-hover);
+}
+.btn-outline {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+}
+.btn-outline:hover {
+  background: var(--bg-surface);
+  border-color: var(--primary);
+  color: var(--primary);
+}
+.btn-danger {
+  background: var(--danger);
+  color: white;
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.field label {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.field input,
+.field select {
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+}
+.err {
+  color: var(--danger);
+  font-size: 13px;
+  margin: 4px 0;
+}
+.msg {
+  color: var(--primary);
+  font-size: 14px;
+  margin: 8px 0;
+}

@@ -110,13 +110,13 @@ async def _propose_for_chunks(
     if settings.mock_external:
         return {row.id: _mock_clean_content(row.content or "") for row in rows}
 
-    from app.modules.llm import client as llm_client
+    from app.modules.llm.gateway import chat_json
 
     payload_items = [
         {"chunk_id": row.id, "content": (row.content or "")[:8000]} for row in rows
     ]
     try:
-        raw = await llm_client.chat_completion_json(
+        raw = await chat_json(
             messages=[
                 {"role": "system", "content": _CLEAN_SYSTEM},
                 {

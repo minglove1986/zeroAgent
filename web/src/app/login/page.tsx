@@ -1,13 +1,17 @@
 /**
  * 登录页（品牌主视觉 + 自建账号）。
  * @author 赵振明
- * @date 2026-07-23 15:30:58
+ * @date 2026-07-30 16:37:06
  */
 "use client";
 
 import { FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
 import { apiJson } from "@/lib/api";
+import { BrandMark } from "@/components/BrandMark";
+
+/** 内部构建版本号，仅登录页页脚展示。 */
+const APP_VERSION = "V0.0.1-B";
 
 const DEMO_USER = {
   username: "demo",
@@ -78,69 +82,99 @@ export default function LoginPage() {
     <main
       style={{
         minHeight: "100vh",
-        display: "grid",
-        placeItems: "center",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
         padding: "2rem",
       }}
     >
-      <section
+      <div
         style={{
-          width: "min(420px, 100%)",
-          padding: "2.5rem 2rem",
-          borderRadius: "var(--radius)",
-          background: "var(--card)",
-          border: "1px solid var(--line)",
-          backdropFilter: "blur(12px)",
+          flex: 1,
+          display: "grid",
+          placeItems: "center",
+          width: "100%",
         }}
       >
-        <p style={{ margin: 0, color: "var(--accent)", letterSpacing: "0.08em", fontSize: "0.8rem" }}>
-          ENTERPRISE AGENT
-        </p>
-        <h1 style={{ margin: "0.4rem 0 0.6rem", fontSize: "2.4rem", fontWeight: 700 }}>
-          zeroAgent
-        </h1>
-        <p style={{ margin: "0 0 1.75rem", color: "var(--muted)", lineHeight: 1.5 }}>
-          企业内网智能体控制台。登录后进入系统对话（SSE + 交互卡片）。
-        </p>
+        <section
+          style={{
+            width: "min(420px, 100%)",
+            padding: "2.5rem 2rem",
+            borderRadius: "var(--radius)",
+            background: "var(--card)",
+            border: "1px solid var(--line)",
+            backdropFilter: "blur(12px)",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", marginBottom: "0.35rem" }}>
+            <BrandMark size={48} priority />
+            <div>
+              <p style={{ margin: 0, color: "var(--accent)", letterSpacing: "0.08em", fontSize: "0.8rem" }}>
+                ENTERPRISE AGENT
+              </p>
+              <h1 style={{ margin: "0.15rem 0 0", fontSize: "2.1rem", fontWeight: 700 }}>
+                zeroAgent
+              </h1>
+            </div>
+          </div>
+          <p style={{ margin: "0 0 1.75rem", color: "var(--muted)", lineHeight: 1.5 }}>
+            <span style={{ fontWeight: 5000,color: "var(--accent)" }}>灵辖企业级通用智能体工作平台</span>支持实时应答与结构化人机协同、知识库、工作流，是中小企业数字智能化优选平台。 
+          </p>
 
-        <form onSubmit={onSubmit}>
-          <div className="field">
-            <label htmlFor="username">用户名</label>
-            <input
-              id="username"
-              autoComplete="username"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              required
-            />
-          </div>
-          <div className="field">
-            <label htmlFor="password">密码</label>
-            <input
-              id="password"
-              type="password"
-              autoComplete="current-password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-            />
-          </div>
-          {error ? <p className="err">{error}</p> : null}
-          <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
-            <button className="btn" type="submit" disabled={busy}>
-              {busy ? "登录中…" : "登录"}
-            </button>
-            <button
-              className="btn btn-ghost"
-              type="button"
-              disabled={busy}
-              onClick={onBootstrap}
-            >
-              创建演示账号并登录
-            </button>
-          </div>
-        </form>
-      </section>
+          <form onSubmit={onSubmit}>
+            <div className="field">
+              <label htmlFor="username">用户名</label>
+              <input
+                id="username"
+                autoComplete="username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                required
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="password">密码</label>
+              <input
+                id="password"
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+              />
+            </div>
+            {error ? <p className="err">{error}</p> : null}
+            <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
+              <button className="btn" type="submit" disabled={busy}>
+                {busy ? "登录中…" : "登录"}
+              </button>
+              <button
+                className="btn btn-ghost"
+                type="button"
+                disabled={busy}
+                onClick={onBootstrap}
+              >
+                创建演示账号并登录
+              </button>
+            </div>
+          </form>
+        </section>
+      </div>
+      <footer
+        style={{
+          width: "100%",
+          textAlign: "center",
+          paddingTop: "1.25rem",
+          color: "var(--muted)",
+          fontSize: "0.8rem",
+          letterSpacing: "0.04em",
+          lineHeight: 1.5,
+        }}
+      >
+        {APP_VERSION}
+        <span style={{ margin: "0 0.45rem", opacity: 0.55 }}>·</span>
+        内部版本
+      </footer>
     </main>
   );
 }

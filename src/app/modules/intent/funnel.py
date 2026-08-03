@@ -1,7 +1,7 @@
 """意图漏斗入口（P3：动态阈值 + 专名词典）。
 
 @author 赵振明
-@date 2026-07-24 10:03:15
+@date 2026-07-27 12:42:37
 """
 
 from __future__ import annotations
@@ -16,8 +16,11 @@ TAU_HIGH = 0.75
 TAU_LOW = 0.45
 
 
-def evaluate_intent_funnel(user_content: str) -> IntentDecision:
-    """同步评估：仅 L2 + L4 兜底（兼容旧调用 / 单测）。"""
+def evaluate_l2_only(user_content: str) -> IntentDecision:
+    """仅 L2 + 低置信回落；禁止用于生产 runtime（无 L3）。
+
+    兼容旧名：evaluate_intent_funnel。
+    """
     text = (user_content or "").strip()
     tau_high = get_tau_high()
     tau_low = get_tau_low()
@@ -34,6 +37,10 @@ def evaluate_intent_funnel(user_content: str) -> IntentDecision:
         reason="fallback_chitchat",
         features=["funnel:fallback"],
     )
+
+
+# 兼容别名：仅 L2，生产对话请用 evaluate_intent_funnel_async / resolve_route
+evaluate_intent_funnel = evaluate_l2_only
 
 
 def _enrich_kb_filters(decision: IntentDecision) -> IntentDecision:
@@ -111,6 +118,7 @@ async def evaluate_intent_funnel_async(
     *,
     recent_summary: str = "",
     kb_names: list[str] | None = None,
+    model: str | None = None,
 ) -> IntentDecision:
     """完整漏斗：L2 高置信短路；否则 L3 → L4。"""
     text = (user_content or "").strip()
@@ -120,6 +128,6 @@ async def evaluate_intent_funnel_async(
         return l2
 
     l3 = await classify_intent_l3(
-        text, recent_summary=recent_summary, kb_names=kb_names
+        text, recent_summary=recent_summary, kb_names=kb_names, model=model
     )
     return _adjudicate_l4(text=text, l2=l2, l3=l3)

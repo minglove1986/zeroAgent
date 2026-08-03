@@ -113,10 +113,10 @@ async def generate_qa_pairs_for_document(
         total += len(piece)
     context = "\n\n---\n\n".join(buf)
 
-    from app.modules.llm import client as llm_client
+    from app.modules.llm.gateway import chat_json
 
     try:
-        raw = await llm_client.chat_completion_json(
+        raw = await chat_json(
             messages=[
                 {"role": "system", "content": _GENERATE_SYSTEM},
                 {

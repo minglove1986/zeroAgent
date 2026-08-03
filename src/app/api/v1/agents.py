@@ -82,6 +82,7 @@ async def _agent_dict(db: AsyncSession, a: Agent) -> dict:
         "status": a.status,
         "memory_access": a.memory_access or "all",
         "can_modify_memory": bool(a.can_modify_memory),
+        "inherit_system_persona": bool(getattr(a, "inherit_system_persona", 1)),
         "kb_ids": await _list_agent_kb_ids(db, a.id),
     }
 
@@ -146,6 +147,7 @@ async def create_agent(body: AgentCreate, db: AsyncSession = Depends(get_db)) ->
         status="draft",
         memory_access=body.memory_access,
         can_modify_memory=1 if body.can_modify_memory else 0,
+        inherit_system_persona=1 if body.inherit_system_persona else 0,
         created_by="usr_system",
     )
     db.add(agent)
@@ -165,6 +167,7 @@ async def create_agent(body: AgentCreate, db: AsyncSession = Depends(get_db)) ->
             "kb_ids": list(body.kb_ids or []),
             "memory_access": agent.memory_access,
             "can_modify_memory": bool(agent.can_modify_memory),
+            "inherit_system_persona": bool(agent.inherit_system_persona),
             "fallback_model_ids": body.fallback_model_ids or [],
             "prompt_template_id": agent.prompt_template_id,
             "variables": variables,
