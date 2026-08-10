@@ -84,24 +84,24 @@
 
 ## Final-fix
 
-**Ê±¼ä£¨¶«°ËÇø£©**£º2026-07-30 15:09:37  
-**×÷Õß**£ºÕÔÕñÃ÷  
-**Õë¶Ô**£ºfinal chat-queue review ¡ª ensureConversation ¾ºÌ¬ + messages/send ËùÓÐÈ¨
+**Ê±ï¿½ä£¨ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½**ï¿½ï¿½2026-07-30 15:09:37  
+**ï¿½ï¿½ï¿½ï¿½**ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½  
+**ï¿½ï¿½ï¿½**ï¿½ï¿½final chat-queue review ï¿½ï¿½ ensureConversation ï¿½ï¿½Ì¬ + messages/send ï¿½ï¿½ï¿½ï¿½È¨
 
-### ±ä¸ü
+### ï¿½ï¿½ï¿½
 
-| ÎÄ¼þ | ¸Ä¶¯ |
+| ï¿½Ä¼ï¿½ | ï¿½Ä¶ï¿½ |
 |------|------|
-| web/src/app/chat/page.tsx | ensureConversation(gen)£ºpersist Ç°Èô sessionGenRef.current !== gen ÔòÅ× AbortError£¬²»Ð´ conversationId/storage£»sendText ´«Èë gen |
-| src/app/api/v1/messages.py | send_message ¶ÔÆë dismiss_card£º·ÇÖ÷ÈËÇÒ·ÇÆ½Ì¨¹ÜÀíÔ± ¡ú 403/40301£¬ÔÚ supersede/cancel Ö®Ç° |
-| 	ests/test_dismiss_card.py | ÐÂÔö 	est_send_forbidden_before_supersede_for_stranger |
-| docs/superpowers/CHECKPOINT.md | ÀúÊ·¡¸dismiss 4 passed¡¹¸üÕýÎª 3£»±¾ÂÖ final-fix ºóÎª 4 passed |
+| web/src/app/chat/page.tsx | ensureConversation(gen)ï¿½ï¿½persist Ç°ï¿½ï¿½ sessionGenRef.current !== gen ï¿½ï¿½ï¿½ï¿½ AbortErrorï¿½ï¿½ï¿½ï¿½Ð´ conversationId/storageï¿½ï¿½sendText ï¿½ï¿½ï¿½ï¿½ gen |
+| src/app/api/v1/messages.py | send_message ï¿½ï¿½ï¿½ï¿½ dismiss_cardï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò·ï¿½Æ½Ì¨ï¿½ï¿½ï¿½ï¿½Ô± ï¿½ï¿½ 403/40301ï¿½ï¿½ï¿½ï¿½ supersede/cancel Ö®Ç° |
+| 	ests/test_dismiss_card.py | ï¿½ï¿½ï¿½ï¿½ 	est_send_forbidden_before_supersede_for_stranger |
+| docs/superpowers/CHECKPOINT.md | ï¿½ï¿½Ê·ï¿½ï¿½dismiss 4 passedï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Îª 3ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ final-fix ï¿½ï¿½Îª 4 passed |
 
-### ÑéÖ¤
+### ï¿½ï¿½Ö¤
 
-| Ïî | ½á¹û |
+| ï¿½ï¿½ | ï¿½ï¿½ï¿½ |
 |----|------|
-| pytest tests/test_dismiss_card.py -q | ? 4 passed£¨7.13s£¬1 warning ÎÞ¹Ø£© |
-| cd web; npx tsc --noEmit | ? PASS£¨exit 0£© |
+| pytest tests/test_dismiss_card.py -q | ? 4 passedï¿½ï¿½7.13sï¿½ï¿½1 warning ï¿½Þ¹Ø£ï¿½ |
+| cd web; npx tsc --noEmit | ? PASSï¿½ï¿½exit 0ï¿½ï¿½ |
 
-°´Ô¼Êø£º**Î´ commit**¡£
+ï¿½ï¿½Ô¼ï¿½ï¿½ï¿½ï¿½**Î´ commit**ï¿½ï¿½

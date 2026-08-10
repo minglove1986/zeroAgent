@@ -97,6 +97,64 @@ async def synthesize_kb_answer(
     return text
 
 
+async def execute_system_kb_lookup(
+    db: AsyncSession | None,
+    *,
+    user_id: str,
+    user_content: str,
+    route: RouteDecision,
+    agent_id: str | None,
+    department_ids: list[str] | None,
+    role_ids: list[str] | None,
+    is_platform_admin: bool,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """执行 kb 检索+合成（无落库/无 SSE）；供 Turn Graph 子图与 legacy 复用。
+
+    返回 keys: answer, citations, turn_status, reason。
+
+    @author 赵振明
+    @date 2026-08-03 11:09:55
+    """
+    from app.modules.conversation import runtime as rt
+
+    citations: list[dict[str, Any]] = []
+    if db is not None and rt.rag_stub_has_citation(user_content):
+        lookup = await run_kb_lookup(
+            db,
+            query=route.query or parse_rag_query(user_content),
+            agent_id=agent_id,
+            top_k=5,
+            user_id=user_id,
+            department_ids=department_ids,
+            role_ids=role_ids,
+            is_platform_admin=is_platform_admin,
+            filters=(route.slots or {}).get("filters"),
+        )
+        citations = list(lookup.get("citations") or [])
+
+    if not rt.evaluate_rag_citation_gate(used_rag=True, citations=citations):
+        return {
+            "answer": "本轮检索未产生有效引用，已拒绝展示最终答案（D14）。",
+            "citations": [],
+            "turn_status": "rejected_no_citation",
+            "reason": "D14",
+        }
+
+    answer = await synthesize_kb_answer(
+        user_content=user_content,
+        query=route.query or user_content,
+        citations=citations,
+        model=model,
+    )
+    return {
+        "answer": answer,
+        "citations": citations,
+        "turn_status": "completed",
+        "reason": "",
+    }
+
+
 async def handle_system_kb_lookup(
     db: AsyncSession,
     *,
@@ -130,31 +188,30 @@ async def handle_system_kb_lookup(
     for item in iter_stage_enter("retrieve"):
         yield item
 
-    citations: list[dict[str, Any]] = []
-    if rt.rag_stub_has_citation(user_content):
-        lookup = await run_kb_lookup(
-            db,
-            query=route.query or parse_rag_query(user_content),
-            agent_id=agent_id,
-            top_k=5,
-            user_id=user_id,
-            department_ids=department_ids,
-            role_ids=role_ids,
-            is_platform_admin=is_platform_admin,
-            filters=(route.slots or {}).get("filters"),
-        )
-        citations = list(lookup.get("citations") or [])
+    result = await execute_system_kb_lookup(
+        db,
+        user_id=user_id,
+        user_content=user_content,
+        route=route,
+        agent_id=agent_id,
+        department_ids=department_ids,
+        role_ids=role_ids,
+        is_platform_admin=is_platform_admin,
+        model=model,
+    )
+    citations = list(result.get("citations") or [])
+    answer = str(result.get("answer") or "")
+    turn_status = str(result.get("turn_status") or "completed")
 
-    if not rt.evaluate_rag_citation_gate(used_rag=True, citations=citations):
+    if turn_status == "rejected_no_citation":
         for item in iter_stage_leave("retrieve", ok=False):
             yield item
-        notice = "本轮检索未产生有效引用，已拒绝展示最终答案（D14）。"
-        for ch in notice:
+        for ch in answer:
             yield "content_delta", {"delta": ch}
         msg_id, _ = await rt.persist_assistant_and_card(
             db,
             conversation_id=conversation_id,
-            assistant_text=notice,
+            assistant_text=answer,
             card_payload=None,
             meta={**(msg_meta or {})},
         )
@@ -174,12 +231,6 @@ async def handle_system_kb_lookup(
     for c in citations:
         yield "citation", c
 
-    answer = await synthesize_kb_answer(
-        user_content=user_content,
-        query=route.query or user_content,
-        citations=citations,
-        model=model,
-    )
     for ch in answer:
         yield "content_delta", {"delta": ch}
     for item in iter_stage_leave("respond", ok=True):

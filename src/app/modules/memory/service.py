@@ -167,18 +167,49 @@ async def upsert_memory(
     return row
 
 
+def _extract_display_name(text: str) -> str | None:
+    """从自称话术中解析姓名；支持「我叫」「我的名字是」等。
+
+    @author 赵振明
+    @date 2026-08-03 09:41:43
+    """
+    import re
+
+    patterns = (
+        r"我的名字是[：:\s]*([^\s，,。；;\n]{1,20})",
+        r"我的名字叫[：:\s]*([^\s，,。；;\n]{1,20})",
+        r"(?:真实)?姓名是[：:\s]*([^\s，,。；;\n]{1,20})",
+        r"我叫[：:\s]*([^\s，,。；;\n]{1,20})",
+    )
+    for pat in patterns:
+        m = re.search(pat, text or "")
+        if not m:
+            continue
+        name = m.group(1).strip().strip("「」\"'")
+        # 截断角色前缀污染（短记忆拼接 user:/assistant:）
+        for sep in ("assistant:", "user:", "\n"):
+            if sep in name:
+                name = name.split(sep, 1)[0].strip()
+        if name and name not in {"什么", "谁", "啥"}:
+            return name[:40]
+    return None
+
+
 def parse_auto_extract_rules(text: str) -> list[dict[str, Any]]:
     """MOCK / 轻量规则抽取（仅白名单 key）。"""
     from app.modules.memory.extract_catalog_cache import allowed_field_keys
 
     allowed = allowed_field_keys()
     found: list[dict[str, Any]] = []
-    if "我叫" in text and "display_name" in allowed:
-        idx = text.find("我叫")
-        name = text[idx + 2 : idx + 20].split("，")[0].split("。")[0].split(" ")[0].strip()
+    if "display_name" in allowed:
+        name = _extract_display_name(text)
         if name:
             found.append(
-                {"memory_type": "fact", "memory_key": "display_name", "memory_value": name}
+                {
+                    "memory_type": "fact",
+                    "memory_key": "display_name",
+                    "memory_value": name,
+                }
             )
     if ("以后请" in text or "请用" in text or "习惯" in text) and "brevity" in allowed:
         found.append(

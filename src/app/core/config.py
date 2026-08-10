@@ -70,6 +70,18 @@ class Settings(BaseSettings):
     # Agent 运行时：langgraph（Plan-Execute）| legacy（扁平 FC）
     agent_runtime: str = "langgraph"
 
+    # 对话回合总编排：langgraph（Turn Main Graph）| legacy（runtime 命令式）
+    turn_runtime: str = "langgraph"
+
+    # 系统 Agent：plan_execute（空技能共用 Planner，默认）| respond_only（单次 LC 特化回滚）
+    system_agent_mode: str = "plan_execute"
+
+    # Turn Graph checkpointer：redis（za:lg:）| memory（单测/显式降级）
+    turn_checkpointer: str = "redis"
+
+    # 记忆抽取短防抖空闲（秒）；Turn Graph 调度优先用此值
+    memory_extract_debounce_seconds: int = 30
+
     # Plan-Execute 主图最大计划步数
     agent_plan_max_steps: int = 5
 

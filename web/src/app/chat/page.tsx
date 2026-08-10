@@ -144,6 +144,7 @@ function ensurePendingAssistantProcess(items: ChatItem[]): ChatItem[] {
     return {
       stages: [{ id: PENDING_STAGE_ID, label: "思考中", status: "running" }],
       thought: "",
+      modelThought: "",
       collapsed: false,
     };
   });
@@ -876,6 +877,7 @@ export default function ChatPage() {
           conversation_id: cid,
           content: text,
           supersede_pending_card: true,
+          deep_think: deepThink,
         },
         (event, data) => {
           if (gen !== sessionGenRef.current) return;
@@ -1715,7 +1717,7 @@ export default function ChatPage() {
                   type="button"
                   className={`tool-btn ${deepThink ? "is-on" : ""}`}
                   onClick={() => setDeepThink((v) => !v)}
-                  title="占位开关（与上方「处理过程」面板无关）"
+                  title="开启后调用模型原生思考，过程显示在上方思考区"
                 >
                   <span className="tool-ico">🧠</span>
                   <span>深度思考</span>

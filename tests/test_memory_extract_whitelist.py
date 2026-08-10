@@ -46,6 +46,28 @@ def test_mock_rules_map_to_whitelist_keys() -> None:
     items = parse_auto_extract_rules("我叫张三")
     assert items
     assert items[0]["memory_key"] == "display_name"
+    assert items[0]["memory_value"] == "张三"
+
+
+def test_mock_rules_extract_my_name_is_colon() -> None:
+    """「我的名字是：xxx」须抽出 display_name（非仅「我叫」）。"""
+    items = parse_auto_extract_rules("我的名字是：赵振明")
+    assert items
+    assert items[0]["memory_key"] == "display_name"
+    assert items[0]["memory_value"] == "赵振明"
+
+
+def test_mock_rules_extract_name_variants() -> None:
+    """常见自称姓名话术均应命中。"""
+    for text, expect in (
+        ("我的名字叫李四", "李四"),
+        ("真实姓名是王五", "王五"),
+        ("user: 我的名字是：赵振明\nassistant: 好的", "赵振明"),
+    ):
+        items = parse_auto_extract_rules(text)
+        assert items, text
+        assert items[0]["memory_key"] == "display_name"
+        assert items[0]["memory_value"] == expect
 
 
 def test_prompt_filters_non_whitelist_memories() -> None:
@@ -130,4 +152,32 @@ def test_schedule_does_not_call_extract_sync(monkeypatch) -> None:
 
 def test_explicit_remember_detect() -> None:
     assert is_explicit_remember("请记住我叫李四")
+    assert is_explicit_remember("记住我的名字")
+    assert is_explicit_remember("记住我叫张三")
     assert not is_explicit_remember("今天天气不错")
+
+
+def test_schedule_immediate_on_name_self_intro(monkeypatch) -> None:
+    """自称姓名话术应立即投递（不必等 idle/窗口）。"""
+    import app.modules.memory.extract_scheduler as sch
+
+    calls: list[dict] = []
+
+    monkeypatch.setattr(
+        sch,
+        "_dispatch_celery",
+        lambda **kw: calls.append(kw) or True,
+    )
+    monkeypatch.setattr(sch, "load_short_memory", lambda **_: [])
+    monkeypatch.setattr(sch, "_touch_idle", lambda *a, **k: None)
+
+    out = schedule_memory_extract(
+        user_id="u1",
+        conversation_id="c1",
+        transcript="我的名字是：赵振明",
+        allow_memory_write=True,
+        route_kind="chitchat",
+    )
+    assert out["skipped"] is False
+    assert "explicit" in out["scheduled"] or "rule_hit" in out["scheduled"]
+    assert any(c.get("countdown", 0) == 0 for c in calls)

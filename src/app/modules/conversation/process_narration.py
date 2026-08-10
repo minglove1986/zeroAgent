@@ -79,12 +79,19 @@ def iter_stage_enter(
     *,
     skill_name: str | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
-    """进入阶段：running + 一句 thought。"""
+    """进入阶段：running + 一句合成叙述（source=narration）。
+
+    @author 赵振明
+    @date 2026-08-03 16:17:37
+    """
     return [
         ("stage", stage_event(stage_id, "running")),
         (
             "thought_delta",
-            {"delta": thought_for(stage_id, "enter", skill_name=skill_name)},
+            {
+                "delta": thought_for(stage_id, "enter", skill_name=skill_name),
+                "source": "narration",
+            },
         ),
     ]
 
@@ -95,13 +102,20 @@ def iter_stage_leave(
     ok: bool = True,
     skill_name: str | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
-    """离开阶段：done/error + 一句 thought。"""
+    """离开阶段：done/error + 一句合成叙述（source=narration）。
+
+    @author 赵振明
+    @date 2026-08-03 16:17:37
+    """
     status: StageStatus = "done" if ok else "error"
     action: StageAction = "done" if ok else "error"
     return [
         ("stage", stage_event(stage_id, status)),
         (
             "thought_delta",
-            {"delta": thought_for(stage_id, action, skill_name=skill_name)},
+            {
+                "delta": thought_for(stage_id, action, skill_name=skill_name),
+                "source": "narration",
+            },
         ),
     ]

@@ -1,13 +1,11 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-  zeroAgent one-click Docker deploy (Compose stack, API fixed :8000).
+  zeroAgent local one-click Docker deploy: API :8000 + web :3000 + admin :3001.
 
 .DESCRIPTION
-  Starts mysql/redis/rabbitmq/litellm + api/worker/beat in Docker.
-  Ensures deploy/.env exists, frees host :8000, builds images, runs compose,
-  then alembic upgrade inside api container.
-  Frontend (Next.js :3000) stays on host; point web/.env.local to :8000.
+  Starts compose stack (api/web/admin_web + mysql/redis/rabbitmq/litellm/worker/beat).
+  Frees host ports 8000/3000/3001 before publish. Runs alembic upgrade in api container.
 
 .PARAMETER Full
   Also start profile full (neo4j/etcd/milvus).
@@ -16,7 +14,7 @@
   Also start profile embed (embed-rerank :8088).
 
 .PARAMETER Minio
-  Also start profile minio (biz minio).
+  Also start profile minio.
 
 .PARAMETER SkipMigrate
   Skip alembic upgrade head.
@@ -25,10 +23,15 @@
   docker compose up without --build.
 
 .PARAMETER Down
-  Stop and remove the compose stack instead of deploying.
+  Stop and remove the compose stack.
 
-@author 赵振明
-@date 2026-07-28 15:29:36
+.EXAMPLE
+  .\scripts\deploy-docker.ps1
+  .\scripts\deploy-docker.ps1 -Down
+  .\scripts\deploy-docker.cmd
+
+@author Zhao Zhenming
+@date 2026-08-10 11:19:00
 #>
 [CmdletBinding()]
 param(
@@ -47,6 +50,8 @@ $DeployDir = Join-Path $RepoRoot "deploy"
 $EnvFile = Join-Path $DeployDir ".env"
 $EnvExample = Join-Path $DeployDir ".env.example"
 $ApiPort = 8000
+$WebPort = 3000
+$AdminPort = 3001
 $ComposeProject = "zeroagent"
 
 function Write-Step {
@@ -61,7 +66,7 @@ function Assert-DockerReady {
     }
     docker info 1>$null 2>$null
     if ($LASTEXITCODE -ne 0) {
-        throw "Docker engine not running. Start Docker Desktop and retry."
+        throw "Docker engine is not running. Start Docker Desktop and retry."
     }
 }
 
@@ -112,9 +117,6 @@ function Stop-ListenPort {
         try {
             $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
             if ($null -eq $proc) {
-                # 幽灵监听 PID：父进程已死，子 worker 仍占 127.0.0.1，挡住 Docker 映射。
-                # @author 赵振明
-                # @date 2026-07-29 14:10:45
                 $orphans = @(
                     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
                         Where-Object { $_.ParentProcessId -eq $procId } |
@@ -126,7 +128,6 @@ function Stop-ListenPort {
                 }
                 continue
             }
-            # Do not kill Docker / com.docker; only free host uvicorn etc.
             if ($proc.ProcessName -match "docker|com\.docker|vpnkit") {
                 Write-Step "Port ${Port} held by $($proc.ProcessName) (PID=$procId), skip kill"
                 continue
@@ -147,24 +148,27 @@ function Get-ComposeArgs {
     return ,$composeArgs
 }
 
-function Wait-ApiHealthy {
-    param([int]$TimeoutSec = 120)
+function Wait-HttpOk {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Url,
+        [int]$TimeoutSec = 180
+    )
 
-    $url = "http://127.0.0.1:$ApiPort/health"
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    Write-Step "Waiting API health $url ..."
+    Write-Step "Waiting $Name ready: $Url ..."
     while ((Get-Date) -lt $deadline) {
         try {
-            $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 3
-            if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 300) {
-                Write-Step "API ready (HTTP $($resp.StatusCode))"
+            $resp = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 3
+            if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 500) {
+                Write-Step "$Name ready (HTTP $($resp.StatusCode))"
                 return
             }
         } catch {
-            Start-Sleep -Seconds 2
+            Start-Sleep -Seconds 3
         }
     }
-    throw "API health timeout after ${TimeoutSec}s. Check: docker compose -p $ComposeProject logs api"
+    throw "$Name health timeout after ${TimeoutSec}s. Check: docker compose -p $ComposeProject logs"
 }
 
 function Invoke-Migrate {
@@ -200,8 +204,10 @@ try {
         return
     }
 
-    Write-Step "Free host :$ApiPort before publishing container port..."
+    Write-Step "Free host ports $ApiPort / $WebPort / $AdminPort ..."
     Stop-ListenPort -Port $ApiPort
+    Stop-ListenPort -Port $WebPort
+    Stop-ListenPort -Port $AdminPort
     Start-Sleep -Seconds 1
 
     $upArgs = @("up", "-d")
@@ -215,21 +221,24 @@ try {
         throw "docker compose up failed (exit $LASTEXITCODE)"
     }
 
-    Wait-ApiHealthy
-
+    Wait-HttpOk -Name "API" -Url "http://127.0.0.1:$ApiPort/health" -TimeoutSec 180
     if (-not $SkipMigrate) {
         Invoke-Migrate
     } else {
         Write-Step "Skip migrate (-SkipMigrate)"
     }
 
+    Wait-HttpOk -Name "Web" -Url "http://127.0.0.1:$WebPort" -TimeoutSec 300
+    Wait-HttpOk -Name "Admin" -Url "http://127.0.0.1:$AdminPort" -TimeoutSec 300
+
     Write-Host ""
     Write-Step "Deploy done."
-    Write-Step "API     http://127.0.0.1:$ApiPort/health"
-    Write-Step "LiteLLM http://127.0.0.1:4000"
-    Write-Step "MQ UI   http://127.0.0.1:15672"
-    Write-Step "Web is NOT in Docker; use .\scripts\restart-dev.ps1 -SkipBackend  (proxy :8000)"
-    Write-Step "Stop:   .\scripts\deploy-docker.ps1 -Down"
+    Write-Host "  API     http://127.0.0.1:$ApiPort/health" -ForegroundColor Green
+    Write-Host "  Web     http://127.0.0.1:$WebPort" -ForegroundColor Green
+    Write-Host "  Admin   http://127.0.0.1:$AdminPort" -ForegroundColor Green
+    Write-Host "  LiteLLM http://127.0.0.1:4000"
+    Write-Host "  RabbitMQ http://127.0.0.1:15672"
+    Write-Step "Stop: .\scripts\deploy-docker.ps1 -Down"
 }
 finally {
     Pop-Location

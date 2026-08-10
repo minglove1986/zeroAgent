@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.modules.memory.extract_catalog_cache import reset_extract_fields_for_tests
 from app.modules.memory.service import (
     extract_memories_from_transcript,
     parse_auto_extract_rules,
@@ -15,20 +16,28 @@ from app.modules.memory.service import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _reset_catalog():
+    """避免本机 Redis 白名单污染解析单测。"""
+    reset_extract_fields_for_tests()
+    yield
+    reset_extract_fields_for_tests()
+
+
 def test_parse_memory_json_valid() -> None:
-    raw = '[{"memory_type":"fact","memory_key":"name","memory_value":"张三","confidence":0.9}]'
+    raw = '[{"memory_type":"fact","memory_key":"display_name","memory_value":"张三","confidence":0.9}]'
     items = parse_memory_json(raw)
     assert len(items) == 1
-    assert items[0]["memory_key"] == "name"
+    assert items[0]["memory_key"] == "display_name"
     assert items[0]["memory_value"] == "张三"
 
 
 def test_parse_memory_json_strips_fence_and_filters() -> None:
     raw = """```json
     [
-      {"memory_type":"fact","memory_key":"name","memory_value":"李四"},
+      {"memory_type":"fact","memory_key":"display_name","memory_value":"李四"},
       {"memory_type":"other","memory_key":"x","memory_value":"应丢弃"},
-      {"memory_type":"preference","memory_key":"style","memory_value":"简洁"},
+      {"memory_type":"preference","memory_key":"brevity","memory_value":"简洁"},
       {"memory_type":"summary","memory_key":"conv_digest","memory_value":"摘要"}
     ]
     ```"""
@@ -61,12 +70,12 @@ async def test_extract_llm_success(monkeypatch: pytest.MonkeyPatch) -> None:
     config.get_settings.cache_clear()
 
     async def _fake_json(*, messages, model=None):  # noqa: ANN001
-        return '[{"memory_type":"preference","memory_key":"style","memory_value":"简短"}]'
+        return '[{"memory_type":"preference","memory_key":"brevity","memory_value":"简短"}]'
 
     monkeypatch.setattr(llm_client, "chat_completion_json", _fake_json)
     items = await extract_memories_from_transcript("请以后用简短回答")
     assert items[0]["memory_type"] == "preference"
-    assert items[0]["memory_key"] == "style"
+    assert items[0]["memory_key"] == "brevity"
     config.get_settings.cache_clear()
 
 

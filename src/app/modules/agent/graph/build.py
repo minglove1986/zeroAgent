@@ -72,11 +72,13 @@ async def stream_agent_turn(
     max_steps: int | None = None,
     memory_access: str = "all",
     model: str | None = None,
+    enable_thinking: bool = False,
+    skip_understand_stage: bool = False,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """单轮 Agent 流式门面：透传 stream_plan_execute 事件。
 
     @author 赵振明
-    @date 2026-07-30 13:03:49
+    @date 2026-08-03 15:59:40
     """
     _ = await load_agent_skill_catalog(db, agent_id)
     async for item in stream_plan_execute(
@@ -91,5 +93,7 @@ async def stream_agent_turn(
         max_steps=max_steps,
         memory_access=memory_access,
         model=model,
+        enable_thinking=enable_thinking,
+        skip_understand_stage=skip_understand_stage,
     ):
         yield item

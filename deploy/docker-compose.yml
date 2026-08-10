@@ -216,6 +216,27 @@ services:
       retries: 20
       start_period: 40s
 
+  # ========== 员工端 (Next.js 应用) ==========
+  web:
+    build:
+      context: ..
+      dockerfile: web/Dockerfile
+    container_name: zeroagent-web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"  # 宿主机:容器（员工端默认端口）
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      # Next.js rewrite 代理目标（next.config.ts 运行时读取，容器内必须用 compose 服务名 api:8000）
+      API_PROXY_TARGET: http://api:8000
+      # 构建期注入（前端运行时可见；保留与现有约定一致）
+      NEXT_PUBLIC_API_PROXY_TARGET: http://api:8000
+      NODE_ENV: production
+    # Note: Session Cookie 跨域问题 – 前后端同域名不同端口需设置 SameSite=None;Secure(生产用 HTTPS)
+    # 开发环境可通过浏览器禁用 SameSite 或使用反向代理统一域名
+
   # ========== 管理后台 (独立 Next.js 应用) ==========
   admin_web:
     build:
@@ -224,12 +245,15 @@ services:
     container_name: zeroagent-admin-web
     restart: unless-stopped
     ports:
-      - "3001:3000"  # 宿主机:容器
+      - "3001:3001"  # 宿主机:容器（admin-web/package.json 的 start 脚本固定 -p 3001）
     depends_on:
       api:
         condition: service_healthy
     environment:
-      NEXT_PUBLIC_API_PROXY_TARGET: http://api:8000  # 内部 compose 服务名
+      # Next.js rewrite 代理目标（next.config.ts 运行时读取，容器内必须用 compose 服务名 api:8000）
+      API_PROXY_TARGET: http://api:8000
+      # 构建期注入（前端运行时可见；保留与现有约定一致）
+      NEXT_PUBLIC_API_PROXY_TARGET: http://api:8000
       # 前端自身不需要 Python 变量，但可注入用于调试
       NODE_ENV: production
     # Note: Session Cookie 跨域问题 – 前后端同域名不同端口需设置 SameSite=None;Secure(生产用 HTTPS)

@@ -159,9 +159,12 @@ async def test_stream_plan_execute_runtime_forwards_stages(monkeypatch):
 @pytest.mark.asyncio
 async def test_chitchat_emits_understand_and_respond(monkeypatch):
     """闲聊直答路径至少有 understand + respond 阶段。"""
+    from app.core.config import get_settings
     from app.modules.conversation import runtime as rt
     from app.modules.conversation.route import RouteDecision
 
+    monkeypatch.setenv("TURN_RUNTIME", "legacy")
+    get_settings.cache_clear()
     monkeypatch.setattr(
         rt,
         "resolve_route",
@@ -223,9 +226,6 @@ async def test_chitchat_emits_understand_and_respond(monkeypatch):
     )
     monkeypatch.setattr(rt, "_enqueue_extract", AsyncMock(return_value=None))
 
-    from app.core.config import get_settings
-
-    get_settings.cache_clear()
     monkeypatch.setenv("MOCK_EXTERNAL", "true")
     get_settings.cache_clear()
 
@@ -242,6 +242,7 @@ async def test_chitchat_emits_understand_and_respond(monkeypatch):
     stage_ids = [d["id"] for e, d in events if e == "stage"]
     assert "understand" in stage_ids
     assert "respond" in stage_ids
+    get_settings.cache_clear()
 
 
 @pytest.mark.asyncio
@@ -325,9 +326,12 @@ async def test_skill_fc_ask_user_has_need_info_thought(monkeypatch):
 @pytest.mark.asyncio
 async def test_kb_lookup_path_emits_retrieve_stages(monkeypatch):
     """system kb_lookup 须推送 stage/thought，不能只有正文。"""
+    from app.core.config import get_settings
     from app.modules.conversation import runtime as rt
     from app.modules.conversation.route import RouteDecision
 
+    monkeypatch.setenv("TURN_RUNTIME", "legacy")
+    get_settings.cache_clear()
     monkeypatch.setattr(
         rt,
         "resolve_route",

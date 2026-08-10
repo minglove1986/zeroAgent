@@ -1,17 +1,21 @@
 """配额与部门管理员范围（Task 9）。
 
 @author 赵振明
-@date 2026-07-21 16:43:06
+@date 2026-08-10 10:00:00
 """
 
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import app.models  # noqa: F401
 from app.core.config import get_settings
+from app.core.security import hash_password
 from app.main import create_app
 from app.shared.db import Base, get_db
 
@@ -26,6 +30,41 @@ async def client(monkeypatch: pytest.MonkeyPatch):
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    from app.models.department import Department
+    from app.models.role import BUILTIN_ROLES, Role
+    from app.models.user import User
+
+    async with session_factory() as db:
+        for code, name, desc, scope in BUILTIN_ROLES:
+            await db.execute(
+                insert(Role).values(
+                    code=code,
+                    name=name,
+                    description=desc,
+                    is_builtin=True,
+                    is_active=True,
+                    data_scope_default=scope,
+                )
+            )
+        await db.execute(insert(Department).values(id="dept_hr", name="HR", parent_id=None))
+        await db.execute(
+            insert(User).values(
+                id="usr_target",
+                username="xiaowang",
+                password_hash=hash_password("Passw0rd!"),
+                name="小王",
+                employee_no="E001",
+                email="a@b.com",
+                phone="13800138000",
+                position="工程师",
+                hire_date=date(2024, 1, 1),
+                main_department_id="dept_hr",
+                role="employee",
+                status="active",
+            )
+        )
+        await db.commit()
 
     async def _override_db():
         async with session_factory() as session:
@@ -54,25 +93,9 @@ async def test_daily_quota_exceeded_returns_42901(client: AsyncClient) -> None:
 
 @pytest.mark.asyncio
 async def test_department_admin_cannot_toggle_user(client: AsyncClient) -> None:
-    created = await client.post(
-        "/api/v1/users",
-        json={
-            "username": "xiaowang",
-            "password": "Passw0rd!",
-            "name": "小王",
-            "employee_no": "E001",
-            "email": "a@b.com",
-            "phone": "13800138000",
-            "position": "工程师",
-            "hire_date": "2024-01-01",
-            "main_department_id": "dept_hr",
-        },
-    )
-    assert created.status_code == 200
-    user_id = created.json()["data"]["id"]
-
+    """部门管理员禁止启停用户（D26）。"""
     resp = await client.patch(
-        f"/api/v1/users/{user_id}/status",
+        "/api/v1/users/usr_target/status",
         headers={"X-Role": "department_admin", "X-User-Id": "usr_admin"},
         json={"status": "disabled"},
     )
@@ -82,22 +105,28 @@ async def test_department_admin_cannot_toggle_user(client: AsyncClient) -> None:
 
 @pytest.mark.asyncio
 async def test_department_admin_conversation_redacted(client: AsyncClient) -> None:
-    conv = await client.post("/api/v1/conversations", json={"title": "含敏感"})
+    headers = {
+        "X-Role": "department_admin",
+        "X-User-Id": "usr_da",
+        "X-Department-Id": "dept_hr",
+    }
+    conv = await client.post(
+        "/api/v1/conversations",
+        headers=headers,
+        json={"title": "含敏感"},
+    )
+    assert conv.status_code == 200
     conversation_id = conv.json()["data"]["id"]
     await client.post(
         "/api/v1/messages/send",
+        headers=headers,
         json={"conversation_id": conversation_id, "content": "手机号13800138000"},
     )
 
-    listed = await client.get(
-        "/api/v1/conversations",
-        headers={"X-Role": "department_admin", "X-Department-Id": "dept_hr"},
-        params={"user_id": "usr_system"},
-    )
+    listed = await client.get("/api/v1/conversations", headers=headers)
     assert listed.status_code == 200
     items = listed.json()["data"]["items"]
     assert len(items) >= 1
-    # 脱敏：不应原样出现完整手机号
     blob = str(items)
     assert "13800138000" not in blob
     assert "138****8000" in blob or "***" in blob

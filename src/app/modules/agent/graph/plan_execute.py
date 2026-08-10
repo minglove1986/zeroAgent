@@ -72,6 +72,7 @@ class AgentState(TypedDict, total=False):
     max_steps: int
     context_system: str
     llm_model: str | None
+    enable_thinking: bool
 
 
 def _runtime_ctx(config: RunnableConfig) -> dict[str, Any]:
@@ -379,26 +380,264 @@ def _respond_system_content(state: AgentState) -> str:
     return f"{_RESPOND_PREAMBLE}\n\n【来源边界】\n{SOURCE_BOUNDARY_RULE}"
 
 
-async def _execute_respond(state: AgentState, step: PlanStep) -> str:
-    """执行 respond 步：注入分栏上下文后生成回复。
+async def _execute_respond(
+    state: AgentState, step: PlanStep, config: RunnableConfig | None = None
+) -> str:
+    """执行 respond 步：注入分栏上下文后流式生成，并向 custom stream 推 token。
+
+    开启 enable_thinking 时同步推 thought_delta（reasoning_content 或 <think> 标签）。
 
     @author 赵振明
-    @date 2026-07-27 10:06:11
+    @date 2026-08-03 16:01:46
     """
     args = dict(step.get("args") or {})
+    # 先宣告「整理回答」，再推思考/正文，避免思考跑在阶段标签前面
+    for item in iter_stage_enter("respond"):
+        _emit_sse_pair(item[0], item[1])
     preset = str(args.get("answer") or "").strip()
     if preset:
+        _emit_content_delta(preset)
+        for item in iter_stage_leave("respond", ok=True):
+            _emit_sse_pair(item[0], item[1])
         return preset
     user_content = str(args.get("query") or state.get("user_content") or "")
-    chat = get_chat_model(model=str(state.get("llm_model") or "") or None)
-    ai = await chat.ainvoke(
-        [
-            SystemMessage(content=_respond_system_content(state)),
-            HumanMessage(content=user_content),
-        ]
+    ctx = _runtime_ctx(config or {})
+    enable_thinking = bool(
+        ctx.get("enable_thinking") or state.get("enable_thinking")
     )
-    content = ai.content if isinstance(ai, AIMessage) else str(ai)
-    return content if isinstance(content, str) else str(content or "")
+    chat = get_chat_model(
+        model=str(state.get("llm_model") or "") or None,
+        enable_thinking=enable_thinking,
+    )
+    messages = [
+        SystemMessage(content=_respond_system_content(state)),
+        HumanMessage(content=user_content),
+    ]
+    splitter = _ThinkTagSplitter()
+    answer_parts: list[str] = []
+    try:
+        async for chunk in chat.astream(messages):
+            reasoning = _chunk_reasoning(chunk)
+            if reasoning:
+                _emit_thought_delta(reasoning)
+            text = _chunk_text(chunk)
+            if not text:
+                continue
+            for kind, delta in splitter.feed(text):
+                if kind == "thought":
+                    _emit_thought_delta(delta)
+                else:
+                    answer_parts.append(delta)
+                    _emit_content_delta(delta)
+        for kind, delta in splitter.flush():
+            if kind == "thought":
+                _emit_thought_delta(delta)
+            else:
+                answer_parts.append(delta)
+                _emit_content_delta(delta)
+    except Exception:
+        for item in iter_stage_leave("respond", ok=False):
+            _emit_sse_pair(item[0], item[1])
+        raise
+    for item in iter_stage_leave("respond", ok=True):
+        _emit_sse_pair(item[0], item[1])
+    return "".join(answer_parts).strip()
+
+
+class _ThinkTagSplitter:
+    """流式拆分 ``<think>...</think>``：思考进 thought，其余进 content。
+
+    MiniMax adaptive 常把推理包在正文标签里，而非独立 reasoning_content。
+
+    @author 赵振明
+    @date 2026-08-03 15:16:02
+    """
+
+    _OPEN = "<think>"
+    _CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_think = False
+
+    def feed(self, text: str) -> list[tuple[str, str]]:
+        """喂入增量，返回 (thought|content, delta) 列表。
+
+        @author 赵振明
+        @date 2026-08-03 15:16:02
+        """
+        if not text:
+            return []
+        self._buf += text
+        out: list[tuple[str, str]] = []
+        while True:
+            if self._in_think:
+                idx = self._buf.find(self._CLOSE)
+                if idx < 0:
+                    keep = self._holdback_len(self._CLOSE)
+                    emit = self._buf[:-keep] if keep else self._buf
+                    self._buf = self._buf[-keep:] if keep else ""
+                    if emit:
+                        out.append(("thought", emit))
+                    break
+                thought = self._buf[:idx]
+                if thought:
+                    out.append(("thought", thought))
+                self._buf = self._buf[idx + len(self._CLOSE) :]
+                self._in_think = False
+                continue
+            idx = self._buf.find(self._OPEN)
+            if idx < 0:
+                keep = self._holdback_len(self._OPEN)
+                emit = self._buf[:-keep] if keep else self._buf
+                self._buf = self._buf[-keep:] if keep else ""
+                if emit:
+                    out.append(("content", emit))
+                break
+            before = self._buf[:idx]
+            if before:
+                out.append(("content", before))
+            self._buf = self._buf[idx + len(self._OPEN) :]
+            self._in_think = True
+        return out
+
+    def flush(self) -> list[tuple[str, str]]:
+        """结束时冲刷缓冲残片。
+
+        @author 赵振明
+        @date 2026-08-03 15:16:02
+        """
+        if not self._buf:
+            return []
+        kind = "thought" if self._in_think else "content"
+        leftover = self._buf
+        self._buf = ""
+        return [(kind, leftover)]
+
+    def _holdback_len(self, tag: str) -> int:
+        """保留可能构成标签前缀的尾部，避免跨 chunk 切开标签。
+
+        @author 赵振明
+        @date 2026-08-03 15:16:02
+        """
+        max_keep = len(tag) - 1
+        if max_keep <= 0 or not self._buf:
+            return 0
+        tail = self._buf[-max_keep:]
+        for i in range(len(tail), 0, -1):
+            if tag.startswith(tail[-i:]):
+                return i
+        return 0
+
+
+def _chunk_text(chunk: Any) -> str:
+    """从 LC 流式 chunk 提取正文纯文本。
+
+    @author 赵振明
+    @date 2026-08-03 13:27:34
+    """
+    content = getattr(chunk, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        bits: list[str] = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                bits.append(str(p.get("text") or ""))
+            elif isinstance(p, str):
+                bits.append(p)
+        return "".join(bits)
+    if isinstance(chunk, AIMessage):
+        c = chunk.content
+        return c if isinstance(c, str) else str(c or "")
+    return ""
+
+
+def _chunk_reasoning(chunk: Any) -> str:
+    """从 LC 流式 chunk 提取模型思考增量。
+
+    @author 赵振明
+    @date 2026-08-03 14:59:17
+    """
+    ak = getattr(chunk, "additional_kwargs", None) or {}
+    if isinstance(ak, dict):
+        for key in ("reasoning_content", "reasoning", "thinking"):
+            val = ak.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+    meta = getattr(chunk, "response_metadata", None) or {}
+    if isinstance(meta, dict):
+        for key in ("reasoning_content", "reasoning", "thinking"):
+            val = meta.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+    content = getattr(chunk, "content", None)
+    if isinstance(content, list):
+        bits: list[str] = []
+        for p in content:
+            if not isinstance(p, dict):
+                continue
+            if p.get("type") in {"reasoning", "thinking"}:
+                bits.append(str(p.get("text") or p.get("thinking") or ""))
+        return "".join(bits)
+    return ""
+
+
+def _emit_content_delta(delta: str) -> None:
+    """向 LangGraph custom stream 推送 content_delta（不可用时静默）。
+
+    @author 赵振明
+    @date 2026-08-03 13:27:34
+    """
+    _emit_sse_pair("content_delta", {"delta": delta})
+
+
+def _emit_thought_delta(delta: str) -> None:
+    """向 LangGraph custom stream 推送模型思考（source=model）。
+
+    @author 赵振明
+    @date 2026-08-03 16:17:37
+    """
+    _emit_sse_pair("thought_delta", {"delta": delta, "source": "model"})
+
+
+def _emit_sse_pair(event: str, payload: dict[str, Any]) -> None:
+    """经 custom writer 推送 SSE 事件对；图外调用时静默。
+
+    @author 赵振明
+    @date 2026-08-03 16:17:37
+    """
+    if event == "content_delta" and not str(payload.get("delta") or ""):
+        return
+    if event == "thought_delta" and not str(payload.get("delta") or ""):
+        return
+    try:
+        from langgraph.config import get_stream_writer
+
+        writer = get_stream_writer()
+        if event == "content_delta":
+            writer({"type": event, "delta": str(payload.get("delta") or "")})
+        elif event == "thought_delta":
+            writer(
+                {
+                    "type": event,
+                    "delta": str(payload.get("delta") or ""),
+                    "source": str(payload.get("source") or "narration"),
+                }
+            )
+        elif event == "stage":
+            writer(
+                {
+                    "type": "stage",
+                    "id": payload.get("id"),
+                    "label": payload.get("label"),
+                    "status": payload.get("status"),
+                }
+            )
+        else:
+            writer({"type": event, **payload})
+    except Exception:  # noqa: BLE001
+        return
 
 
 async def _node_execute(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
@@ -428,7 +667,7 @@ async def _node_execute(state: AgentState, config: RunnableConfig) -> dict[str, 
         elif kind == "call_agent":
             obs = "call_agent 未启用（P0 stub）。"
         else:
-            obs = await _execute_respond(state, step)
+            obs = await _execute_respond(state, step, config)
             final_answer = obs
     except Exception as exc:  # noqa: BLE001
         obs = f"步骤执行失败：{exc}"
@@ -488,7 +727,12 @@ async def _node_aggregate(state: AgentState, config: RunnableConfig) -> dict[str
             parts.append(obs)
 
     if not parts:
-        answer = "未能生成有效回答。"
+        # 优先透出上游错误（如 LiteLLM/供应商 429），避免只剩笼统兜底文案
+        upstream = str(state.get("error") or "").strip()
+        if upstream:
+            answer = f"未能生成有效回答：{upstream}"
+        else:
+            answer = "未能生成有效回答。"
         return {"final_answer": answer, "ok": False, "error": state.get("error")}
 
     if len(parts) == 1:
@@ -648,11 +892,15 @@ async def stream_plan_execute(
     max_steps: int | None = None,
     memory_access: str = "all",
     model: str | None = None,
+    enable_thinking: bool = False,
+    skip_understand_stage: bool = False,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """流式执行 Plan-Execute：yield stage/thought_delta，最后 yield (__result__, result)。
 
+    skip_understand_stage：Turn Graph 已报过「理解」时置 True，避免重复。
+
     @author 赵振明
-    @date 2026-07-30 13:03:49
+    @date 2026-08-03 15:59:40
     """
     settings = get_settings()
     catalog = await load_agent_skill_catalog(db, agent_id)
@@ -682,6 +930,7 @@ async def stream_plan_execute(
         "max_steps": steps_cap,
         "context_system": context_system,
         "llm_model": llm_model,
+        "enable_thinking": bool(enable_thinking),
     }
     config: RunnableConfig = {
         "configurable": {
@@ -695,13 +944,15 @@ async def stream_plan_execute(
             "memory_access": memory_access,
             "context_system": context_system,
             "llm_model": llm_model,
+            "enable_thinking": bool(enable_thinking),
         }
     }
 
-    for item in iter_stage_enter("understand"):
-        yield item
-    for item in iter_stage_leave("understand", ok=True):
-        yield item
+    if not skip_understand_stage:
+        for item in iter_stage_enter("understand"):
+            yield item
+        for item in iter_stage_leave("understand", ok=True):
+            yield item
 
     for item in iter_stage_enter("plan"):
         yield item
@@ -711,7 +962,40 @@ async def stream_plan_execute(
     saw_respond_stage = False
     plan_left = False
 
-    async for update in graph.astream(initial, config=config, stream_mode="updates"):
+    async for item in graph.astream(
+        initial, config=config, stream_mode=["updates", "custom"]
+    ):
+        mode = "updates"
+        payload: Any = item
+        if isinstance(item, tuple) and len(item) == 2:
+            mode, payload = item[0], item[1]
+
+        if mode == "custom":
+            if isinstance(payload, dict):
+                typ = str(payload.get("type") or "")
+                if typ == "content_delta":
+                    delta = str(payload.get("delta") or "")
+                    if delta:
+                        yield "content_delta", {"delta": delta}
+                elif typ == "thought_delta":
+                    delta = str(payload.get("delta") or "")
+                    if delta:
+                        yield "thought_delta", {
+                            "delta": delta,
+                            "source": str(payload.get("source") or "narration"),
+                        }
+                elif typ == "stage":
+                    stage_id = str(payload.get("id") or "")
+                    if stage_id == "respond":
+                        saw_respond_stage = True
+                    yield "stage", {
+                        "id": stage_id,
+                        "label": payload.get("label") or stage_id,
+                        "status": payload.get("status") or "running",
+                    }
+            continue
+
+        update = payload
         if not isinstance(update, dict):
             continue
         for node_name, partial in update.items():
@@ -720,15 +1004,15 @@ async def stream_plan_execute(
 
             if node_name == "plan":
                 if not plan_left:
-                    for item in iter_stage_leave("plan", ok=True):
-                        yield item
+                    for stage_item in iter_stage_leave("plan", ok=True):
+                        yield stage_item
                     plan_left = True
                 continue
 
             if node_name == "execute":
                 if not plan_left:
-                    for item in iter_stage_leave("plan", ok=True):
-                        yield item
+                    for stage_item in iter_stage_leave("plan", ok=True):
+                        yield stage_item
                     plan_left = True
                 plan = list(final_state.get("plan") or [])
                 cursor = int(final_state.get("plan_cursor") or 0)
@@ -739,38 +1023,40 @@ async def stream_plan_execute(
                 stage_id = _KIND_TO_STAGE.get(kind)
                 if stage_id is None:
                     continue
+                # respond 阶段已在 _execute_respond 内经 custom 推送，避免事后再报一遍
+                if stage_id == "respond":
+                    saw_respond_stage = True
+                    continue
                 ok = str(step.get("status") or "") != "failed"
                 skill_name = None
                 if stage_id == "skill":
                     skill_name = _skill_display_name(
                         catalog, step.get("skill_id")  # type: ignore[arg-type]
                     )
-                if stage_id == "respond":
-                    saw_respond_stage = True
-                for item in iter_stage_enter(stage_id, skill_name=skill_name):
-                    yield item
-                for item in iter_stage_leave(
+                for stage_item in iter_stage_enter(stage_id, skill_name=skill_name):
+                    yield stage_item
+                for stage_item in iter_stage_leave(
                     stage_id, ok=ok, skill_name=skill_name
                 ):
-                    yield item
+                    yield stage_item
                 continue
 
             if node_name == "aggregate":
                 if not plan_left:
-                    for item in iter_stage_leave("plan", ok=True):
-                        yield item
+                    for stage_item in iter_stage_leave("plan", ok=True):
+                        yield stage_item
                     plan_left = True
                 if not saw_respond_stage:
-                    for item in iter_stage_enter("respond"):
-                        yield item
+                    for stage_item in iter_stage_enter("respond"):
+                        yield stage_item
                     agg_ok = not bool(final_state.get("error"))
-                    for item in iter_stage_leave("respond", ok=agg_ok):
-                        yield item
+                    for stage_item in iter_stage_leave("respond", ok=agg_ok):
+                        yield stage_item
                     saw_respond_stage = True
 
     if not plan_left:
-        for item in iter_stage_leave("plan", ok=True):
-            yield item
+        for stage_item in iter_stage_leave("plan", ok=True):
+            yield stage_item
 
     yield ("__result__", _build_plan_result(final_state))
 

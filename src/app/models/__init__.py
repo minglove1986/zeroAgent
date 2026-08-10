@@ -36,10 +36,12 @@ from app.models.notification import Notification
 from app.models.prompt import PromptTemplate, PromptTemplateVersion
 from app.models.usage import DailyUsage
 from app.models.user import User
+from app.models.user_session import UserSession
 from app.models.workflow import Workflow, WorkflowInstance
 
 __all__ = [
     "User",
+    "UserSession",
     "Department",
     "UserDepartment",
     "KnowledgeBase",

@@ -11,10 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
-import uuid
 from typing import Any, AsyncIterator
-
-import httpx
 
 from app.core.config import get_settings
 from app.modules.llm.tokens import (
@@ -51,13 +48,16 @@ async def stream_chat_completion(
     messages: list[dict[str, Any]],
     model: str | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-    """经 LiteLLM Proxy 流式补全。
+    """经 LangChain → LiteLLM Proxy 流式补全。
 
     yield: (chunk, meta) meta.event = delta | usage
+
+    @author 赵振明
+    @date 2026-08-03 11:21:06
     """
     settings = get_settings()
     use_model = model or settings.litellm_model
-    logger.info("llm.stream_chat model=%s", use_model)
+    logger.info("llm.stream_chat model=%s via=langchain", use_model)
 
     if settings.mock_external:
         # 单测：模型名以 fail 开头则模拟上游失败
@@ -101,45 +101,39 @@ async def stream_chat_completion(
         yield "", {"event": "usage", **usage}
         return
 
-    url = settings.litellm_proxy_url.rstrip("/") + "/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {settings.litellm_master_key}",
-        "Content-Type": "application/json",
-    }
-    payload: dict[str, Any] = {
-        "model": use_model,
-        "messages": messages,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-        "max_tokens": 2048,
-        # 国内 MiniMax-M3：避免 reasoning 占满输出导致 content 为空
-        "thinking": {"type": "disabled"},
-    }
+    from app.modules.llm.lc_chat import (
+        content_to_text,
+        dict_messages_to_lc,
+        get_chat_model,
+    )
+
+    chat = get_chat_model(model=use_model)
+    lc_messages = dict_messages_to_lc(messages)
     collected: list[str] = []
     last_usage: dict[str, Any] | None = None
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        async with client.stream("POST", url, headers=headers, json=payload) as resp:
-            if resp.status_code >= 400:
-                body = (await resp.aread()).decode("utf-8", errors="replace")
-                raise RuntimeError(
-                    f"LiteLLM {resp.status_code} model={use_model}: {body[:500]}"
-                )
-            async for line in resp.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if not data or data == "[DONE]":
-                    continue
-                chunk = json.loads(data)
-                if chunk.get("usage"):
-                    parsed = parse_litellm_usage(chunk.get("usage"))
-                    if parsed:
-                        last_usage = parsed
-                delta = chunk.get("choices", [{}])[0].get("delta", {}) or {}
-                text = delta.get("content") or delta.get("reasoning_content")
-                if text:
-                    collected.append(text)
-                    yield text, {"event": "delta"}
+    async for chunk in chat.astream(lc_messages):
+        text = content_to_text(getattr(chunk, "content", None))
+        if text:
+            collected.append(text)
+            yield text, {"event": "delta"}
+        usage_meta = getattr(chunk, "usage_metadata", None)
+        if isinstance(usage_meta, dict) and usage_meta:
+            parsed = parse_litellm_usage(usage_meta)
+            if parsed:
+                last_usage = parsed
+            else:
+                # LangChain usage_metadata: input_tokens / output_tokens
+                try:
+                    pt = int(usage_meta.get("input_tokens") or 0)
+                    ct = int(usage_meta.get("output_tokens") or 0)
+                    if pt or ct:
+                        last_usage = {
+                            "prompt_tokens": pt,
+                            "completion_tokens": ct,
+                            "total_tokens": pt + ct,
+                        }
+                except (TypeError, ValueError):
+                    pass
     if last_usage:
         yield "", {"event": "usage", **last_usage}
     else:
@@ -199,11 +193,14 @@ async def chat_completion_with_tools(
 ) -> dict[str, Any]:
     """非流式补全（可带 tools）。返回 {content, tool_calls, model}。
 
-    tool_calls 项: {id, name, arguments}
+    经 LangChain bind_tools → LiteLLM；tool_calls 项: {id, name, arguments}。
+
+    @author 赵振明
+    @date 2026-08-03 11:21:06
     """
     settings = get_settings()
     use_model = model or settings.litellm_model
-    logger.info("llm.chat_with_tools model=%s", use_model)
+    logger.info("llm.chat_with_tools model=%s via=langchain", use_model)
     tool_names = {
         (t.get("function") or {}).get("name")
         for t in tools
@@ -347,54 +344,45 @@ async def chat_completion_with_tools(
             content=reply, tool_calls=[], model=use_model, messages=messages
         )
 
-    url = settings.litellm_proxy_url.rstrip("/") + "/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {settings.litellm_master_key}",
-        "Content-Type": "application/json",
-    }
-    payload: dict[str, Any] = {
-        "model": use_model,
-        "messages": messages,
-        "tools": tools,
-        "tool_choice": "auto",
-        "stream": False,
-        "max_tokens": 2048,
-        "thinking": {"type": "disabled"},
-    }
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(url, headers=headers, json=payload)
-        if resp.status_code >= 400:
-            raise RuntimeError(
-                f"LiteLLM {resp.status_code} model={use_model}: {resp.text[:500]}"
-            )
-        data = resp.json()
-        choice = (data.get("choices") or [{}])[0]
-        message = choice.get("message") or {}
-        content = message.get("content")
-        raw_calls = message.get("tool_calls") or []
-        parsed: list[dict[str, Any]] = []
-        for tc in raw_calls:
-            fn = tc.get("function") or {}
-            args_raw = fn.get("arguments") or "{}"
+    from app.modules.llm.lc_chat import (
+        content_to_text,
+        dict_messages_to_lc,
+        get_chat_model,
+        normalize_lc_tool_calls,
+    )
+
+    chat = get_chat_model(model=use_model)
+    lc_messages = dict_messages_to_lc(messages)
+    if tools:
+        runnable = chat.bind_tools(tools)
+    else:
+        runnable = chat.bind(max_tokens=2048)
+    result = await runnable.ainvoke(lc_messages)
+    content = content_to_text(getattr(result, "content", None)) or None
+    parsed = normalize_lc_tool_calls(getattr(result, "tool_calls", None))
+    usage_meta = getattr(result, "usage_metadata", None)
+    usage = None
+    if isinstance(usage_meta, dict) and usage_meta:
+        usage = parse_litellm_usage(usage_meta)
+        if usage is None:
             try:
-                args = json.loads(args_raw) if isinstance(args_raw, str) else dict(args_raw)
-            except json.JSONDecodeError:
-                args = {"_raw": args_raw}
-            parsed.append(
-                {
-                    "id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
-                    "name": fn.get("name") or "",
-                    "arguments": args if isinstance(args, dict) else {"value": args},
-                }
-            )
-        usage = parse_litellm_usage(data.get("usage"))
-        return _tools_result(
-            content=content,
-            tool_calls=parsed,
-            model=use_model,
-            messages=messages,
-            usage=usage,
-        )
+                pt = int(usage_meta.get("input_tokens") or 0)
+                ct = int(usage_meta.get("output_tokens") or 0)
+                if pt or ct:
+                    usage = {
+                        "prompt_tokens": pt,
+                        "completion_tokens": ct,
+                        "total_tokens": pt + ct,
+                    }
+            except (TypeError, ValueError):
+                usage = None
+    return _tools_result(
+        content=content,
+        tool_calls=parsed,
+        model=use_model,
+        messages=messages,
+        usage=usage,
+    )
 
 
 async def chat_completion_json(
@@ -402,42 +390,26 @@ async def chat_completion_json(
     messages: list[dict[str, str]],
     model: str | None = None,
 ) -> str:
-    """非流式补全，返回完整文本（供记忆 JSON 抽取）。"""
+    """非流式补全，返回完整文本（供记忆 JSON / L3）。
+
+    经 LangChain ChatOpenAI → LiteLLM Proxy，禁止本路径再发纯 httpx chat。
+
+    @author 赵振明
+    @date 2026-08-03 11:21:06
+    """
     settings = get_settings()
     use_model = model or settings.litellm_model
-    logger.info("llm.chat_json model=%s", use_model)
+    logger.info("llm.chat_json model=%s via=langchain", use_model)
 
     if settings.mock_external:
         return "[]"
 
-    url = settings.litellm_proxy_url.rstrip("/") + "/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {settings.litellm_master_key}",
-        "Content-Type": "application/json",
-    }
-    payload: dict[str, Any] = {
-        "model": use_model,
-        "messages": messages,
-        "stream": False,
-        "max_tokens": 1024,
-        "thinking": {"type": "disabled"},
-    }
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(url, headers=headers, json=payload)
-        if resp.status_code >= 400:
-            raise RuntimeError(
-                f"LiteLLM {resp.status_code} model={use_model}: {resp.text[:500]}"
-            )
-        data = resp.json()
-        choice = (data.get("choices") or [{}])[0]
-        message = choice.get("message") or {}
-        content = message.get("content") or ""
-        if isinstance(content, list):
-            parts: list[str] = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    parts.append(str(part.get("text") or ""))
-                elif isinstance(part, str):
-                    parts.append(part)
-            content = "".join(parts)
-        return str(content or "")
+    from app.modules.llm.lc_chat import (
+        content_to_text,
+        dict_messages_to_lc,
+        get_chat_model,
+    )
+
+    chat = get_chat_model(model=use_model).bind(max_tokens=1024)
+    result = await chat.ainvoke(dict_messages_to_lc([dict(m) for m in messages]))
+    return content_to_text(getattr(result, "content", None))

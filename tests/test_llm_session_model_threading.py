@@ -39,9 +39,73 @@ def test_conversation_critical_modules_do_not_call_bare_get_chat_model():
 
 
 @pytest.mark.asyncio
+async def test_turn_graph_forwards_session_model(monkeypatch):
+    """Turn Main Graph 须把会话模型传入 system_agent → get_chat_model。"""
+    from app.core.config import get_settings
+    from app.modules.conversation.turn_graph import reset_turn_graph_for_tests, run_turn
+    from app.modules.intent.decision import IntentDecision
+
+    monkeypatch.setenv("TURN_RUNTIME", "langgraph")
+    monkeypatch.setenv("TURN_CHECKPOINTER", "memory")
+    monkeypatch.setenv("MOCK_EXTERNAL", "true")
+    monkeypatch.setenv("SYSTEM_AGENT_MODE", "respond_only")
+    get_settings.cache_clear()
+    reset_turn_graph_for_tests()
+    captured: dict[str, object] = {}
+
+    async def _fake_chitchat(text, **kwargs):
+        return IntentDecision(
+            intent="chitchat",
+            confidence=0.9,
+            funnel_layer="L4",
+            query=text,
+            reason="test",
+            features=[],
+        )
+
+    real_get = None
+    from app.modules.conversation.subgraphs import system_agent as sa
+
+    import app.modules.llm.gateway as gw
+
+    real_get = gw.get_chat_model
+
+    def wrap_get(*, model=None):
+        captured["model"] = model
+        return real_get(model=model)
+
+    monkeypatch.setattr(
+        "app.modules.conversation.subgraphs.intent_node.evaluate_intent_funnel_async",
+        _fake_chitchat,
+    )
+    monkeypatch.setattr(
+        "app.modules.conversation.subgraphs.memory_schedule.schedule_memory_extract",
+        lambda **kw: {"scheduled": [], "skipped": True},
+    )
+    monkeypatch.setattr(sa, "get_chat_model", wrap_get)
+    reset_turn_graph_for_tests()
+
+    await run_turn(
+        db=None,
+        user_id="u1",
+        conversation_id="c_model",
+        user_content="hi",
+        model="agnes-2.5-flash",
+    )
+    assert captured.get("model") == "agnes-2.5-flash"
+    get_settings.cache_clear()
+    reset_turn_graph_for_tests()
+
+
+
+@pytest.mark.asyncio
 async def test_stream_mock_reply_forwards_model_to_all_turn_paths(monkeypatch):
     """发消息时 primary 模型须传到路由 / Agent / KB / 文档理解。"""
+    from app.core.config import get_settings
     from app.modules.conversation import runtime as rt
+
+    monkeypatch.setenv("TURN_RUNTIME", "legacy")
+    get_settings.cache_clear()
 
     captured: dict[str, object] = {}
 
@@ -115,7 +179,11 @@ async def test_stream_mock_reply_forwards_model_to_all_turn_paths(monkeypatch):
 @pytest.mark.asyncio
 async def test_kb_and_doc_and_agent_receive_session_model(monkeypatch):
     """KB / doc_analyze / plan_execute 入口须收到会话模型。"""
+    from app.core.config import get_settings
     from app.modules.conversation import runtime as rt
+
+    monkeypatch.setenv("TURN_RUNTIME", "legacy")
+    get_settings.cache_clear()
 
     captured: dict[str, object] = {}
 
@@ -215,7 +283,15 @@ async def test_kb_and_doc_and_agent_receive_session_model(monkeypatch):
     monkeypatch.setattr(rt, "resolve_route", fake_resolve_agent)
     monkeypatch.setattr(
         "app.core.config.get_settings",
-        lambda: type("S", (), {"agent_runtime": "langgraph", "mock_external": True})(),
+        lambda: type(
+            "S",
+            (),
+            {
+                "agent_runtime": "langgraph",
+                "turn_runtime": "legacy",
+                "mock_external": True,
+            },
+        )(),
     )
     monkeypatch.setattr(rt, "_stream_plan_execute", fake_plan)
     monkeypatch.setattr(rt, "load_agent_openai_tools", AsyncMock(return_value=[{"x": 1}]))

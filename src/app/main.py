@@ -17,6 +17,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from app.api.v1.router import api_router
 from app.core.config import get_settings
 from app.modules.admin.dependencies import _AuthError, admin_auth_error_handler
+from app.core.permissions import AuthzError, authz_error_handler
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +139,7 @@ def create_app() -> FastAPI:
         https_only=False,
     )
     app.add_exception_handler(_AuthError, admin_auth_error_handler)
+    app.add_exception_handler(AuthzError, authz_error_handler)
     app.include_router(api_router)
     return app
 

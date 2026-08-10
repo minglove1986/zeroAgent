@@ -151,6 +151,7 @@ def schedule_memory_extract(
     allow_memory_write: bool = True,
     route_reason: str = "",
     route_kind: str = "",
+    idle_seconds: int | None = None,
 ) -> dict[str, Any]:
     """对话结束后异步调度（不 await LLM）。
 
@@ -167,20 +168,33 @@ def schedule_memory_extract(
         return result
 
     settings = get_settings()
-    idle = int(settings.memory_extract_idle_seconds or 180)
+    idle = int(
+        idle_seconds
+        if idle_seconds is not None
+        else (settings.memory_extract_idle_seconds or 180)
+    )
     window_n = int(settings.memory_extract_window_turns or 12)
 
     _touch_idle(conversation_id, idle)
 
-    if is_explicit_remember(transcript):
+    # 显式记住 / 规则可抽到事实：立即投递；正文取短记忆全文（「记住我的名字」本身不含姓名）
+    from app.modules.memory.service import parse_auto_extract_rules
+
+    rule_hits = parse_auto_extract_rules(transcript)
+    want_immediate = is_explicit_remember(transcript) or bool(rule_hits)
+    if want_immediate:
+        full_now = build_transcript_from_short(
+            user_id=user_id, conversation_id=conversation_id, fallback=transcript
+        )
+        trigger = "explicit" if is_explicit_remember(transcript) else "rule_hit"
         if _dispatch_celery(
             user_id=user_id,
             conversation_id=conversation_id,
-            transcript=transcript,
+            transcript=full_now,
             countdown=0,
-            trigger="explicit",
+            trigger=trigger,
         ):
-            result["scheduled"].append("explicit")
+            result["scheduled"].append(trigger)
 
     turns = load_short_memory(user_id=user_id, conversation_id=conversation_id)
     if len(turns) >= window_n and not _window_recently_fired(conversation_id):

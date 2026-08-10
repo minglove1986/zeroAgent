@@ -148,8 +148,8 @@ async def test_get_actor_ignores_test_headers_in_production(
         "/api/v1/admin/_probe",
         headers={"X-Role": "platform_admin", "X-User-Id": "usr_fake"},
     )
-    assert r.json()["actor_id"] == "usr_system"
-    assert r.json()["role"] == "employee"
+    assert r.json()["actor_id"] == ""
+    assert r.json()["role"] == ""
 
 
 @pytest.mark.asyncio

@@ -161,8 +161,17 @@ async def client_eager(tmp_path, monkeypatch: pytest.MonkeyPatch):
 
 @pytest.mark.asyncio
 async def test_upload_eager_reaches_pending_review(client_eager: AsyncClient) -> None:
-    kb = await client_eager.post("/api/v1/knowledge-bases", json={"name": "KB", "description": "d"})
-    kb_id = kb.json()["data"]["id"]
+    """eager 入库须落到 pending_review；创建 KB 须超管头（MOCK_EXTERNAL）。"""
+    admin_headers = {"X-Role": "platform_admin", "X-User-Id": "usr_admin"}
+    kb = await client_eager.post(
+        "/api/v1/knowledge-bases",
+        json={"name": "KB", "description": "d"},
+        headers=admin_headers,
+    )
+    body = kb.json()
+    assert kb.status_code == 200, body
+    assert body.get("code") == 0, body
+    kb_id = body["data"]["id"]
     content_b64 = base64.b64encode(b"hello world").decode("ascii")
     resp = await client_eager.post(
         "/api/v1/documents/upload",
@@ -172,8 +181,9 @@ async def test_upload_eager_reaches_pending_review(client_eager: AsyncClient) ->
             "content_b64": content_b64,
             "filename": "readme.txt",
         },
+        headers=admin_headers,
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.json()
     doc_id = resp.json()["data"]["document_id"]
     factory = client_eager._session_factory  # type: ignore[attr-defined]
     async with factory() as db:

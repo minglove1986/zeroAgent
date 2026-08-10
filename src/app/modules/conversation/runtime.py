@@ -376,29 +376,225 @@ async def _enqueue_extract(
     route_reason: str = "",
     route_kind: str = "",
     model_name: str | None = None,
+    skip_memory_extract: bool = False,
 ) -> None:
     """对话结束后异步调度记忆抽取与上下文压缩（禁止 await LLM）。
 
+    Turn Graph 已跑 memory_schedule 时传 skip_memory_extract=True，避免二次投递。
+
     @author 赵振明
-    @date 2026-07-30 14:03:22
+    @date 2026-08-03 12:48:20
     """
     _ = db
     from app.modules.conversation.compress_scheduler import schedule_context_compress
     from app.modules.memory.extract_scheduler import schedule_memory_extract
 
-    schedule_memory_extract(
-        user_id=user_id,
-        conversation_id=conversation_id,
-        transcript=transcript,
-        allow_memory_write=allow_memory_write,
-        route_reason=route_reason,
-        route_kind=route_kind,
-    )
+    if not skip_memory_extract:
+        schedule_memory_extract(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            transcript=transcript,
+            allow_memory_write=allow_memory_write,
+            route_reason=route_reason,
+            route_kind=route_kind,
+        )
     schedule_context_compress(
         user_id=user_id,
         conversation_id=conversation_id,
         model_name=model_name,
     )
+
+
+async def _stream_via_turn_graph(
+    db: AsyncSession,
+    *,
+    conversation_id: str,
+    user_content: str,
+    user_id: str,
+    memory_access: str,
+    allow_memory_write: bool,
+    msg_meta: dict[str, Any] | None,
+    agent_id: str | None,
+    department_ids: list[str] | None,
+    role_ids: list[str] | None,
+    is_platform_admin: bool,
+    model: str | None,
+    model_ids: list[str] | None,
+    enable_thinking: bool = False,
+) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    """Turn Main Graph 适配层：映射 SSE；business/system handoff 走 Plan-Execute。
+
+    @author 赵振明
+    @date 2026-08-03 14:59:17
+    """
+    from app.modules.conversation.route import RouteDecision
+    from app.modules.conversation.turn_graph import stream_turn
+    from app.modules.conversation.turn_state import SYSTEM_AGENT_ID
+    from app.modules.conversation.compress_scheduler import schedule_context_compress
+
+    async for ev_name, payload in stream_turn(
+        db=db,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        user_content=user_content,
+        agent_id=agent_id,
+        model=model,
+        allow_memory_write=allow_memory_write,
+        memory_access=memory_access,
+        department_ids=department_ids,
+        role_ids=role_ids,
+        is_platform_admin=is_platform_admin,
+        msg_meta=msg_meta,
+        enable_thinking=enable_thinking,
+    ):
+        if ev_name == "__handoff__":
+            dispatch = str((payload or {}).get("dispatch") or "")
+            route_raw = dict((payload or {}).get("route") or {})
+            route = RouteDecision(
+                kind=route_raw.get("kind") or "chitchat",  # type: ignore[arg-type]
+                query=str(route_raw.get("query") or user_content),
+                confidence=float(route_raw.get("confidence") or 0),
+                layer=str(route_raw.get("layer") or ""),
+                reason=str(route_raw.get("reason") or ""),
+                handler="system",
+                slots=dict(route_raw.get("slots") or {}),
+                features=list(route_raw.get("features") or []),
+            )
+            meta = dict((payload or {}).get("msg_meta") or msg_meta or {})
+            meta.update(route.to_meta())
+            if dispatch == "business_agent":
+                if not agent_id:
+                    notice = "当前 Agent 不可用。"
+                    for ch in notice:
+                        yield "content_delta", {"delta": ch}
+                    msg_id, _ = await persist_assistant_and_card(
+                        db,
+                        conversation_id=conversation_id,
+                        assistant_text=notice,
+                        card_payload=None,
+                        meta=meta,
+                    )
+                    yield "message_end", {
+                        "message_id": msg_id,
+                        "status": "error",
+                        "path": "turn_graph",
+                    }
+                    return
+                pe_agent_id = agent_id
+            elif dispatch == "system_agent":
+                pe_agent_id = SYSTEM_AGENT_ID
+            else:
+                continue
+            # 主图 memory_schedule 已调度；此处禁止二次 extract
+            async for ev in _stream_plan_execute(
+                db,
+                conversation_id=conversation_id,
+                user_content=user_content,
+                user_id=user_id,
+                memory_access=memory_access,
+                allow_memory_write=allow_memory_write,
+                msg_meta=meta,
+                agent_id=pe_agent_id,
+                department_ids=department_ids,
+                role_ids=role_ids,
+                is_platform_admin=is_platform_admin,
+                model=model,
+                skip_memory_extract=True,
+                enable_thinking=enable_thinking,
+                skip_understand_stage=True,
+            ):
+                yield ev
+            return
+
+        if ev_name == "__turn__":
+            final_state = dict(payload or {})
+            route_raw = dict(final_state.get("route") or {})
+            answer = str(final_state.get("final_answer") or "")
+            deferred = final_state.get("deferred_card")
+            card_payload = None
+            if isinstance(deferred, dict) and deferred.get("_build") == "route_clarify":
+                route = RouteDecision(
+                    kind=route_raw.get("kind") or "clarify_kb",  # type: ignore[arg-type]
+                    query=str(route_raw.get("query") or user_content),
+                    confidence=float(route_raw.get("confidence") or 0),
+                    layer=str(route_raw.get("layer") or ""),
+                    reason=str(route_raw.get("reason") or ""),
+                    handler="clarify",
+                    slots=dict(route_raw.get("slots") or {}),
+                    features=list(route_raw.get("features") or []),
+                )
+                card_payload = build_route_clarify_card(route)
+            elif isinstance(deferred, dict) and deferred.get("_build") == "ask_form":
+                card_payload = ask_user_to_card_payload(mock_leave_ask_user_args())
+            elif isinstance(deferred, dict) and deferred.get("card_type"):
+                card_payload = deferred
+
+            usage = estimate_turn_usage(
+                [{"role": "user", "content": user_content}], answer
+            )
+            ctx = _context_info(
+                [{"role": "user", "content": user_content}], model_name=model
+            )
+            meta = {
+                **(msg_meta or {}),
+                "usage": usage,
+                "context": ctx,
+                "path": "turn_graph",
+                "effective_agent_id": final_state.get("effective_agent_id"),
+                "intent": final_state.get("intent"),
+                "route": route_raw,
+                "memory_schedule": final_state.get("memory_schedule"),
+                **(
+                    RouteDecision(
+                        kind=route_raw.get("kind") or "chitchat",  # type: ignore[arg-type]
+                        query=str(route_raw.get("query") or user_content),
+                        confidence=float(route_raw.get("confidence") or 0),
+                        layer=str(route_raw.get("layer") or ""),
+                        reason=str(route_raw.get("reason") or ""),
+                        handler=str(route_raw.get("handler") or "system"),  # type: ignore[arg-type]
+                        slots=dict(route_raw.get("slots") or {}),
+                        features=list(route_raw.get("features") or []),
+                    ).to_meta()
+                    if route_raw
+                    else {}
+                ),
+            }
+            msg_id, _ = await persist_assistant_and_card(
+                db,
+                conversation_id=conversation_id,
+                assistant_text=answer,
+                card_payload=card_payload,
+                meta=meta,
+            )
+            if answer:
+                append_short_memory(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    role="assistant",
+                    content=answer,
+                )
+            if card_payload:
+                yield "card", card_payload
+            turn_status = str(final_state.get("turn_status") or "")
+            if not turn_status:
+                turn_status = "awaiting_card" if card_payload else "completed"
+            yield "message_end", {
+                "message_id": msg_id,
+                "status": turn_status,
+                "path": "turn_graph",
+                "usage": usage,
+                "context": ctx,
+                "effective_agent_id": final_state.get("effective_agent_id"),
+                "memory_schedule": final_state.get("memory_schedule"),
+            }
+            schedule_context_compress(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                model_name=model,
+            )
+            return
+
+        yield ev_name, payload
 
 
 def _build_llm_messages(
@@ -718,13 +914,21 @@ async def _stream_plan_execute(
     role_ids: list[str] | None = None,
     is_platform_admin: bool = False,
     model: str | None = None,
+    skip_memory_extract: bool = False,
+    enable_thinking: bool = False,
+    skip_understand_stage: bool = False,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Plan-Execute 主图 SSE：过程事件 + citations + answer + 可选 deferred_card。
 
+    skip_memory_extract：Turn Graph 已调度记忆时置 True，仅保留压缩调度。
+    enable_thinking：透传模型原生 thinking → thought_delta。
+    skip_understand_stage：Turn Graph 已报「理解」时置 True。
+
     @author 赵振明
-    @date 2026-07-30 13:03:49
+    @date 2026-08-03 15:59:40
     """
     result: dict[str, Any] | None = None
+    content_streamed = False
     async for ev, data in stream_agent_turn(
         db,
         agent_id,
@@ -736,10 +940,14 @@ async def _stream_plan_execute(
         is_platform_admin=is_platform_admin,
         memory_access=memory_access,
         model=model,
+        enable_thinking=enable_thinking,
+        skip_understand_stage=skip_understand_stage,
     ):
         if ev == "__result__":
             result = data
             continue
+        if ev == "content_delta":
+            content_streamed = True
         yield ev, data
 
     if result is None:
@@ -777,8 +985,10 @@ async def _stream_plan_execute(
     if not answer and result.get("error"):
         answer = f"执行失败：{result['error']}"
 
-    for ch in answer:
-        yield "content_delta", {"delta": ch}
+    # 已在 respond 真流式推送过则禁止按字重放（否则前端瞬间刷完，无打字机感）
+    if not content_streamed:
+        for ch in answer:
+            yield "content_delta", {"delta": ch}
 
     deferred_card = result.get("deferred_card")
     msgs = [{"role": "user", "content": user_content}]
@@ -822,6 +1032,13 @@ async def _stream_plan_execute(
         }
         if result.get("error"):
             end_payload["reason"] = str(result["error"])
+    mem_sched = (msg_meta or {}).get("memory_schedule")
+    if isinstance(mem_sched, dict):
+        end_payload["memory_schedule"] = mem_sched
+    if skip_memory_extract:
+        end_payload["effective_agent_id"] = (msg_meta or {}).get(
+            "effective_agent_id"
+        ) or agent_id
     yield "message_end", end_payload
     if not isinstance(deferred_card, dict):
         await _enqueue_extract(
@@ -831,6 +1048,7 @@ async def _stream_plan_execute(
             transcript=user_content,
             allow_memory_write=allow_memory_write,
             model_name=model,
+            skip_memory_extract=skip_memory_extract,
         )
 
 
@@ -867,12 +1085,15 @@ async def stream_mock_reply(
     department_ids: list[str] | None = None,
     role_ids: list[str] | None = None,
     is_platform_admin: bool = False,
+    enable_thinking: bool = False,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-    """对话流：RouteResolver → Dispatcher（澄清 / System / Agent）。"""
+    """对话流：Turn Main Graph（默认）或 legacy 命令式分发。"""
     append_short_memory(
         user_id=user_id, conversation_id=conversation_id, role="user", content=user_content
     )
     msg_meta: dict[str, Any] | None = {"retry_of": retry_of} if retry_of else None
+    if enable_thinking:
+        msg_meta = {**(msg_meta or {}), "deep_think": True}
     try:
         from app.modules.intent.lexicon import refresh_lexicon_if_stale
 
@@ -883,7 +1104,6 @@ async def stream_mock_reply(
     from app.core.config import get_settings
 
     settings = get_settings()
-    summary = _build_recent_summary(user_id=user_id, conversation_id=conversation_id)
     primary = None
     if model_ids:
         for mid in model_ids:
@@ -891,6 +1111,29 @@ async def stream_mock_reply(
             if name:
                 primary = name
                 break
+
+    # —— Turn Main Graph 唯一入口（可 TURN_RUNTIME=legacy 回滚）——
+    if str(getattr(settings, "turn_runtime", "langgraph") or "").lower() == "langgraph":
+        async for ev in _stream_via_turn_graph(
+            db,
+            conversation_id=conversation_id,
+            user_content=user_content,
+            user_id=user_id,
+            memory_access=memory_access,
+            allow_memory_write=allow_memory_write,
+            msg_meta=msg_meta,
+            agent_id=agent_id,
+            department_ids=department_ids,
+            role_ids=role_ids,
+            is_platform_admin=is_platform_admin,
+            model=primary,
+            model_ids=model_ids,
+            enable_thinking=enable_thinking,
+        ):
+            yield ev
+        return
+
+    summary = _build_recent_summary(user_id=user_id, conversation_id=conversation_id)
     route = await resolve_route(
         user_content,
         agent_id=agent_id,
@@ -946,6 +1189,7 @@ async def stream_mock_reply(
             role_ids=role_ids,
             is_platform_admin=is_platform_admin,
             model=primary,
+            enable_thinking=bool((msg_meta or {}).get("deep_think")),
         ):
             yield ev
         return

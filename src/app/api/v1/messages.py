@@ -66,6 +66,8 @@ class MessageSend(BaseModel):
     conversation_id: str
     content: str
     supersede_pending_card: bool = False
+    # 深度思考：打开模型原生 thinking → SSE thought_delta
+    deep_think: bool = False
 
 
 class DismissCardBody(BaseModel):
@@ -355,6 +357,7 @@ async def send_message(
                 department_ids=dept_ids,
                 role_ids=[] if admin else [actor.role],
                 is_platform_admin=admin,
+                enable_thinking=bool(body.deep_think),
             )
         ),
         media_type="text/event-stream",

@@ -20,11 +20,15 @@ from app.api.v1 import (
     knowledge,
     llm_models_admin,
     llm_models_public,
+    me,
     memories,
     memory_extract_fields,
+    menus,
     messages,
     notifications,
     prompt_templates,
+    roles,
+    sessions,
     system_persona,
     usage,
     users,
@@ -35,6 +39,7 @@ api_router = APIRouter()
 api_router.include_router(health.router)
 api_router.include_router(users.router)
 api_router.include_router(auth.router)
+api_router.include_router(sessions.router)
 api_router.include_router(departments.router)
 api_router.include_router(knowledge.router)
 api_router.include_router(agents.router)
@@ -53,3 +58,6 @@ api_router.include_router(llm_models_admin.router)
 api_router.include_router(audit_logs.router)
 api_router.include_router(admin_overview.router)
 api_router.include_router(admin_feedbacks.router)
+api_router.include_router(roles.router)
+api_router.include_router(menus.router)
+api_router.include_router(me.router)

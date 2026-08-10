@@ -21,6 +21,7 @@ def test_enter_understand_emits_stage_and_thought():
     }
     assert events[1][0] == "thought_delta"
     assert "理解" in events[1][1]["delta"]
+    assert events[1][1].get("source") == "narration"
 
 
 def test_skill_enter_uses_display_name_not_json():

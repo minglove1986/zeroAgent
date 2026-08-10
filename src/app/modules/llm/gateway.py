@@ -240,9 +240,14 @@ class LlmGateway:
             model=use_model,
         )
 
-    def get_chat_model(self, *, model: str | None = None) -> BaseChatModel:
+    def get_chat_model(
+        self,
+        *,
+        model: str | None = None,
+        enable_thinking: bool = False,
+    ) -> BaseChatModel:
         """LangChain Chat 模型（Agent 图路径）；仍经 LiteLLM Proxy。"""
-        return _get_chat_model(model=model)
+        return _get_chat_model(model=model, enable_thinking=enable_thinking)
 
     async def sync_catalog(self, db: AsyncSession | None = None) -> SyncResult:
         """从 LiteLLM 同步目录；需传入 AsyncSession。"""
@@ -301,6 +306,10 @@ async def chat_json(
     )
 
 
-def get_chat_model(*, model: str | None = None) -> BaseChatModel:
+def get_chat_model(
+    *,
+    model: str | None = None,
+    enable_thinking: bool = False,
+) -> BaseChatModel:
     """模块级 LangChain Chat 入口。"""
-    return llm_gateway.get_chat_model(model=model)
+    return llm_gateway.get_chat_model(model=model, enable_thinking=enable_thinking)

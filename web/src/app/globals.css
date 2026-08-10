@@ -628,12 +628,34 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.process-thought {
+.process-thought-body {
   margin-top: 0.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+.process-thought {
   white-space: pre-wrap;
   font-size: 0.82rem;
   line-height: 1.55;
   color: var(--muted, #64748b);
+}
+/* 合成阶段叙述：常规灰字 */
+.process-thought.is-narration {
+  color: #64748b;
+  font-style: normal;
+  font-family: inherit;
+}
+/* 模型深度思考：斜体 + 暖灰，与叙述区分 */
+.process-thought.is-model {
+  color: #92400e;
+  font-style: italic;
+  font-family: "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+    serif;
+  background: rgba(245, 158, 11, 0.08);
+  border-radius: 0.4rem;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid rgba(245, 158, 11, 0.22);
 }
 
 

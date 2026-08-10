@@ -10,12 +10,12 @@
 
 | 项 | 值 |
 |---|---|
-| 更新时间 | 2026-07-30 17:01:38（东八区） |
-| 能力 | 修复本机 Windows Celery prefork 崩溃 |
-| 改动 | `celery_app` Windows 默认 `worker_pool=solo`；`restart-dev.ps1 -WithCelery` 显式 `--pool=solo` |
-| 测 | 需关掉旧 zeroAgent-Celery 窗口后按下方命令重启 |
-| 下一步 | 重启 Celery 后复测反馈异步任务 |
-| 备注 | Docker Linux worker 仍用 prefork，不受影响 |
+| 更新时间 | 2026-08-10 13:57:08（东八区） |
+| 能力 | 管理端持久壳规范写入 PRD（D48 / Org §9.0） |
+| 改动 | 主 PRD §12.1.1+D48；`权限用户菜单PRD` v1.0.4 §9.0；白名单/AGENTS/cursor 规则同步 |
+| 测 | 文档对齐；运行时壳与 prompts 占位此前已落地 |
+| 下一步 | Agent 新建管理页按 D48 检查清单执行 |
+| 备注 | 菜单 path 与页面必须同仓 `(admin)`；禁页内包 AdminLayout |
 
 ### 新会话开场（复制）
 
@@ -26,7 +26,7 @@
 ### 启动命令备忘
 
 ```powershell
-# 一键 Docker 部署（api/worker/beat + 依赖；API 固定 :8000）
+# 一键 Docker 部署（api :8000 + web :3000 + admin :3001 + 依赖）
 cd D:\HermesWork\zeroAgent
 .\scripts\deploy-docker.ps1
 # 可选：.\scripts\deploy-docker.ps1 -Full
@@ -39,13 +39,21 @@ cd D:\HermesWork\zeroAgent
 # 可选：.\scripts\restart-dev.ps1 -WithDeps
 # 可选：.\scripts\restart-dev.ps1 -WithCelery
 
+# 仅重启前端（员工端 :3000 + 管理端 :3001）
+cd D:\HermesWork\zeroAgent
+.\scripts\restart-frontends.cmd
+# 可选：.\scripts\restart-frontends.ps1 -SkipWeb
+# 可选：.\scripts\restart-frontends.ps1 -SkipAdmin
+
 # 后端（必须用本机 Python3.12；固定 :8000，禁止随意改端口）
 cd D:\HermesWork\zeroAgent
 & "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" -m uvicorn app.main:app --app-dir src --reload --host 127.0.0.1 --port 8000
-# 前端代理：web/.env.local 中 API_PROXY_TARGET=http://127.0.0.1:8000
+# 前端代理：web/.env.local、admin-web/.env.local 中 API_PROXY_TARGET=http://127.0.0.1:8000
 
-# 前端
+# 前端（也可一键脚本）
 cd D:\HermesWork\zeroAgent\web
+npm run dev
+cd D:\HermesWork\zeroAgent\admin-web
 npm run dev
 
 # 依赖（也可被 deploy-docker 一并拉起）
@@ -61,6 +69,93 @@ $env:PYTHONPATH = "src"
 ---
 
 ## 断点日志（只追加）
+
+### 2026-08-10 13:57:08
+- 持久壳标准入 PRD：主 PRD D48 + §12.1.1 检查清单；Org PRD v1.0.4 §9.0；AGENTS/白名单/cursor 同步。
+
+### 2026-08-10 13:52:30
+- Prompt 整页 404：无 `/prompts` 时不进 `(admin)` layout；已加 prompts/usage/alerts 占位 + 壳内 `[...slug]`/`not-found`。各页不含菜单，壳只在 layout。
+
+### 2026-08-10 13:45:12
+- 管理端壳持久化：`(admin)/layout` 固定侧栏顶栏；页内去 `AdminLayout`；根因是壳挂在 page 导致软导航仍整壳重挂。
+
+### 2026-08-10 13:31:16
+- 管理端侧栏 UX：树形分组折叠（grid 行高过渡）+ 整栏收窄 + 选中指示条/滑动；状态写 localStorage。下一步刷新或重建 admin-web。
+
+### 2026-08-10 13:26:23
+- 管理端「模型与服务商」404：菜单 path 错链 `/models`，实页在 `/system/llm-models`；种子+迁移 `0036`+DB 已改；`/models` 重定向页已加。下一步重建 api 升迁移、硬刷侧栏。
+
+### 2026-08-10 11:11:45
+- M2 第一刀：`user_sessions` + `last_login_at`；登录 nonce；吊销校验；会话列表/注销全部；改密等踢人；13 passed。下一步失败登录监控或 §9 UI。
+
+### 2026-08-10 11:03:54
+- M1.5 收尾：部门管理员 `GET /departments` 本部门只读 + `0034` 种子；部门写接口补守卫；9 passed。下一步 M2 或本地升迁移。
+
+### 2026-08-10 10:01:37
+- 组织权限 M1.5：`department_admin` 用户列表/详情本部门只读；写操作仍拒；`0033` 种子 org.users；顺带修 scope 旧测与空 Session 兼容。下一步可选部门树只读或 M2。
+
+### 2026-08-10 09:54:17
+- 组织权限 M1：接通 Actor/`require_menu`/菜单过滤/动态侧栏/用户契约/restore/菜单树种子 `0032`/审计最小集；相关测 47 passed。下一步 M1.5 或补齐剩余组织写接口守卫与审计。
+
+### 2026-08-10 09:20:09
+- 组织权限：`权限用户菜单PRD.md` v1.0.3 对齐现码与 10 条裁定（9A′+6A′）；主 PRD / 白名单 / AGENTS / cursor 规则同步；未改业务代码。下一步 M1 接通 Actor 主链路。
+
+### 2026-08-04 09:39:11
+- 排查 `doc_4011dc501a774b31`：`fail_reason=oss_missing`；api 写入本地 `.data/oss`，worker 无共享卷；文件为 `.docx`（即便可读也会 `unsupported_extension`）。未改代码。
+
+### 2026-08-03 16:17:37
+- 模型思考与叙述分样式：`source=model|narration` + 前端暖灰斜体；11 passed；重建 api 进行中；未 commit。
+
+### 2026-08-03 16:13:32
+- ProcessPanel：思考过程提到阶段胶囊之上；折叠预览改首行；未 commit。
+
+### 2026-08-03 16:08:00
+- 修过程阶段顺序反转：handoff 不抢 respond、`skip_understand_stage`、respond 经 custom 先报阶段再推思考；`test_process_stage_order`+`test_deep_think_wiring` 7 passed；api 已重建；未 commit。
+
+### 2026-08-03 15:16:02
+- 修深度思考失败：MiniMax 仅允许 adaptive/disabled；并拆 `<think>` 到思考区；5 passed；api 已重建；未 commit。
+
+### 2026-08-03 15:03:00
+- 深度思考按钮从占位改为接通：deep_think→enable_thinking→thought_delta；12 passed；api 已重建；未 commit。
+
+### 2026-08-03 13:32:25
+- 修系统对话无打字机：respond 改 astream+custom stream；适配层禁按字重放；9 passed；未 commit。
+
+### 2026-08-03 12:50:03
+- handoff 后 skip_memory_extract，避免双 idle；message_end 带 memory_schedule；6 passed；api 已重建；未 commit。
+
+### 2026-08-03 12:40:34
+- 系统 Agent 默认 plan_execute（空技能 handoff）；respond_only 可回滚；相关 16 passed；规格/CHECKPOINT 已更；未 commit。
+
+### 2026-08-03 12:28:41
+- 记忆 E2E 通：ephemeral engine + message_end.memory_schedule；停宿主机 celery@yhm-zzm；rule_hit 落库 display_name=赵振明；未 commit。
+
+### 2026-08-03 11:51:51
+- 联调发现 ChatOpenAI `model_kwargs.thinking` 触发 TypeError；改为 `extra_body`；KB eager 补 platform_admin 头；重建后 SSE 验证 path=turn_graph；未 commit。
+
+### 2026-08-03 11:38:18
+- Docker 重建 api/worker/beat 完成；`/health` ok；容器内确认 async_bridge、SYSTEM_AGENT_MODE=respond_only、stream 走 LC；未 commit。
+
+### 2026-08-03 11:28:46
+- Celery 统一 async_bridge（eager 嵌套 ASGI 循环走独立线程）；extract/compress 等接入；3 passed；未 commit。
+
+### 2026-08-03 11:23:52
+- client 全量迁 LC（stream/tools/json，去 httpx）；系统 Agent 明示 respond_only；规格 §4.3/§11 更新；23 passed；未 commit。
+
+### 2026-08-03 11:13:47
+- 还债：Redis checkpointer（失败降级 MemorySaver）；chat_json 经 LangChain；kb/doc 图内执行；规格 §11 更新；相关 28 passed；未 commit。
+
+### 2026-08-03 11:02:14
+- 架构评判写入规格 §11：方向合理、一期有折扣；修正业务 Agent 为 handoff+真流式 Plan-Execute；禁止图内假打字。相关单测绿；未 commit。
+
+### 2026-08-03 10:59:44
+- Turn Main Graph 落地：规格/计划 + `turn_graph`/`system_agent`/`memory_schedule`；runtime 默认走主图；系统对话用 LC；相关 21 passed；未 commit。需重建 Docker api/worker。
+
+### 2026-08-03 09:43:51
+- 修复记忆抽取：自称姓名（我的名字是/叫）规则 +「记住我的名字」即时调度 + Celery asyncio dispose；`test_memory_extract_whitelist` 10 passed；未 commit。
+
+### 2026-08-03 09:32:59
+- 新增前端一键重启：`scripts/restart-frontends.ps1` / `.cmd`（:3000 + :3001）；不碰后端/Docker；未 commit。
 
 ### 2026-07-30 17:01:38
 - 根因：本机 Windows Celery 默认 prefork → `tasks, accept, hostname = _loc` 解包失败；已改 solo（celery_app + restart-dev）；未 commit。
