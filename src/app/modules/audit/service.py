@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.audit.models import ConfigAuditLog
@@ -128,6 +128,42 @@ async def query(
     result = await db.execute(
         stmt.offset((page - 1) * page_size).limit(page_size)
     )
+    return list(result.scalars().all()), total
+
+
+async def query_for_user(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    page: int = 1,
+    page_size: int = 20,
+) -> tuple[list[ConfigAuditLog], int]:
+    """查询与指定用户相关的 user./auth. 审计（作为资源或操作者）。
+
+    @author 赵振明
+    @date 2026-08-11 15:40:06
+    """
+    subject = or_(
+        ConfigAuditLog.resource_id == user_id,
+        ConfigAuditLog.actor_id == user_id,
+    )
+    action_prefix = or_(
+        ConfigAuditLog.action.like("user.%"),
+        ConfigAuditLog.action.like("auth.%"),
+    )
+    filters = and_(subject, action_prefix)
+    count_stmt = (
+        select(func.count()).select_from(ConfigAuditLog).where(filters)
+    )
+    total = int(await db.scalar(count_stmt) or 0)
+    stmt = (
+        select(ConfigAuditLog)
+        .where(filters)
+        .order_by(ConfigAuditLog.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    result = await db.execute(stmt)
     return list(result.scalars().all()), total
 
 

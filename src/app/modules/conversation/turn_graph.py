@@ -22,6 +22,7 @@ from app.modules.conversation.subgraphs.system_agent import system_agent_node
 from app.modules.conversation.turn_checkpointer import get_turn_checkpointer
 from app.modules.conversation.turn_state import SYSTEM_AGENT_ID, TurnState
 from app.modules.conversation.process_narration import iter_stage_enter, iter_stage_leave
+from app.modules.conversation.turn_trace import trace as turn_trace
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +168,7 @@ async def run_turn(
     department_ids: list[str] | None = None,
     role_ids: list[str] | None = None,
     is_platform_admin: bool = False,
+    suppress_route_clarify: bool = False,
 ) -> dict[str, Any]:
     """非流式执行一整轮 Turn Main Graph。
 
@@ -185,6 +187,7 @@ async def run_turn(
         "messages": [],
         "citations": [],
         "final_answer": "",
+        "suppress_route_clarify": bool(suppress_route_clarify),
     }
     config: RunnableConfig = {
         "configurable": {
@@ -218,6 +221,7 @@ async def stream_turn(
     is_platform_admin: bool = False,
     msg_meta: dict[str, Any] | None = None,
     enable_thinking: bool = False,
+    suppress_route_clarify: bool = False,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """流式适配：主图 updates → SSE 事件；business/system handoff 真流式。
 
@@ -240,6 +244,7 @@ async def stream_turn(
         "messages": [],
         "citations": [],
         "final_answer": "",
+        "suppress_route_clarify": bool(suppress_route_clarify),
     }
     config: RunnableConfig = {
         "configurable": {
@@ -256,6 +261,15 @@ async def stream_turn(
         }
     }
 
+    turn_trace(
+        "turn",
+        "start",
+        conv=conversation_id,
+        user=user_id,
+        agent=agent_id,
+        thinking=bool(enable_thinking),
+    )
+
     for item in iter_stage_enter("understand"):
         yield item
 
@@ -267,6 +281,18 @@ async def stream_turn(
             if isinstance(partial, dict):
                 final_state.update(partial)
             if node_name == "intent":
+                route = dict(final_state.get("route") or {})
+                turn_trace(
+                    "intent",
+                    "done",
+                    conv=conversation_id,
+                    user=user_id,
+                    kind=route.get("kind"),
+                    handler=route.get("handler"),
+                    reason=route.get("reason"),
+                    confidence=route.get("confidence"),
+                    layer=route.get("layer"),
+                )
                 for item in iter_stage_leave("understand", ok=True):
                     yield item
                 # handoff 路径由 Plan-Execute 负责 plan/respond；此处不抢先进「整理回答」
@@ -274,6 +300,14 @@ async def stream_turn(
     handoff = str(final_state.get("handoff") or "")
     # 业务 / 系统（plan_execute）handoff → 适配层 stream_plan_execute；kb/doc 已在图内
     if handoff in ("business_agent", "system_agent"):
+        turn_trace(
+            "turn",
+            "handoff",
+            conv=conversation_id,
+            user=user_id,
+            dispatch=handoff,
+            effective_agent=final_state.get("effective_agent_id") or SYSTEM_AGENT_ID,
+        )
         yield (
             "__handoff__",
             {
@@ -293,6 +327,17 @@ async def stream_turn(
         )
         return
 
+    answer = str(final_state.get("final_answer") or "")
+    deferred = final_state.get("deferred_card")
+    turn_trace(
+        "turn",
+        "inline_answer",
+        conv=conversation_id,
+        user=user_id,
+        has_card=bool(isinstance(deferred, dict) and deferred),
+        answer_len=len(answer),
+    )
+
     # 图内直接出答（kb/doc/clarify/respond_only 等）：此刻才进入整理回答
     for item in iter_stage_enter("respond"):
         yield item
@@ -300,7 +345,6 @@ async def stream_turn(
     for c in list(final_state.get("citations") or []):
         yield "citation", c
 
-    answer = str(final_state.get("final_answer") or "")
     for ch in answer:
         yield "content_delta", {"delta": ch}
 

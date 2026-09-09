@@ -1,7 +1,7 @@
 """用户模型。
 
 @author 赵振明
-@date 2026-07-23 15:30:58
+@date 2026-08-11 15:32:58
 """
 
 from __future__ import annotations
@@ -31,6 +31,8 @@ class User(Base):
     status: Mapped[str] = mapped_column(String(20), default="active")
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_login_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    id_card: Mapped[str | None] = mapped_column(String(18), unique=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

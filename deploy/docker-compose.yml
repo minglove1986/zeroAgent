@@ -193,6 +193,8 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD:-redispass}@redis:6379/0
       DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-zeroagent}:${MYSQL_PASSWORD:-zeropass}@mysql:3306/${MYSQL_DATABASE:-zeroagent}
       LITELLM_PROXY_URL: http://litellm:4000
+      # 管理端「打开 LiteLLM 控制台」给浏览器用，须宿主机可达地址
+      LITELLM_UI_BASE_URL: ${LITELLM_UI_BASE_URL:-http://127.0.0.1:4000}
       MOCK_EXTERNAL: ${MOCK_EXTERNAL:-false}
     depends_on:
       mysql:

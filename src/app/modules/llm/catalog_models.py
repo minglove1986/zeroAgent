@@ -29,6 +29,8 @@ class LlmModel(Base):
     display_name: Mapped[str] = mapped_column(String(200), nullable=False)
     max_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 0/1：LiteLLM 同步的思考能力位；未知默认 0
+    supports_reasoning: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # 0/1：本库启停；LiteLLM 缺失时强制 0
     enabled: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     source_status: Mapped[str] = mapped_column(

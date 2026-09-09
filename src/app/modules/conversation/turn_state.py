@@ -56,3 +56,4 @@ class TurnState(TypedDict, total=False):
     path: str
     handoff: str
     turn_status: str
+    suppress_route_clarify: bool

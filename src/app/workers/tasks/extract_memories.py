@@ -12,7 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.core.config import get_settings
 from app.modules.memory.extract_scheduler import idle_still_due
-from app.modules.memory.service import extract_memories_from_transcript, persist_extracted_memories
 from app.workers.async_bridge import run_coro_factory
 from app.workers.celery_app import celery_app
 
@@ -97,7 +96,6 @@ async def _extract_async(
             "trigger": trigger,
         }
     model: str | None = None
-    items: list = []
     async with session_factory() as db:
         if conversation_id:
             from app.models.conversation import Conversation
@@ -106,8 +104,15 @@ async def _extract_async(
             selected = getattr(conv, "selected_model", None) if conv else None
             if isinstance(selected, str) and selected.strip():
                 model = selected.strip()
-        items = await extract_memories_from_transcript(transcript, model=model)
-        result = await persist_extracted_memories(db, user_id=user_id, items=items)
+        from app.modules.memory.extract_skill import run_memory_extract_skill
+
+        result = await run_memory_extract_skill(
+            db,
+            user_id=user_id,
+            transcript=transcript,
+            model=model,
+            trigger=trigger,
+        )
     logger.info(
         "extract_memories done trigger=%s user=%s conv=%s saved=%s skipped=%s items=%s",
         trigger,
@@ -115,11 +120,11 @@ async def _extract_async(
         conversation_id,
         result.get("saved"),
         result.get("skipped"),
-        len(items),
+        result.get("items"),
     )
     return {
         "user_id": user_id,
         "conversation_id": conversation_id,
         "trigger": trigger,
-        **result,
+        **{k: v for k, v in result.items() if k not in {"trigger"}},
     }

@@ -58,6 +58,12 @@ const FALLBACK_TREE: MenuItem[] = [
         icon: "ApartmentOutlined",
         path: "/organization/departments",
       },
+      {
+        code: "org.menus",
+        name: "菜单管理",
+        icon: "MenuOutlined",
+        path: "/organization/menus",
+      },
     ],
   },
   {

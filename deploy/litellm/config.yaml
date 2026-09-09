@@ -5,6 +5,9 @@ model_list:
       model: minimax/MiniMax-M3
       api_key: os.environ/MINIMAX_API_KEY
       api_base: os.environ/MINIMAX_API_BASE
+    # 业务从 /model/info 同步 supports_reasoning；价目表缺位时显式标注
+    model_info:
+      supports_reasoning: true
   - model_name: MiniMax-Text-01
     litellm_params:
       model: minimax/MiniMax-Text-01

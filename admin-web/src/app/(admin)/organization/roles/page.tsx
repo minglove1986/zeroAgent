@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type Key } from "react";
 import {
   App,
   Button,
@@ -12,12 +12,14 @@ import {
   Select,
   Space,
   Table,
-  Tabs,
   Tag,
+  Tree,
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
+import type { DataNode } from "antd/es/tree";
 import { useAdminPageTitle } from "@/components/AdminTitle";
 import { apiJson } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 
 type RoleOut = {
   code: string;
@@ -43,6 +45,8 @@ const SCOPE_OPTIONS = Object.entries(SCOPE_LABEL).map(([value, label]) => ({
 
 export default function RolesPage() {
   const { message, modal } = App.useApp();
+  const { user } = useAuth();
+  const isSuper = user?.role === "super_admin";
   const [items, setItems] = useState<RoleOut[]>([]);
   const [loading, setLoading] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
@@ -347,6 +351,7 @@ export default function RolesPage() {
       <RoleMenusModal
         open={!!menusOpen}
         role={menusOpen}
+        readOnly={!isSuper}
         onCancel={() => setMenusOpen(null)}
         onSave={onSaveMenus}
       />
@@ -384,77 +389,165 @@ export default function RolesPage() {
 function RoleMenusModal({
   open,
   role,
+  readOnly,
   onCancel,
   onSave,
 }: {
   open: boolean;
   role: RoleOut | null;
+  readOnly: boolean;
   onCancel: () => void;
   onSave: (code: string, items: { menu_code: string; can_view: boolean }[]) => void;
 }) {
-  const [items, setItems] = useState<{ menu_code: string; can_view: boolean }[]>([]);
   const [loading, setLoading] = useState(false);
+  const [catalog, setCatalog] = useState<
+    {
+      code: string;
+      name: string;
+      parent_code?: string | null;
+      path?: string | null;
+    }[]
+  >([]);
+  const [checked, setChecked] = useState<string[]>([]);
 
   useEffect(() => {
     if (!open || !role) return;
+    let cancelled = false;
     setLoading(true);
-    apiJson<{ items: { menu_code: string; can_view: boolean; can_edit: boolean }[] }>(
-      `/api/v1/roles/${role.code}/menus`,
-    )
-      .then((res) => {
-        if (res.code === 0 && res.data) setItems(res.data.items);
-      })
-      .finally(() => setLoading(false));
+    (async () => {
+      try {
+        const [menuRes, permRes] = await Promise.all([
+          apiJson<{
+            items: {
+              code: string;
+              name: string;
+              parent_code?: string | null;
+              path?: string | null;
+            }[];
+          }>("/api/v1/menus?manage=1&app=admin"),
+          apiJson<{
+            items: { menu_code: string; can_view: boolean }[];
+          }>(`/api/v1/roles/${role.code}/menus`),
+        ]);
+        if (cancelled) return;
+        const menus = menuRes.code === 0 ? (menuRes.data?.items ?? []) : [];
+        setCatalog(menus);
+        const allowed = new Set(
+          (permRes.code === 0 ? (permRes.data?.items ?? []) : [])
+            .filter((i) => i.can_view)
+            .map((i) => i.menu_code),
+        );
+        setChecked(menus.filter((m) => allowed.has(m.code)).map((m) => m.code));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [open, role]);
+
+  const treeData: DataNode[] = useMemo(() => {
+    const byCode: Record<string, DataNode & { children?: DataNode[] }> = {};
+    for (const m of catalog) {
+      byCode[m.code] = {
+        key: m.code,
+        title: (
+          <span>
+            <strong>{m.name}</strong>
+            <span
+              style={{
+                marginLeft: 8,
+                fontSize: 12,
+                color: "var(--text-secondary)",
+                fontFamily: "monospace",
+              }}
+            >
+              {m.code}
+            </span>
+            {m.path ? (
+              <span style={{ marginLeft: 8, fontSize: 11, opacity: 0.6 }}>
+                {m.path}
+              </span>
+            ) : null}
+          </span>
+        ),
+        children: [],
+      };
+    }
+    const roots: DataNode[] = [];
+    for (const m of catalog) {
+      const node = byCode[m.code];
+      const parent = m.parent_code;
+      if (parent && byCode[parent]) {
+        byCode[parent].children = byCode[parent].children || [];
+        byCode[parent].children!.push(node);
+      } else {
+        roots.push(node);
+      }
+    }
+    const prune = (nodes: DataNode[]) => {
+      for (const n of nodes) {
+        const kids = n.children as DataNode[] | undefined;
+        if (kids?.length) prune(kids);
+        else delete n.children;
+      }
+    };
+    prune(roots);
+    return roots;
+  }, [catalog]);
+
+  /** 勾选变更：父子联动由 Tree 默认 checkStrictly=false 处理。 */
+  function onCheck(
+    keys: Key[] | { checked: Key[]; halfChecked: Key[] },
+  ) {
+    if (readOnly) return;
+    const list = Array.isArray(keys) ? keys : keys.checked;
+    setChecked(list.map(String));
+  }
+
+  function handleOk() {
+    if (!role || readOnly) return;
+    onSave(
+      role.code,
+      checked.map((menu_code) => ({
+        menu_code,
+        can_view: true,
+      })),
+    );
+  }
 
   return (
     <Modal
       title={`菜单权限：${role?.name || ""}`}
       open={open}
       onCancel={onCancel}
-      onOk={() => role && onSave(role.code, items)}
-      okText="保存"
-      cancelText="取消"
-      width={640}
+      onOk={handleOk}
+      okText={readOnly ? "关闭" : "保存"}
+      okButtonProps={readOnly ? { style: { display: "none" } } : undefined}
+      cancelText={readOnly ? "关闭" : "取消"}
+      width={720}
+      destroyOnClose
     >
+      {readOnly && (
+        <div style={{ marginBottom: 12, color: "var(--text-secondary)", fontSize: 13 }}>
+          平台管理员只读：仅超级管理员可保存角色菜单权限。
+        </div>
+      )}
       {loading ? (
         <div>加载中...</div>
+      ) : catalog.length === 0 ? (
+        <div style={{ color: "var(--text-secondary)" }}>暂无菜单定义</div>
       ) : (
-        <div style={{ maxHeight: 360, overflow: "auto" }}>
-          {items.map((it) => (
-            <div
-              key={it.menu_code}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                padding: "6px 0",
-                borderBottom: "1px solid var(--border-color, #eee)",
-              }}
-            >
-              <span style={{ flex: 1, fontFamily: "monospace" }}>{it.menu_code}</span>
-              <Tabs
-                size="small"
-                activeKey={it.can_view ? "view" : "hide"}
-                onChange={(k) =>
-                  setItems((prev) =>
-                    prev.map((p) =>
-                      p.menu_code === it.menu_code
-                        ? { ...p, can_view: k === "view" }
-                        : p,
-                    ),
-                  )
-                }
-                items={[
-                  { key: "view", label: "可见" },
-                  { key: "hide", label: "隐藏" },
-                ]}
-              />
-            </div>
-          ))}
-          {items.length === 0 && (
-            <div style={{ color: "var(--text-secondary)" }}>暂无菜单权限（全部隐藏）</div>
-          )}
-        </div>
+        <Tree
+          checkable
+          defaultExpandAll
+          disabled={readOnly}
+          checkedKeys={checked}
+          onCheck={onCheck}
+          treeData={treeData}
+          style={{ maxHeight: 420, overflow: "auto" }}
+        />
       )}
     </Modal>
   );

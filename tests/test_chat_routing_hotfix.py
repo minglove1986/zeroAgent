@@ -12,7 +12,7 @@ from app.modules.intent.rules import match_l2_rules
 
 
 def test_empty_agent_candidates_card_title_matches_kb_confirm() -> None:
-    """agent_pick 无候选回退时，标题须为「是否检索知识库」而非「请选择助手」。"""
+    """agent_pick 无候选回退时，须为查库软确认文案，而非「请选择助手」。"""
     intent = IntentDecision(
         intent="route_clarify",
         confidence=0.6,
@@ -24,21 +24,21 @@ def test_empty_agent_candidates_card_title_matches_kb_confirm() -> None:
     )
     card = build_route_clarify_card(intent)
     assert card["meta"]["clarify_kind"] == "kb_confirm"
-    assert "知识库" in card["title"]
+    assert "您是不是想查" in card["title"]
     assert "助手" not in card["title"]
     ids = {o["id"] for o in card["options"]}
     assert ids == {"kb_lookup", "chitchat"}
 
 
 def test_meta_reply_is_l2_chitchat() -> None:
-    d = match_l2_rules("刚才你说我是尹庆为，资料从哪里来？")
+    """明确纠正仍 L2 闲聊；弱来源追问交 L3。"""
+    d = match_l2_rules("别总结赵世龙的简历")
     assert d is not None
     assert d.intent == "chitchat"
     assert d.reason == "meta_conversation"
 
-    d2 = match_l2_rules("我怎么是尹庆为？")
-    assert d2 is not None
-    assert d2.intent == "chitchat"
+    assert match_l2_rules("刚才你说我是尹庆为，资料从哪里来？") is None
+    assert match_l2_rules("我怎么是尹庆为？") is None
 
 
 def test_ambiguous_utterances_defer_to_l3() -> None:

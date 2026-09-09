@@ -16,18 +16,29 @@ from app.modules.intent.l2_catalog_cache import (
 from app.modules.intent.l2_seed import DEFAULT_SEED
 
 
-def test_default_seed_has_summarize_and_negation() -> None:
+def test_default_seed_has_handle_and_negation() -> None:
+    from app.modules.intent.l2_seed import LEAVE_CLUE_PHRASES, LEAVE_HANDLE_PHRASES
+
     phrases_sum = {x["phrase"] for x in DEFAULT_SEED["doc_summarize"]}
     phrases_meta = {x["phrase"] for x in DEFAULT_SEED["meta_reply"]}
-    assert "总结" in phrases_sum
+    phrases_leave = {x["phrase"] for x in DEFAULT_SEED["leave"]}
+    assert phrases_sum == set()
     assert any("没让你" in p for p in phrases_meta)
+    assert "我没让你总结" not in phrases_meta  # 已被「我没让你」覆盖，勿重复入库
+    assert "我要请假" in phrases_leave
+    assert "请假" not in phrases_leave  # 线索短词不进种子
+    assert "请假" in LEAVE_CLUE_PHRASES
+    assert phrases_leave == set(LEAVE_HANDLE_PHRASES)
+    assert "提交请假" not in phrases_leave
+    assert "请两天假" not in phrases_leave
 
 
 def test_get_catalog_falls_back_to_seed() -> None:
     reset_l2_catalog_for_tests()
     cat = get_catalog()
     assert "doc_summarize" in cat
-    assert any(x["phrase"] == "总结" for x in cat["doc_summarize"])
+    assert cat["doc_summarize"] == []
+    assert any(x["phrase"] == "别总结" for x in cat["meta_reply"])
 
 
 def test_set_fallback_overrides_get_catalog() -> None:
@@ -41,6 +52,8 @@ def test_set_fallback_overrides_get_catalog() -> None:
     )
     cat = get_catalog()
     assert cat["meta_reply"][0]["phrase"] == "别总结"
+    reset_l2_catalog_for_tests()
+    set_fallback_catalog(DEFAULT_SEED)
 
 
 def test_intent_l2_keyword_model_tablename() -> None:
@@ -63,6 +76,9 @@ async def test_reload_l2_catalog_sets_fallback(monkeypatch: pytest.MonkeyPatch) 
     async def _fake_ensure(_db):  # noqa: ANN001
         return 0
 
+    async def _fake_sync(_db, **_kwargs):  # noqa: ANN001
+        return {"soft_deleted": 0, "upserted": 0, "inserted": 0}
+
     async def _fake_load(_db):  # noqa: ANN001
         return fake
 
@@ -73,6 +89,7 @@ async def test_reload_l2_catalog_sets_fallback(monkeypatch: pytest.MonkeyPatch) 
         return True
 
     monkeypatch.setattr(store, "ensure_seed_if_empty", _fake_ensure)
+    monkeypatch.setattr(store, "sync_system_seeds", _fake_sync)
     monkeypatch.setattr(store, "load_catalog_from_db", _fake_load)
     monkeypatch.setattr(store, "set_catalog_in_redis", _fake_redis)
 

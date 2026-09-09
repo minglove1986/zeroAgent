@@ -35,6 +35,31 @@ def stable_model_id(model_name: str) -> str:
     return f"llm_{digest}"
 
 
+def _extract_supports_reasoning(info: dict[str, Any]) -> bool:
+    """从 LiteLLM model/info 项提取是否支持思考；仅显式真为真。
+
+    规则：顶层或 model_info 中 supports_reasoning is True；
+    或 supported_openai_params 含 reasoning_effort / reasoning（大小写不敏感）。
+    缺字段、false、null → False（如 agnes 自定义别名）。
+
+    @author 赵振明
+    @date 2026-08-19 16:14:25
+    """
+    candidates: list[dict[str, Any]] = [info]
+    nested = info.get("model_info")
+    if isinstance(nested, dict):
+        candidates.append(nested)
+    for block in candidates:
+        if block.get("supports_reasoning") is True:
+            return True
+        params = block.get("supported_openai_params")
+        if isinstance(params, list):
+            lowered = {str(p).strip().lower() for p in params if p is not None}
+            if "reasoning_effort" in lowered or "reasoning" in lowered:
+                return True
+    return False
+
+
 def _extract_window(info: dict[str, Any]) -> tuple[int | None, int | None]:
     """从 model_info / 扁平字段提取输入/输出窗口。"""
     candidates = [info]
@@ -128,7 +153,8 @@ async def fetch_litellm_remote_models() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for name in names:
         raw = info_by_name.get(name) or {"model_name": name}
-        max_in, max_out = _extract_window(raw if isinstance(raw, dict) else {})
+        raw_dict = raw if isinstance(raw, dict) else {"model_name": name}
+        max_in, max_out = _extract_window(raw_dict)
         # /v1/models 无 info 时，尝试扁平字段
         if max_in is None and name in info_by_name:
             max_in, max_out = _extract_window(info_by_name[name])
@@ -137,7 +163,8 @@ async def fetch_litellm_remote_models() -> list[dict[str, Any]]:
                 "model_name": name,
                 "max_input_tokens": max_in,
                 "max_output_tokens": max_out,
-                "raw": raw if isinstance(raw, dict) else {"model_name": name},
+                "supports_reasoning": _extract_supports_reasoning(raw_dict),
+                "raw": raw_dict,
             }
         )
     return out
@@ -155,6 +182,7 @@ def build_catalog_payload(rows: list[LlmModel]) -> dict[str, Any]:
                 "display_name": row.display_name,
                 "max_input_tokens": row.max_input_tokens,
                 "max_output_tokens": row.max_output_tokens,
+                "supports_reasoning": bool(row.supports_reasoning),
                 "enabled": bool(row.enabled),
                 "source_status": row.source_status,
                 "allow_system_chat": bool(row.allow_system_chat),
@@ -215,6 +243,7 @@ async def sync_llm_models_from_litellm(db: AsyncSession) -> dict[str, Any]:
             continue
         max_in = item.get("max_input_tokens")
         max_out = item.get("max_output_tokens")
+        supports_reasoning = 1 if item.get("supports_reasoning") is True else 0
         complete = isinstance(max_in, int) and max_in > 0
         raw_json = _sanitize_raw(item.get("raw") or {"model_name": name})
         row = existing_by_name.get(name)
@@ -225,6 +254,7 @@ async def sync_llm_models_from_litellm(db: AsyncSession) -> dict[str, Any]:
                 display_name=name,
                 max_input_tokens=int(max_in) if complete else None,
                 max_output_tokens=int(max_out) if isinstance(max_out, int) else None,
+                supports_reasoning=supports_reasoning,
                 enabled=0,
                 source_status=SOURCE_ACTIVE if complete else SOURCE_INCOMPLETE,
                 litellm_raw_json=raw_json,
@@ -254,6 +284,7 @@ async def sync_llm_models_from_litellm(db: AsyncSession) -> dict[str, Any]:
             row.source_status = SOURCE_INCOMPLETE
             row.enabled = 0
             counts["incomplete"] += 1
+        row.supports_reasoning = supports_reasoning
         row.litellm_raw_json = raw_json
         row.revision = int(row.revision or 1) + 1
         counts["upserted"] += 1

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from typing import Literal
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
@@ -97,20 +98,74 @@ async def list_agents(db: AsyncSession = Depends(get_db)) -> dict:
 @router.get("/skills")
 async def list_skills(db: AsyncSession = Depends(get_db)) -> dict:
     rows = (await db.execute(select(Skill).order_by(Skill.created_at.desc()))).scalars().all()
+    items = []
+    for s in rows:
+        tool_ids = [
+            str(r.tool_id)
+            for r in (
+                await db.execute(select(SkillTool).where(SkillTool.skill_id == s.id))
+            )
+            .scalars()
+            .all()
+        ]
+        origin = getattr(s, "origin", None) or "custom"
+        items.append(
+            {
+                "id": s.id,
+                "name": s.name,
+                "description": s.description,
+                "status": s.status,
+                "current_version": s.current_version,
+                "origin": origin,
+                "seed_code": getattr(s, "seed_code", None),
+                "tool_ids": tool_ids,
+                "deletable": origin != "system",
+            }
+        )
+    return ok({"items": items})
+
+
+class SkillStatusUpdate(BaseModel):
+    status: Literal["published", "disabled", "draft"]
+
+
+@router.patch("/skills/{skill_id}")
+async def patch_skill(
+    skill_id: str,
+    body: SkillStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """停用/启用技能；系统种子允许改 status。"""
+    skill = await db.get(Skill, skill_id)
+    if skill is None:
+        return JSONResponse(status_code=404, content=fail(40401, "skill not found"))
+    skill.status = body.status
+    await db.commit()
     return ok(
         {
-            "items": [
-                {
-                    "id": s.id,
-                    "name": s.name,
-                    "description": s.description,
-                    "status": s.status,
-                    "current_version": s.current_version,
-                }
-                for s in rows
-            ]
+            "skill_id": skill.id,
+            "status": skill.status,
+            "origin": getattr(skill, "origin", None) or "custom",
         }
     )
+
+
+@router.delete("/skills/{skill_id}")
+async def delete_skill(skill_id: str, db: AsyncSession = Depends(get_db)) -> dict:
+    """删除技能；系统种子禁止删除。"""
+    skill = await db.get(Skill, skill_id)
+    if skill is None:
+        return JSONResponse(status_code=404, content=fail(40401, "skill not found"))
+    if (getattr(skill, "origin", None) or "custom") == "system":
+        return JSONResponse(
+            status_code=403,
+            content=fail(40301, "系统种子技能不可删除，仅可停用"),
+        )
+    await db.execute(delete(SkillTool).where(SkillTool.skill_id == skill_id))
+    await db.execute(delete(AgentSkill).where(AgentSkill.skill_id == skill_id))
+    await db.delete(skill)
+    await db.commit()
+    return ok({"skill_id": skill_id, "deleted": True})
 
 
 @router.post("/agents")
@@ -199,6 +254,7 @@ async def create_skill(body: SkillCreate, db: AsyncSession = Depends(get_db)) ->
         system_prompt=body.system_prompt,
         workflow_id=body.workflow_id,
         status="draft",
+        origin="custom",
         created_by="usr_system",
     )
     db.add(skill)

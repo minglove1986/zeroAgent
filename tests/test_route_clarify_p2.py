@@ -70,7 +70,7 @@ async def test_mid_conf_emits_route_clarify_card(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "app.modules.conversation.route.evaluate_intent_funnel_async",
+        "app.modules.conversation.subgraphs.intent_node.evaluate_intent_funnel_async",
         AsyncMock(
             return_value=IntentDecision(
                 intent="route_clarify",
@@ -105,21 +105,27 @@ async def test_mid_conf_emits_route_clarify_card(
     assert any(o["id"] == "kb_lookup" for o in card["options"])
     end = next(p for n, p in events if n == "message_end")
     assert end["status"] == "awaiting_card"
-    assert end["path"] == "route_clarify"
+    assert end["path"] in {"route_clarify", "turn_graph"}
 
 
 @pytest.mark.asyncio
-async def test_kb_confirm_chitchat_skips_rag(
+async def test_kb_confirm_chitchat_resumes_original_without_rag(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """选「否，随便聊聊」须用原问题续跑系统助手，禁止只回固定话术或再查库。
+
+    @author 赵振明
+    @date 2026-09-07 13:35:30
+    """
+    original = "单价19.99 * 数量3"
     monkeypatch.setattr(
-        "app.modules.conversation.route.evaluate_intent_funnel_async",
+        "app.modules.conversation.subgraphs.intent_node.evaluate_intent_funnel_async",
         AsyncMock(
             return_value=IntentDecision(
                 intent="route_clarify",
-                confidence=0.55,
+                confidence=0.6,
                 funnel_layer="L4",
-                query="赵世龙",
+                query="单价19.99 数量3",
                 reason="mid_conf_kb_confirm",
                 slots={
                     "clarify_kind": "kb_confirm",
@@ -129,13 +135,41 @@ async def test_kb_confirm_chitchat_skips_rag(
             )
         ),
     )
-    conv = await client.post("/api/v1/conversations", json={"title": "跳过"})
+    rag_called = {"n": 0}
+
+    async def _forbid_rag(*_a, **_k):
+        rag_called["n"] += 1
+        return {"citations": [], "hits": []}
+
+    monkeypatch.setattr(
+        "app.modules.conversation.runtime.run_kb_lookup",
+        _forbid_rag,
+    )
+
+    pe_calls: list[dict] = []
+
+    async def _fake_pe(db, **kwargs):
+        pe_calls.append(kwargs)
+        yield "content_delta", {"delta": "59.97"}
+        yield "message_end", {
+            "message_id": "msg_pe_test",
+            "status": "completed",
+            "path": "plan_execute",
+        }
+
+    monkeypatch.setattr(
+        "app.modules.conversation.runtime._stream_plan_execute",
+        _fake_pe,
+    )
+
+    conv = await client.post("/api/v1/conversations", json={"title": "计算"})
     conversation_id = conv.json()["data"]["id"]
     resp = await client.post(
         "/api/v1/messages/send",
-        json={"conversation_id": conversation_id, "content": "可能是在找赵世龙吧"},
+        json={"conversation_id": conversation_id, "content": original},
     )
     card = next(p for n, p in _parse_sse(resp.text) if n == "card")
+    assert card["meta"].get("original_user_content") == original
 
     action = await client.post(
         "/api/v1/messages/card-action",
@@ -149,9 +183,13 @@ async def test_kb_confirm_chitchat_skips_rag(
     events = _parse_sse(action.text)
     end = next(p for n, p in events if n == "message_end")
     assert end["status"] == "completed"
-    assert end.get("path") == "chitchat"
+    assert end.get("path") == "plan_execute"
     text = "".join(p.get("delta", "") for n, p in events if n == "content_delta")
-    assert "不查知识库" in text
+    assert "59.97" in text
+    assert "不查知识库" not in text
+    assert rag_called["n"] == 0
+    assert pe_calls, "须走 _stream_plan_execute 续跑原问题"
+    assert pe_calls[0].get("user_content") == original
 
 
 @pytest.mark.asyncio
@@ -159,7 +197,7 @@ async def test_kb_confirm_lookup_hits_d14_without_docs(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "app.modules.conversation.route.evaluate_intent_funnel_async",
+        "app.modules.conversation.subgraphs.intent_node.evaluate_intent_funnel_async",
         AsyncMock(
             return_value=IntentDecision(
                 intent="route_clarify",

@@ -98,6 +98,8 @@ async def ensure_seed_if_empty(db: AsyncSession) -> int:
 async def reload_l2_catalog(db: AsyncSession) -> dict[str, list[dict[str, Any]]]:
     try:
         await ensure_seed_if_empty(db)
+        # 幂等对齐：软删废弃系统种子、补插缺失；不复活用户已软删的有效种子
+        await sync_system_seeds(db, actor_id="system_sync", restore_deleted=False)
         catalog = await load_catalog_from_db(db)
         set_fallback_catalog(catalog)
         ok = set_catalog_in_redis(catalog)
@@ -281,11 +283,14 @@ async def update_keyword(
 async def soft_delete_keyword(
     db: AsyncSession, *, keyword_id: str, actor_id: str
 ) -> IntentL2Keyword:
+    """软删关键词；系统种子与自定义均可删（恢复默认可找回系统种子）。
+
+    @author 赵振明
+    @date 2026-09-09 10:41:38
+    """
     row = await db.get(IntentL2Keyword, keyword_id)
     if row is None or row.deleted_at is not None:
         raise ValueError("keyword not found")
-    if row.origin == "system":
-        raise ValueError("系统种子关键词不允许删除，请使用恢复默认或停用")
     row.deleted_at = datetime.now(timezone.utc).replace(tzinfo=None)
     row.enabled = 0
     row.revision = int(row.revision) + 1
@@ -304,6 +309,7 @@ async def soft_delete_keyword(
             "category": row.category,
             "phrase": row.phrase,
             "match_mode": row.match_mode,
+            "origin": row.origin,
         },
         after=None,
     )
@@ -311,21 +317,53 @@ async def soft_delete_keyword(
     return row
 
 
-async def reset_default_seeds(
-    db: AsyncSession, *, actor_id: str
-) -> int:
-    seed_by_code: dict[str, dict[str, Any]] = {}
+def _seed_by_code() -> dict[str, dict[str, Any]]:
+    """DEFAULT_SEED 按 seed_code 索引。"""
+    out: dict[str, dict[str, Any]] = {}
     for cat, items in DEFAULT_SEED.items():
         for item in items:
-            seed_by_code[str(item["seed_code"])] = {**item, "category": cat}
-    count = 0
+            out[str(item["seed_code"])] = {**item, "category": cat}
+    return out
+
+
+async def sync_system_seeds(
+    db: AsyncSession,
+    *,
+    actor_id: str,
+    restore_deleted: bool = False,
+) -> dict[str, int]:
+    """对齐系统种子与 DEFAULT_SEED。
+
+    - 废弃 seed_code（已不在 DEFAULT）→ 软删
+    - 缺失 seed_code → 插入
+    - restore_deleted=True（恢复默认）：还复活并覆写仍在 DEFAULT 内的系统行
+
+    @author 赵振明
+    @date 2026-09-09 10:41:38
+    """
+    seed_by_code = _seed_by_code()
+    soft_deleted = 0
+    upserted = 0
+    inserted = 0
+
     stmt = select(IntentL2Keyword).where(
         IntentL2Keyword.origin == "system",
         IntentL2Keyword.seed_code.is_not(None),
     )
+    existing: dict[str, IntentL2Keyword] = {}
     for row in (await db.execute(stmt)).scalars().all():
-        seed = seed_by_code.get(str(row.seed_code))
+        code = str(row.seed_code)
+        existing[code] = row
+        seed = seed_by_code.get(code)
         if seed is None:
+            if row.deleted_at is None:
+                row.deleted_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                row.enabled = 0
+                row.revision = int(row.revision) + 1
+                row.updated_by = actor_id
+                soft_deleted += 1
+            continue
+        if row.deleted_at is not None and not restore_deleted:
             continue
         row.phrase = str(seed["phrase"])
         row.category = str(seed["category"])
@@ -335,31 +373,51 @@ async def reset_default_seeds(
         row.enabled = 1
         row.revision = int(row.revision) + 1
         row.updated_by = actor_id
-        await audit_service.record(
-            db,
-            actor_id=actor_id,
-            actor_role="platform_admin",
-            action="reset_default",
-            resource_type="intent_l2_keyword",
-            resource_id=row.id,
-            resource_label=f"{row.category}/{row.phrase}",
-            before={
-                "phrase": row.phrase,
-                "category": row.category,
-                "match_mode": row.match_mode,
-                "priority": row.priority,
-            },
-            after={
-                "phrase": row.phrase,
-                "category": row.category,
-                "match_mode": row.match_mode,
-                "priority": row.priority,
-            },
+        upserted += 1
+
+    for code, seed in seed_by_code.items():
+        if code in existing:
+            continue
+        db.add(
+            IntentL2Keyword(
+                id=f"l2k_{uuid.uuid4().hex[:16]}",
+                category=str(seed["category"]),
+                phrase=str(seed["phrase"]),
+                match_mode=str(seed.get("match_mode") or "contains"),
+                enabled=1,
+                priority=int(seed.get("priority") or 100),
+                origin="system",
+                seed_code=code,
+                revision=1,
+                created_by=actor_id,
+                updated_by=actor_id,
+            )
         )
-        count += 1
-    if count:
+        inserted += 1
+
+    if soft_deleted or upserted or inserted:
         await db.commit()
-    return count
+    return {
+        "soft_deleted": soft_deleted,
+        "upserted": upserted,
+        "inserted": inserted,
+    }
+
+
+async def reset_default_seeds(
+    db: AsyncSession, *, actor_id: str
+) -> int:
+    """恢复默认：按 DEFAULT_SEED 全量对齐（含复活已软删系统种子）。
+
+    @author 赵振明
+    @date 2026-09-09 10:41:38
+    """
+    stats = await sync_system_seeds(
+        db, actor_id=actor_id, restore_deleted=True
+    )
+    return int(stats["upserted"]) + int(stats["inserted"]) + int(
+        stats["soft_deleted"]
+    )
 
 
 async def test_match(

@@ -29,11 +29,10 @@ def test_do_not_summarize_is_chitchat() -> None:
     assert d.intent == "chitchat"
 
 
-def test_positive_summarize_still_doc_analyze() -> None:
+def test_positive_summarize_defers_to_l3() -> None:
+    """文档总结默认种子已清空：正向「总结」不得 L2 短路。"""
     d = match_l2_rules("总结赵世龙的简历")
-    assert d is not None
-    assert d.intent == "doc_analyze"
-    assert (d.slots or {}).get("task") == "summarize"
+    assert d is None
 
 
 def test_l3_system_prompt_mentions_user_correction() -> None:

@@ -25,9 +25,16 @@ from app.modules.tool.executor import (
     execute_builtin_tool_async,
     tool_result_content,
 )
-from app.modules.tool.registry import ASK_USER, KB_DOC_ANALYZE, KB_LOOKUP, resolve_openai_tools
+from app.modules.tool.registry import (
+    ASK_USER,
+    EXTRACT_USER_MEMORIES,
+    KB_DOC_ANALYZE,
+    KB_LOOKUP,
+    WEB_SEARCH,
+    resolve_openai_tools,
+)
 
-_ASYNC_TOOLS = frozenset({KB_LOOKUP, KB_DOC_ANALYZE})
+_ASYNC_TOOLS = frozenset({KB_LOOKUP, KB_DOC_ANALYZE, EXTRACT_USER_MEMORIES, WEB_SEARCH})
 
 
 class SkillReactState(TypedDict, total=False):
@@ -152,6 +159,8 @@ async def _node_act(state: SkillReactState, config: RunnableConfig) -> dict[str,
                 department_ids=ctx.get("department_ids"),
                 role_ids=ctx.get("role_ids"),
                 is_platform_admin=bool(ctx.get("is_platform_admin")),
+                conversation_id=ctx.get("conversation_id"),
+                model=ctx.get("llm_model") or ctx.get("model"),
             )
             for c in exec_result.get("citations") or []:
                 if isinstance(c, dict):

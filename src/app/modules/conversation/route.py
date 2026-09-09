@@ -63,6 +63,8 @@ class RouteDecision:
         if self.slots.get("clarify_kind"):
             meta["clarify_kind"] = self.slots.get("clarify_kind")
             meta["pending_intent"] = self.slots.get("pending_intent")
+        if self.slots.get("skill_id"):
+            meta["skill_id"] = self.slots.get("skill_id")
         return meta
 
 
@@ -83,6 +85,7 @@ def intent_to_route(
 
     if intent.intent == "route_clarify":
         ck = str(slots.get("clarify_kind") or "")
+        # intent_confirm 与 kb_confirm 均走 clarify_kb 卡构建分支
         kind: RouteKind = "clarify_agent" if ck == "agent_pick" else "clarify_kb"
         return RouteDecision(
             kind=kind,
@@ -96,6 +99,18 @@ def intent_to_route(
         )
 
     if intent.intent == "ask_user_form":
+        form = str(slots.get("form") or "").strip()
+        if form != "leave":
+            return RouteDecision(
+                kind="chitchat",
+                query=q,
+                confidence=0.3,
+                layer=layer or "L4",
+                reason="ask_form_no_form",
+                handler="system",
+                slots=slots,
+                features=[*features, "ask_form_no_form"],
+            )
         return RouteDecision(
             kind="ask_form",
             query=q,
@@ -119,12 +134,37 @@ def intent_to_route(
             features=features,
         )
 
+    if intent.intent in ("skill_task", "call_agent"):
+        aid = str(
+            slots.get("agent_id") or intent.agent_id or agent_id or ""
+        ).strip()
+        if aid:
+            slots["agent_id"] = aid
+            return RouteDecision(
+                kind="chitchat",
+                query=q,
+                confidence=conf,
+                layer=layer,
+                reason=reason,
+                handler="agent",
+                slots=slots,
+                features=features,
+            )
+        return RouteDecision(
+            kind="chitchat",
+            query=q,
+            confidence=conf,
+            layer=layer,
+            reason=reason or "skill_unbound",
+            handler="system",
+            slots=slots,
+            features=[*features, "skill_unbound"],
+        )
+
     kind_map: dict[str, RouteKind] = {
         "kb_lookup": "kb_lookup",
         "doc_analyze": "doc_analyze",
         "chitchat": "chitchat",
-        "skill_task": "chitchat",
-        "call_agent": "chitchat",
     }
     mapped = kind_map.get(str(intent.intent), "chitchat")
     handler: HandlerKind = "agent" if agent_id else "system"

@@ -11,16 +11,36 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.tool.registry import ASK_USER, ECHO, KB_DOC_ANALYZE, KB_LOOKUP, get_tool_schema
+from app.modules.tool.registry import (
+    ASK_USER,
+    DATETIME_OPS,
+    ECHO,
+    EXTRACT_USER_MEMORIES,
+    KB_DOC_ANALYZE,
+    KB_LOOKUP,
+    NUMERIC_OPS,
+    WEB_SEARCH,
+    get_tool_schema,
+)
 
 
 def execute_builtin_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """同步执行内置工具；kb_lookup 需走 execute_builtin_tool_async。"""
+    """同步执行内置工具；kb_lookup / extract_user_memories 需走 async。"""
     if get_tool_schema(name) is None:
         return {"ok": False, "error": f"unknown tool: {name}"}
 
     if name == ASK_USER:
         return {"ok": True, "deferred": "card", "arguments": arguments}
+
+    if name == DATETIME_OPS:
+        from app.modules.tool.datetime_ops import run_datetime_ops
+
+        return run_datetime_ops(arguments)
+
+    if name == NUMERIC_OPS:
+        from app.modules.tool.numeric_ops import run_numeric_ops
+
+        return run_numeric_ops(arguments)
 
     if name == ECHO:
         msg = str(arguments.get("message") or "")
@@ -40,6 +60,20 @@ def execute_builtin_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]
             "hint": "use execute_builtin_tool_async",
         }
 
+    if name == EXTRACT_USER_MEMORIES:
+        return {
+            "ok": False,
+            "error": "extract_user_memories_requires_async",
+            "hint": "use execute_builtin_tool_async",
+        }
+
+    if name == WEB_SEARCH:
+        return {
+            "ok": False,
+            "error": "web_search_requires_async",
+            "hint": "use execute_builtin_tool_async",
+        }
+
     return {"ok": False, "error": f"unhandled tool: {name}"}
 
 
@@ -53,8 +87,10 @@ async def execute_builtin_tool_async(
     department_ids: list[str] | None = None,
     role_ids: list[str] | None = None,
     is_platform_admin: bool = False,
+    conversation_id: str | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
-    """异步工具执行；kb_lookup 依赖 DB 检索。"""
+    """异步工具执行；kb_lookup / extract_user_memories 依赖 DB。"""
     if name == KB_LOOKUP:
         if db is None:
             return {"ok": False, "error": "kb_lookup_requires_db", "citations": []}
@@ -93,6 +129,38 @@ async def execute_builtin_tool_async(
             query=query,
             user_id=user_id,
         )
+
+    if name == EXTRACT_USER_MEMORIES:
+        if db is None:
+            return {"ok": False, "error": "extract_user_memories_requires_db"}
+        if not user_id:
+            return {"ok": False, "error": "extract_user_memories_requires_user"}
+        from app.modules.memory.extract_skill import run_memory_extract_skill
+        from app.modules.memory.extract_scheduler import build_transcript_from_short
+
+        transcript = str(arguments.get("transcript") or "").strip()
+        if not transcript and conversation_id:
+            transcript = build_transcript_from_short(
+                user_id=str(user_id),
+                conversation_id=str(conversation_id),
+                fallback="",
+            )
+        return await run_memory_extract_skill(
+            db,
+            user_id=str(user_id),
+            transcript=transcript,
+            model=model,
+            trigger="fc",
+        )
+
+    if name == WEB_SEARCH:
+        if db is None:
+            return {"ok": False, "error": "web_search_requires_db"}
+        from app.modules.web_search.citations import attach_web_citations
+        from app.modules.web_search.facade import run_web_search
+
+        query = str(arguments.get("query") or "")
+        return attach_web_citations(await run_web_search(query, db=db))
 
     return execute_builtin_tool(name, arguments)
 

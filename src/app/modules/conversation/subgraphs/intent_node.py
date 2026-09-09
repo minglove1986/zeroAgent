@@ -41,6 +41,7 @@ async def intent_node(state: TurnState, config: RunnableConfig) -> dict[str, Any
         text,
         recent_summary=summary,
         model=model,
+        suppress_route_clarify=bool(state.get("suppress_route_clarify")),
     )
     route = intent_to_route(intent, agent_id=agent_id)
     route_dict = {

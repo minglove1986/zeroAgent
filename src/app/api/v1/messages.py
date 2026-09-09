@@ -68,6 +68,8 @@ class MessageSend(BaseModel):
     supersede_pending_card: bool = False
     # 深度思考：打开模型原生 thinking → SSE thought_delta
     deep_think: bool = False
+    # 本轮用户是否授权联网搜索（管理端可用时才有意义）
+    web_search: bool = False
 
 
 class DismissCardBody(BaseModel):
@@ -358,6 +360,7 @@ async def send_message(
                 role_ids=[] if admin else [actor.role],
                 is_platform_admin=admin,
                 enable_thinking=bool(body.deep_think),
+                web_search=bool(body.web_search),
             )
         ),
         media_type="text/event-stream",
@@ -417,6 +420,26 @@ async def card_action(
         card.status = "expired"
         await db.commit()
         return JSONResponse(status_code=422, content=fail(42211, "card expired"))
+
+    # route_clarify：须选题或填写意图；intent_text ≤200
+    if str(card.card_type or "") == "route_clarify":
+        form = (
+            body.payload.get("form")
+            if isinstance(body.payload.get("form"), dict)
+            else {}
+        )
+        intent_text = str(form.get("intent_text") or "").strip()
+        selected = body.payload.get("selected_option_ids") or []
+        if len(intent_text) > 200:
+            return JSONResponse(
+                status_code=422,
+                content=fail(42212, "intent_text too long (max 200)"),
+            )
+        if not intent_text and not selected:
+            return JSONResponse(
+                status_code=422,
+                content=fail(42212, "请选择选项或填写意图说明"),
+            )
 
     card.status = "submitted"
     card.result = json.dumps(body.payload, ensure_ascii=False)

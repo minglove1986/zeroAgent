@@ -287,6 +287,7 @@ async def list_available_models(
                 "model_name": settings.litellm_model,
                 "display_name": settings.litellm_model,
                 "enabled": True,
+                "supports_reasoning": False,
             }
         ]
 

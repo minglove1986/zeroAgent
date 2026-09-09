@@ -21,26 +21,32 @@ logger = logging.getLogger(__name__)
 async def memory_schedule_node(
     state: TurnState, config: RunnableConfig
 ) -> dict[str, Any]:
-    """按路由门禁调度记忆抽取（短防抖优先）。
+    """按路由门禁调度记忆抽取 Skill（短防抖优先）。
 
     @author 赵振明
-    @date 2026-08-03 11:57:49
+    @date 2026-08-20 16:10:29
     """
     _ = config
     user_id = str(state.get("user_id") or "")
     conversation_id = str(state.get("conversation_id") or "")
     transcript = str(state.get("user_content") or "")
     route = state.get("route") or {}
+    intent = state.get("intent") or {}
     allow = bool(state.get("allow_memory_write", True))
     debounce = int(get_settings().memory_extract_debounce_seconds or 30)
+
+    features = list(intent.get("features") or route.get("features") or [])
+    # route.reason 常为 funnel reason；intent.reason 更贴近分类
+    reason = str(intent.get("reason") or route.get("reason") or "")
 
     result = schedule_memory_extract(
         user_id=user_id,
         conversation_id=conversation_id,
         transcript=transcript,
         allow_memory_write=allow,
-        route_reason=str(route.get("reason") or ""),
+        route_reason=reason,
         route_kind=str(route.get("kind") or ""),
+        intent_features=features,
         idle_seconds=debounce,
     )
     logger.info(

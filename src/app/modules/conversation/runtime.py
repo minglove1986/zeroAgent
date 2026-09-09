@@ -18,6 +18,7 @@ from app.models.conversation import Conversation, Message, MessageCard
 from app.modules.agent.graph.build import run_agent_turn, stream_agent_turn
 from app.modules.agent.skill_prompt import build_agent_skill_system_prompt
 from app.modules.agent.skill_tools import load_agent_openai_tools
+from app.modules.conversation.turn_trace import trace as turn_trace
 from app.modules.llm.gateway import (
     chat_with_tools as chat_completion_with_tools,
     stream_chat as stream_chat_completion_with_fallback,
@@ -41,6 +42,7 @@ from app.modules.memory.service import (
 )
 from app.modules.conversation.route import resolve_route
 from app.modules.intent.funnel import evaluate_intent_funnel, evaluate_intent_funnel_async
+from app.modules.intent.policy import compose_free_intent_resume
 from app.modules.knowledge.lookup import parse_rag_query, run_kb_lookup
 from app.modules.knowledge.doc_analyze import run_doc_analyze
 from app.modules.tool.executor import (
@@ -132,19 +134,31 @@ def mock_leave_ask_user_args() -> dict[str, Any]:
     }
 
 
-def build_route_clarify_card(intent: Any) -> dict[str, Any]:
+def build_route_clarify_card(
+    intent: Any,
+    *,
+    original_user_content: str | None = None,
+) -> dict[str, Any]:
     """路由澄清卡（不经 ask_user；D33 / PRD route_clarify）。
 
     兼容 IntentDecision 与 RouteDecision。
     """
     slots = dict(getattr(intent, "slots", None) or {})
     route_kind = getattr(intent, "kind", None)
-    if route_kind == "clarify_kb":
+    slot_kind = str(slots.get("clarify_kind") or "").strip()
+    if slot_kind in {
+        "kb_confirm",
+        "intent_confirm",
+        "agent_pick",
+        "handle_or_ask",
+    }:
+        kind = slot_kind
+    elif route_kind == "clarify_kb":
         kind = "kb_confirm"
     elif route_kind == "clarify_agent":
         kind = "agent_pick"
     else:
-        kind = str(slots.get("clarify_kind") or "agent_pick")
+        kind = "agent_pick"
     query = str(getattr(intent, "query", "") or "")
     conf = float(getattr(intent, "confidence", 0.5) or 0.5)
     candidates = list(
@@ -152,20 +166,39 @@ def build_route_clarify_card(intent: Any) -> dict[str, Any]:
         or slots.get("agent_candidates")
         or []
     )
+    original = (original_user_content or "").strip() or query
 
-    if kind == "kb_confirm":
-        title = "是否检索知识库？"
+    if kind == "handle_or_ask":
+        title = "您是要办理，还是咨询？"
         body_md = (
-            f"当前意图置信度有限（{conf:.0%}）。"
-            f"关键词：**{query or '（空）'}**。请确认下一步："
+            f"当前意图不太确定（{conf:.0%}）。"
+            f"关于「{query or '该事项'}」，请选择："
         )
         options = [
-            {"id": "kb_lookup", "label": "检索知识库"},
-            {"id": "chitchat", "label": "普通聊聊（不查库）"},
+            {"id": "handle", "label": "我要办理"},
+            {"id": "ask", "label": "我只是咨询"},
+            {"id": "chitchat", "label": "随便聊聊"},
+        ]
+    elif kind == "intent_confirm":
+        title = "您是不是要请假？"
+        body_md = "当前把握有限，请确认是否办理请假（也可在下方用自己的话说明意图）："
+        options = [
+            {"id": "confirm_leave", "label": "是，要请假"},
+            {"id": "chitchat", "label": "否，随便聊聊"},
+        ]
+    elif kind == "kb_confirm":
+        title = f"您是不是想查「{query or '相关资料'}」？"
+        body_md = (
+            f"当前意图置信度有限（{conf:.0%}）。"
+            f"请确认是否检索知识库（也可在下方用自己的话说明意图）："
+        )
+        options = [
+            {"id": "kb_lookup", "label": "是，去检索"},
+            {"id": "chitchat", "label": "否，随便聊聊"},
         ]
     else:
         title = "请选择要使用的助手"
-        body_md = "多个助手可能都适合，请选择其一继续："
+        body_md = "多个助手可能都适合，请选择其一继续（也可在下方用自己的话说明意图）："
         options = [
             {
                 "id": str(c.get("id")),
@@ -177,14 +210,14 @@ def build_route_clarify_card(intent: Any) -> dict[str, Any]:
         if not options:
             # 无助手候选时回退为「是否查库」，标题/文案必须同步，避免文不对题
             kind = "kb_confirm"
-            title = "是否检索知识库？"
+            title = f"您是不是想查「{query or '相关资料'}」？"
             body_md = (
                 f"当前意图置信度有限（{conf:.0%}）。"
-                f"关键词：**{query or '（空）'}**。请确认下一步："
+                f"请确认是否检索知识库（也可在下方用自己的话说明意图）："
             )
             options = [
-                {"id": "kb_lookup", "label": "检索知识库"},
-                {"id": "chitchat", "label": "普通聊聊（不查库）"},
+                {"id": "kb_lookup", "label": "是，去检索"},
+                {"id": "chitchat", "label": "否，随便聊聊"},
             ]
 
     return ask_user_to_card_payload(
@@ -194,13 +227,27 @@ def build_route_clarify_card(intent: Any) -> dict[str, Any]:
             "body_md": body_md,
             "required": True,
             "options": options,
-            "fields": [],
+            "fields": [
+                {
+                    "name": "intent_text",
+                    "label": "用自己的话说明意图",
+                    "type": "text",
+                    "required": False,
+                    "max_length": 200,
+                }
+            ],
             "timeout_seconds": 1800,
             "meta": {
                 "clarify_kind": kind,
                 "pending_intent": slots.get("pending_intent"),
+                "pending_handle": slots.get("pending_handle"),
+                "pending_ask": slots.get("pending_ask"),
                 "query": query,
                 "filters": slots.get("filters") or {},
+                "form": slots.get("form"),
+                "skill_id": slots.get("skill_id"),
+                "original_user_content": original,
+                "allow_free_intent": True,
             },
         }
     )
@@ -375,6 +422,7 @@ async def _enqueue_extract(
     allow_memory_write: bool = True,
     route_reason: str = "",
     route_kind: str = "",
+    intent_features: list[str] | None = None,
     model_name: str | None = None,
     skip_memory_extract: bool = False,
 ) -> None:
@@ -383,7 +431,7 @@ async def _enqueue_extract(
     Turn Graph 已跑 memory_schedule 时传 skip_memory_extract=True，避免二次投递。
 
     @author 赵振明
-    @date 2026-08-03 12:48:20
+    @date 2026-08-20 16:10:29
     """
     _ = db
     from app.modules.conversation.compress_scheduler import schedule_context_compress
@@ -397,6 +445,7 @@ async def _enqueue_extract(
             allow_memory_write=allow_memory_write,
             route_reason=route_reason,
             route_kind=route_kind,
+            intent_features=intent_features,
         )
     schedule_context_compress(
         user_id=user_id,
@@ -421,6 +470,7 @@ async def _stream_via_turn_graph(
     model: str | None,
     model_ids: list[str] | None,
     enable_thinking: bool = False,
+    suppress_route_clarify: bool = False,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Turn Main Graph 适配层：映射 SSE；business/system handoff 走 Plan-Execute。
 
@@ -446,6 +496,7 @@ async def _stream_via_turn_graph(
         is_platform_admin=is_platform_admin,
         msg_meta=msg_meta,
         enable_thinking=enable_thinking,
+        suppress_route_clarify=suppress_route_clarify,
     ):
         if ev_name == "__handoff__":
             dispatch = str((payload or {}).get("dispatch") or "")
@@ -473,6 +524,14 @@ async def _stream_via_turn_graph(
                         assistant_text=notice,
                         card_payload=None,
                         meta=meta,
+                    )
+                    turn_trace(
+                        "runtime",
+                        "end",
+                        conv=conversation_id,
+                        user=user_id,
+                        path="turn_graph",
+                        status="error",
                     )
                     yield "message_end", {
                         "message_id": msg_id,
@@ -502,6 +561,10 @@ async def _stream_via_turn_graph(
                 skip_memory_extract=True,
                 enable_thinking=enable_thinking,
                 skip_understand_stage=True,
+                allow_web_search=bool((meta or {}).get("web_search")),
+                exclude_web_search_skill=bool(
+                    (meta or {}).get("exclude_web_search_skill")
+                ),
             ):
                 yield ev
             return
@@ -523,7 +586,9 @@ async def _stream_via_turn_graph(
                     slots=dict(route_raw.get("slots") or {}),
                     features=list(route_raw.get("features") or []),
                 )
-                card_payload = build_route_clarify_card(route)
+                card_payload = build_route_clarify_card(
+                    route, original_user_content=user_content
+                )
             elif isinstance(deferred, dict) and deferred.get("_build") == "ask_form":
                 card_payload = ask_user_to_card_payload(mock_leave_ask_user_args())
             elif isinstance(deferred, dict) and deferred.get("card_type"):
@@ -578,6 +643,14 @@ async def _stream_via_turn_graph(
             turn_status = str(final_state.get("turn_status") or "")
             if not turn_status:
                 turn_status = "awaiting_card" if card_payload else "completed"
+            turn_trace(
+                "runtime",
+                "end",
+                conv=conversation_id,
+                user=user_id,
+                path="turn_graph",
+                status=turn_status,
+            )
             yield "message_end", {
                 "message_id": msg_id,
                 "status": turn_status,
@@ -839,7 +912,7 @@ async def _stream_skill_fc(
         for tc in tool_calls:
             name = str(tc["name"])
             args = dict(tc.get("arguments") or {})
-            if name == "kb_lookup":
+            if name in ("kb_lookup", "kb_doc_analyze", "extract_user_memories"):
                 exec_result = await execute_builtin_tool_async(
                     name,
                     args,
@@ -849,6 +922,7 @@ async def _stream_skill_fc(
                     department_ids=department_ids,
                     role_ids=role_ids,
                     is_platform_admin=is_platform_admin,
+                    conversation_id=conversation_id,
                 )
                 for c in exec_result.get("citations") or []:
                     yield "citation", c
@@ -917,15 +991,18 @@ async def _stream_plan_execute(
     skip_memory_extract: bool = False,
     enable_thinking: bool = False,
     skip_understand_stage: bool = False,
+    allow_web_search: bool = False,
+    exclude_web_search_skill: bool = False,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Plan-Execute 主图 SSE：过程事件 + citations + answer + 可选 deferred_card。
 
     skip_memory_extract：Turn Graph 已调度记忆时置 True，仅保留压缩调度。
     enable_thinking：透传模型原生 thinking → thought_delta。
     skip_understand_stage：Turn Graph 已报「理解」时置 True。
+    allow_web_search / exclude_web_search_skill：联网 Policy 透传。
 
     @author 赵振明
-    @date 2026-08-03 15:59:40
+    @date 2026-09-07 17:22:45
     """
     result: dict[str, Any] | None = None
     content_streamed = False
@@ -942,6 +1019,8 @@ async def _stream_plan_execute(
         model=model,
         enable_thinking=enable_thinking,
         skip_understand_stage=skip_understand_stage,
+        allow_web_search=allow_web_search,
+        exclude_web_search_skill=exclude_web_search_skill,
     ):
         if ev == "__result__":
             result = data
@@ -969,6 +1048,14 @@ async def _stream_plan_execute(
             assistant_text=notice,
             card_payload=None,
             meta={**(msg_meta or {}), "path": "plan_execute", "plan": plan},
+        )
+        turn_trace(
+            "runtime",
+            "end",
+            conv=conversation_id,
+            user=user_id,
+            path="plan_execute",
+            status="rejected_no_citation",
         )
         yield "message_end", {
             "message_id": msg_id,
@@ -1039,6 +1126,14 @@ async def _stream_plan_execute(
         end_payload["effective_agent_id"] = (msg_meta or {}).get(
             "effective_agent_id"
         ) or agent_id
+    turn_trace(
+        "runtime",
+        "end",
+        conv=conversation_id,
+        user=user_id,
+        path="plan_execute",
+        status=end_payload.get("status"),
+    )
     yield "message_end", end_payload
     if not isinstance(deferred_card, dict):
         await _enqueue_extract(
@@ -1086,6 +1181,7 @@ async def stream_mock_reply(
     role_ids: list[str] | None = None,
     is_platform_admin: bool = False,
     enable_thinking: bool = False,
+    web_search: bool = False,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """对话流：Turn Main Graph（默认）或 legacy 命令式分发。"""
     append_short_memory(
@@ -1094,6 +1190,8 @@ async def stream_mock_reply(
     msg_meta: dict[str, Any] | None = {"retry_of": retry_of} if retry_of else None
     if enable_thinking:
         msg_meta = {**(msg_meta or {}), "deep_think": True}
+    if web_search:
+        msg_meta = {**(msg_meta or {}), "web_search": True}
     try:
         from app.modules.intent.lexicon import refresh_lexicon_if_stale
 
@@ -1544,6 +1642,140 @@ async def stream_mock_reply(
     )
 
 
+async def _stream_resume_web_search_skill(
+    db: AsyncSession,
+    *,
+    conversation_id: str,
+    user_id: str,
+    skill_id: str,
+    instruction: str,
+    agent_id: str,
+    department_ids: list[str] | None = None,
+    role_ids: list[str] | None = None,
+    is_platform_admin: bool = False,
+    model: str | None = None,
+    msg_meta: dict[str, Any] | None = None,
+) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    """联网确认卡「是」：Resume 挂起的 skill_web_search，跳过 Planner。
+
+    @author 赵振明
+    @date 2026-09-08 14:38:53
+    """
+    from app.models.agent import Skill
+    from app.modules.agent.graph.skill_react import run_skill_react
+
+    skill_name = "联网搜索"
+    skill_row = await db.get(Skill, skill_id)
+    if skill_row is not None and str(skill_row.name or "").strip():
+        skill_name = str(skill_row.name).strip()
+
+    yield "thought_delta", {
+        "delta": "已确认开启联网搜索，继续执行。",
+        "source": "narration",
+    }
+    for item in iter_stage_enter("skill", skill_name=skill_name):
+        yield item
+
+    result = await run_skill_react(
+        db=db,
+        skill_id=skill_id,
+        instruction=instruction,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        agent_id=agent_id,
+        department_ids=department_ids,
+        role_ids=role_ids,
+        is_platform_admin=is_platform_admin,
+        model=model,
+    )
+    ok = bool(result.get("ok", True)) and not result.get("error")
+    for item in iter_stage_leave("skill", ok=ok, skill_name=skill_name):
+        yield item
+
+    citations = list(result.get("citations") or [])
+    for c in citations:
+        yield "citation", c
+
+    deferred_card = result.get("deferred_card")
+    answer = str(result.get("answer") or "")
+    if result.get("error") and not answer:
+        answer = f"联网搜索执行失败：{result['error']}"
+
+    for item in iter_stage_enter("respond"):
+        yield item
+    for ch in answer:
+        yield "content_delta", {"delta": ch}
+    for item in iter_stage_leave("respond", ok=ok):
+        yield item
+
+    msgs = [{"role": "user", "content": instruction}]
+    usage = estimate_turn_usage(msgs, answer)
+    ctx = _context_info(msgs, model_name=model)
+    meta = {
+        **(msg_meta or {}),
+        "usage": usage,
+        "context": ctx,
+        "path": "web_search_resume",
+        "web_search": True,
+    }
+    msg_id, _ = await persist_assistant_and_card(
+        db,
+        conversation_id=conversation_id,
+        assistant_text=answer or "（无内容）",
+        card_payload=deferred_card if isinstance(deferred_card, dict) else None,
+        meta=meta,
+    )
+    append_short_memory(
+        user_id=user_id, conversation_id=conversation_id, role="assistant", content=answer
+    )
+    if isinstance(deferred_card, dict):
+        yield "card", deferred_card
+        turn_trace(
+            "runtime",
+            "end",
+            conv=conversation_id,
+            user=user_id,
+            path="web_search_resume",
+            status="awaiting_card",
+        )
+        yield "message_end", {
+            "message_id": msg_id,
+            "status": "awaiting_card",
+            "path": "web_search_resume",
+            "usage": usage,
+            "context": ctx,
+        }
+        return
+
+    status = "completed" if ok else "failed"
+    turn_trace(
+        "runtime",
+        "end",
+        conv=conversation_id,
+        user=user_id,
+        path="web_search_resume",
+        status=status,
+    )
+    end_payload: dict[str, Any] = {
+        "message_id": msg_id,
+        "status": status,
+        "path": "web_search_resume",
+        "usage": usage,
+        "context": ctx,
+    }
+    if result.get("error"):
+        end_payload["reason"] = str(result["error"])
+    yield "message_end", end_payload
+    await _enqueue_extract(
+        db,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        transcript=instruction,
+        allow_memory_write=True,
+        model_name=model,
+    )
+
+
 async def stream_after_card_action(
     db: AsyncSession,
     *,
@@ -1557,10 +1789,17 @@ async def stream_after_card_action(
     is_platform_admin: bool = False,
     model_ids: list[str] | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-    """卡片回传后续跑：请假确认 / 知识库澄清 / Agent 选择。
+    """卡片回传后续跑：请假确认 / 知识库澄清 / Agent 选择 / 联网 Resume。
+
+    kb_confirm / handle_or_ask / intent_confirm 选「随便聊聊」时：
+    用 meta.original_user_content 走系统 Agent Plan-Execute 续答，
+    禁止只回固定话术；亦禁止 suppress→强制 kb_lookup。
+
+    web_search_confirm 选「是」：Resume meta.resume_* 挂起技能（跳过 Planner）；
+    选「否」：exclude_web_search_skill 后重规划。
 
     @author 赵振明
-    @date 2026-07-30 13:36:32
+    @date 2026-09-08 14:38:53
     """
     selected = payload.get("selected_option_ids") or []
     choice = str(selected[0]) if selected else ""
@@ -1580,6 +1819,307 @@ async def stream_after_card_action(
             card_payload = {}
     meta = dict(card_payload.get("meta") or {})
     clarify_kind = str(meta.get("clarify_kind") or "")
+    form_payload = (
+        payload.get("form") if isinstance(payload.get("form"), dict) else {}
+    )
+    intent_text = str(form_payload.get("intent_text") or "").strip()[:200]
+
+    # 联网搜索确认卡：是 → Resume 挂起技能；否 → exclude 后重规划
+    if str(meta.get("card_kind") or "") == "web_search_confirm":
+        from app.modules.web_search.policy import WEB_SEARCH_SKILL_ID
+
+        original = str(meta.get("original_user_content") or "").strip() or "请继续"
+        if choice == "enable":
+            resume_skill = str(meta.get("resume_skill_id") or "").strip() or WEB_SEARCH_SKILL_ID
+            resume_instruction = (
+                str(meta.get("resume_instruction") or "").strip() or original
+            )
+            resume_agent = (
+                str(meta.get("resume_agent_id") or "").strip()
+                or agent_id
+                or "agent_system"
+            )
+            if resume_skill != WEB_SEARCH_SKILL_ID:
+                notice = "联网确认上下文无效，请重新提问后再试。"
+                for ch in notice:
+                    yield "content_delta", {"delta": ch}
+                msg_id, _ = await persist_assistant_and_card(
+                    db,
+                    conversation_id=conversation_id,
+                    assistant_text=notice,
+                    card_payload=None,
+                    meta={
+                        "reason": "web_search_confirm_invalid_resume",
+                        "features": ["card:web_search_confirm"],
+                        "path": "web_search_resume",
+                    },
+                )
+                yield "message_end", {
+                    "message_id": msg_id,
+                    "status": "failed",
+                    "path": "web_search_resume",
+                    "reason": "invalid_resume_skill",
+                }
+                return
+            async for ev in _stream_resume_web_search_skill(
+                db,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                skill_id=resume_skill,
+                instruction=resume_instruction,
+                agent_id=resume_agent,
+                department_ids=department_ids,
+                role_ids=role_ids,
+                is_platform_admin=is_platform_admin,
+                model=primary,
+                msg_meta={
+                    "reason": "web_search_confirm_enable",
+                    "web_search": True,
+                    "features": ["card:web_search_confirm", "resume:skill"],
+                },
+            ):
+                yield ev
+            return
+        # 否：剔除联网技能后续跑，避免再弹确认卡
+        async for ev in _stream_plan_execute(
+            db,
+            conversation_id=conversation_id,
+            user_content=original,
+            user_id=user_id,
+            memory_access="all",
+            allow_memory_write=True,
+            msg_meta={
+                "reason": "web_search_confirm_deny",
+                "web_search": False,
+                "exclude_web_search_skill": True,
+                "features": ["card:web_search_confirm"],
+            },
+            agent_id=agent_id or "agent_system",
+            department_ids=department_ids,
+            role_ids=role_ids,
+            is_platform_admin=is_platform_admin,
+            model=primary,
+            allow_web_search=False,
+            exclude_web_search_skill=True,
+        ):
+            yield ev
+        return
+
+    # 自由意图优先：拼装后走 Turn Graph，并抑制本轮再澄清
+    if intent_text and (
+        clarify_kind
+        in {"kb_confirm", "intent_confirm", "agent_pick", "handle_or_ask"}
+        or str(card_payload.get("type") or "") == "route_clarify"
+    ):
+        original = str(
+            meta.get("original_user_content") or meta.get("query") or ""
+        ).strip()
+        composed = compose_free_intent_resume(original, intent_text)
+        model_name = primary
+        async for ev in _stream_via_turn_graph(
+            db,
+            conversation_id=conversation_id,
+            user_content=composed,
+            user_id=user_id,
+            memory_access="all",
+            allow_memory_write=True,
+            msg_meta={
+                "reason": "card_free_intent",
+                "features": ["card:free_intent", "funnel:suppress_route_clarify"],
+                "original_user_content": original,
+                "intent_text": intent_text,
+            },
+            agent_id=agent_id,
+            department_ids=department_ids,
+            role_ids=role_ids,
+            is_platform_admin=is_platform_admin,
+            model=model_name,
+            model_ids=model_ids,
+            suppress_route_clarify=True,
+        ):
+            yield ev
+        return
+
+    if clarify_kind == "handle_or_ask":
+        original = str(
+            meta.get("original_user_content") or meta.get("query") or ""
+        ).strip()
+        form = str(meta.get("form") or "").strip()
+        pending_handle = str(meta.get("pending_handle") or "").strip()
+        if choice == "handle":
+            if form == "leave" or pending_handle == "ask_user_form":
+                lead = "好的，请先确认请假类型。"
+                for ch in lead:
+                    yield "content_delta", {"delta": ch}
+                leave_card = ask_user_to_card_payload(mock_leave_ask_user_args())
+                msg_id, _ = await persist_assistant_and_card(
+                    db,
+                    conversation_id=conversation_id,
+                    assistant_text=lead,
+                    card_payload=leave_card,
+                    meta={
+                        "intent": "ask_user_form",
+                        "funnel_layer": "L1",
+                        "reason": "card_handle_or_ask_leave",
+                        "form": "leave",
+                    },
+                )
+                yield "card", leave_card
+                yield "message_end", {
+                    "message_id": msg_id,
+                    "status": "awaiting_card",
+                    "path": "ask_form",
+                }
+                return
+            # 技能办理：原问题抑制澄清续跑 Turn Graph
+            async for ev in _stream_via_turn_graph(
+                db,
+                conversation_id=conversation_id,
+                user_content=original or "请继续办理",
+                user_id=user_id,
+                memory_access="all",
+                allow_memory_write=True,
+                msg_meta={
+                    "reason": "card_handle_or_ask_handle",
+                    "features": [
+                        "card:handle_or_ask",
+                        "funnel:suppress_route_clarify",
+                    ],
+                    "skill_id": meta.get("skill_id"),
+                    "pending_handle": pending_handle,
+                },
+                agent_id=agent_id,
+                department_ids=department_ids,
+                role_ids=role_ids,
+                is_platform_admin=is_platform_admin,
+                model=primary,
+                model_ids=model_ids,
+                suppress_route_clarify=True,
+            ):
+                yield ev
+            return
+        if choice == "ask":
+            query = str(meta.get("query") or original or "").strip() or "（空查询）"
+            filters = (
+                meta.get("filters") if isinstance(meta.get("filters"), dict) else None
+            )
+            intent_meta = {
+                "intent": "kb_lookup",
+                "confidence": 1.0,
+                "funnel_layer": "L1",
+                "query": query,
+                "reason": "card_handle_or_ask_ask",
+                "features": ["card:handle_or_ask"],
+                "path": "rag",
+            }
+            lookup = await run_kb_lookup(
+                db,
+                query=query,
+                agent_id=agent_id,
+                top_k=5,
+                user_id=user_id,
+                department_ids=department_ids,
+                role_ids=role_ids,
+                is_platform_admin=is_platform_admin,
+                filters=filters,
+            )
+            citations = list(lookup.get("citations") or [])
+            if not evaluate_rag_citation_gate(used_rag=True, citations=citations):
+                notice = "本轮检索未产生有效引用，已拒绝展示最终答案（D14）。"
+                for ch in notice:
+                    yield "content_delta", {"delta": ch}
+                msg_id, _ = await persist_assistant_and_card(
+                    db,
+                    conversation_id=conversation_id,
+                    assistant_text=notice,
+                    card_payload=None,
+                    meta=intent_meta,
+                )
+                yield "message_end", {
+                    "message_id": msg_id,
+                    **intent_meta,
+                    "status": "rejected_no_citation",
+                    "reason": "D14",
+                }
+                return
+            for c in citations:
+                yield "citation", c
+            snippets = [
+                str(c.get("snippet") or "") for c in citations if c.get("snippet")
+            ]
+            answer = "根据知识库：" + (
+                "；".join(snippets[:3]) if snippets else "已找到相关条目。"
+            )
+            for ch in answer:
+                yield "content_delta", {"delta": ch}
+            msgs = [{"role": "user", "content": query}]
+            usage = estimate_turn_usage(msgs, answer)
+            ctx = _context_info(msgs, model_name=primary)
+            meta_out = {**intent_meta, "usage": usage, "context": ctx}
+            msg_id, _ = await persist_assistant_and_card(
+                db,
+                conversation_id=conversation_id,
+                assistant_text=answer,
+                card_payload=None,
+                meta=meta_out,
+            )
+            yield "message_end", {
+                "message_id": msg_id,
+                "status": "completed",
+                "path": "rag",
+                "usage": usage,
+                "context": ctx,
+                **intent_meta,
+            }
+            return
+        original = str(
+            meta.get("original_user_content") or meta.get("query") or ""
+        ).strip()
+        if original:
+            from app.modules.conversation.turn_state import SYSTEM_AGENT_ID
+
+            async for ev in _stream_plan_execute(
+                db,
+                conversation_id=conversation_id,
+                user_content=original,
+                user_id=user_id,
+                memory_access="all",
+                allow_memory_write=True,
+                msg_meta={
+                    "intent": "chitchat",
+                    "funnel_layer": "L1",
+                    "reason": "card_handle_or_ask_chitchat",
+                    "features": ["card:handle_or_ask", "card:chitchat_resume"],
+                    "original_user_content": original,
+                },
+                agent_id=SYSTEM_AGENT_ID,
+                department_ids=department_ids,
+                role_ids=role_ids,
+                is_platform_admin=is_platform_admin,
+                model=primary,
+            ):
+                yield ev
+            return
+        text = "好的，本次不办理也不查库。有其他问题可以直接问我。"
+        for ch in text:
+            yield "content_delta", {"delta": ch}
+        msg_id, _ = await persist_assistant_and_card(
+            db,
+            conversation_id=conversation_id,
+            assistant_text=text,
+            card_payload=None,
+            meta={
+                "intent": "chitchat",
+                "funnel_layer": "L1",
+                "reason": "card_handle_or_ask_skip",
+            },
+        )
+        yield "message_end", {
+            "message_id": msg_id,
+            "status": "completed",
+            "path": "chitchat",
+        }
+        return
 
     if clarify_kind == "kb_confirm":
         if choice == "kb_lookup":
@@ -1654,6 +2194,37 @@ async def stream_after_card_action(
             }
             return
 
+        # 否/随便聊聊：用原问题直接走系统助手续答，禁止只回固定话术，也禁止
+        # suppress_route_clarify（其会把 kb_confirm 强制改回 kb_lookup）。
+        original = str(
+            meta.get("original_user_content") or meta.get("query") or ""
+        ).strip()
+        if original:
+            from app.modules.conversation.turn_state import SYSTEM_AGENT_ID
+
+            async for ev in _stream_plan_execute(
+                db,
+                conversation_id=conversation_id,
+                user_content=original,
+                user_id=user_id,
+                memory_access="all",
+                allow_memory_write=True,
+                msg_meta={
+                    "intent": "chitchat",
+                    "funnel_layer": "L1",
+                    "reason": "card_kb_confirm_chitchat",
+                    "features": ["card:kb_confirm", "card:chitchat_resume"],
+                    "original_user_content": original,
+                },
+                agent_id=SYSTEM_AGENT_ID,
+                department_ids=department_ids,
+                role_ids=role_ids,
+                is_platform_admin=is_platform_admin,
+                model=primary,
+            ):
+                yield ev
+            return
+
         text = "好的，本次不查知识库。有其他问题可以直接问我。"
         for ch in text:
             yield "content_delta", {"delta": ch}
@@ -1696,6 +2267,80 @@ async def stream_after_card_action(
             "status": "completed",
             "path": "call_agent",
             "agent_id": choice,
+        }
+        return
+
+    if clarify_kind == "intent_confirm":
+        if choice == "confirm_leave":
+            lead = "好的，请先确认请假类型。"
+            for ch in lead:
+                yield "content_delta", {"delta": ch}
+            leave_card = ask_user_to_card_payload(mock_leave_ask_user_args())
+            msg_id, _ = await persist_assistant_and_card(
+                db,
+                conversation_id=conversation_id,
+                assistant_text=lead,
+                card_payload=leave_card,
+                meta={
+                    "intent": "ask_user_form",
+                    "funnel_layer": "L1",
+                    "reason": "card_confirm_leave",
+                    "form": "leave",
+                },
+            )
+            yield "card", leave_card
+            yield "message_end", {
+                "message_id": msg_id,
+                "status": "awaiting_card",
+                "path": "ask_form",
+            }
+            return
+        original = str(
+            meta.get("original_user_content") or meta.get("query") or ""
+        ).strip()
+        if original:
+            from app.modules.conversation.turn_state import SYSTEM_AGENT_ID
+
+            async for ev in _stream_plan_execute(
+                db,
+                conversation_id=conversation_id,
+                user_content=original,
+                user_id=user_id,
+                memory_access="all",
+                allow_memory_write=True,
+                msg_meta={
+                    "intent": "chitchat",
+                    "funnel_layer": "L1",
+                    "reason": "card_leave_confirm_chitchat",
+                    "features": ["card:intent_confirm", "card:chitchat_resume"],
+                    "original_user_content": original,
+                },
+                agent_id=SYSTEM_AGENT_ID,
+                department_ids=department_ids,
+                role_ids=role_ids,
+                is_platform_admin=is_platform_admin,
+                model=primary,
+            ):
+                yield ev
+            return
+        text = "好的，本次不办理请假。有其他问题可以直接问我。"
+        for ch in text:
+            yield "content_delta", {"delta": ch}
+        msg_id, _ = await persist_assistant_and_card(
+            db,
+            conversation_id=conversation_id,
+            assistant_text=text,
+            card_payload=None,
+            meta={
+                "intent": "chitchat",
+                "funnel_layer": "L1",
+                "reason": "card_leave_confirm_skip",
+            },
+        )
+        yield "message_end", {
+            "message_id": msg_id,
+            "status": "completed",
+            "path": "chitchat",
         }
         return
 

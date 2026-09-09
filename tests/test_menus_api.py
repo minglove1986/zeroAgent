@@ -105,6 +105,80 @@ async def test_list_menus_filter_by_app(client: AsyncClient) -> None:
 # === 2. 菜单树 ===
 
 @pytest.mark.asyncio
+async def test_list_menus_manage_includes_hidden(client: AsyncClient) -> None:
+    """manage=1 含隐藏菜单；普通列表不含。
+
+    @author 赵振明
+    @date 2026-08-11 14:16:34
+    """
+    from sqlalchemy import update
+
+    from app.models.menu import Menu
+
+    sf = client._session_factory_for_test  # type: ignore[attr-defined]
+    async with sf() as db:
+        await db.execute(
+            update(Menu).where(Menu.code == "org.roles").values(is_visible=False)
+        )
+        await db.commit()
+
+    resp_side = await client.get(
+        "/api/v1/menus?app=admin", headers=_super_admin_headers()
+    )
+    assert resp_side.status_code == 200
+    side_codes = {m["code"] for m in resp_side.json()["data"]["items"]}
+    assert "org.roles" not in side_codes
+
+    resp_mgmt = await client.get(
+        "/api/v1/menus?app=admin&manage=1", headers=_super_admin_headers()
+    )
+    assert resp_mgmt.status_code == 200
+    mgmt_codes = {m["code"] for m in resp_mgmt.json()["data"]["items"]}
+    assert "org.roles" in mgmt_codes
+    assert "org.menus" in mgmt_codes
+
+
+@pytest.mark.asyncio
+async def test_create_menu_grants_super_admin(client: AsyncClient) -> None:
+    """新建自定义菜单后超管自动获得可见权限。
+
+    @author 赵振明
+    @date 2026-08-11 14:16:34
+    """
+    from sqlalchemy import select
+
+    from app.models.role import RoleMenuPermission
+
+    resp = await client.post(
+        "/api/v1/menus",
+        json={
+            "code": "custom.demo",
+            "name": "演示菜单",
+            "path": "/custom/demo",
+            "parent_code": "group.org",
+            "sort": 99,
+            "app": "admin",
+        },
+        headers=_super_admin_headers(),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"]["code"] == "custom.demo"
+
+    sf = client._session_factory_for_test  # type: ignore[attr-defined]
+    async with sf() as db:
+        row = (
+            await db.execute(
+                select(RoleMenuPermission).where(
+                    RoleMenuPermission.role_code == "super_admin",
+                    RoleMenuPermission.menu_code == "custom.demo",
+                )
+            )
+        ).scalar_one_or_none()
+        assert row is not None
+        assert row.can_view is True
+
+
+@pytest.mark.asyncio
 async def test_menu_tree_returns_nested_structure(client: AsyncClient) -> None:
     """菜单树结构。"""
     resp = await client.get("/api/v1/menus/tree", headers=_super_admin_headers())
@@ -114,6 +188,79 @@ async def test_menu_tree_returns_nested_structure(client: AsyncClient) -> None:
     # 顶级菜单至少有 children 字段（可能为空）
     for it in items:
         assert "children" in it
+
+
+@pytest.mark.asyncio
+async def test_menu_tree_platform_admin_sees_system_governance(
+    client: AsyncClient,
+) -> None:
+    """platform_admin 菜单树须含记忆白名单 / L2 / 系统人格（修复种子漏授）。
+
+    @author 赵振明
+    @date 2026-08-11 13:34:50
+    """
+    from datetime import date
+
+    from sqlalchemy import insert
+
+    from app.core.actor import invalidate_actor_cache
+    from app.models.menu import PLATFORM_ADMIN_DEFAULT_MENU_CODES
+    from app.models.role import RoleMenuPermission
+    from app.models.user import User
+
+    sf = client._session_factory_for_test  # type: ignore[attr-defined]
+    async with sf() as db:
+        await db.execute(
+            insert(User).values(
+                id="u_pa",
+                username="pa_admin",
+                password_hash="x",
+                name="平台管理员",
+                employee_no="EPA1",
+                email="pa@x.com",
+                phone="13800000999",
+                position="Admin",
+                hire_date=date(2026, 1, 1),
+                main_department_id="dept_root",
+                role="platform_admin",
+                status="active",
+            )
+        )
+        for code in PLATFORM_ADMIN_DEFAULT_MENU_CODES:
+            await db.execute(
+                insert(RoleMenuPermission).values(
+                    role_code="platform_admin",
+                    menu_code=code,
+                    can_view=True,
+                    can_edit=False,
+                )
+            )
+        await db.commit()
+    invalidate_actor_cache("u_pa")
+
+    resp = await client.get(
+        "/api/v1/menus/tree?app=admin",
+        headers={
+            "X-User-Id": "u_pa",
+            "X-Role": "platform_admin",
+            "X-Department-Id": "dept_root",
+        },
+    )
+    assert resp.status_code == 200
+    items = resp.json()["data"]["items"]
+
+    def _codes(nodes: list) -> set[str]:
+        out: set[str] = set()
+        for n in nodes:
+            out.add(n["code"])
+            out |= _codes(n.get("children") or [])
+        return out
+
+    codes = _codes(items)
+    assert "system.memory-fields" in codes
+    assert "system.l2-keywords" in codes
+    assert "system.persona" in codes
+    assert "group.system" in codes
 
 
 # === 3. 创建菜单 ===

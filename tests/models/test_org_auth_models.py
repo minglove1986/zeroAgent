@@ -114,4 +114,20 @@ def test_builtin_menus_contain_admin_and_web():
     assert "web" in apps
     # 关键菜单存在
     codes = {m[0] for m in BUILTIN_MENUS}
-    assert {"knowledge", "org.users", "org.roles", "org.departments"}.issubset(codes)
+    assert {"knowledge", "org.users", "org.roles", "org.departments", "org.menus"}.issubset(codes)
+
+
+def test_platform_admin_default_menus_include_system_governance():
+    """平台管理员默认菜单须含系统治理叶子（主 PRD D37 / 角色矩阵）。
+
+    @author 赵振明
+    @date 2026-08-11 13:34:50
+    """
+    from app.models.menu import PLATFORM_ADMIN_DEFAULT_MENU_CODES
+
+    assert {
+        "group.system",
+        "system.memory-fields",
+        "system.l2-keywords",
+        "system.persona",
+    }.issubset(PLATFORM_ADMIN_DEFAULT_MENU_CODES)

@@ -26,12 +26,13 @@ from app.modules.system.platform_safety import PLATFORM_SAFETY_RULE
 
 SOURCE_BOUNDARY_RULE = (
     "称呼与「当前用户是谁」只依据【当前用户身份】与【用户记忆】；"
-    "【本会话上下文】与带「第三人资料」标注的观察中出现的人名、经历、合同当事人，"
+    "【本会话上下文】与知识库/技能观察中出现的人名、经历、合同当事人，"
     "一律视为第三方或文档内容，不得当作当前用户身份。"
     "若用户追问为何被叫成某人/资料从哪来，应说明可能来自会话历史或检索混淆，"
     "并澄清：除非身份块或记忆已写明，否则不确定其真实姓名。"
 )
 
+# 历史前缀（已废止注入）；仅用于剥离旧观察/短记中的残留
 THIRD_PARTY_OBS_PREFIX = "【知识库/技能观察·第三人资料】"
 
 
@@ -46,14 +47,17 @@ class TurnContextBlocks:
     digest_text: str | None = None
 
     def system_sections(self) -> list[str]:
-        """按注入顺序：平台安全 → 人格 → 身份 → 记忆 → 会话摘要 → 边界。
+        """按注入顺序：平台安全 → 当前时间 → 人格 → 身份 → 记忆 → 会话摘要 → 边界。
 
         @author 赵振明
-        @date 2026-07-30 14:03:22
+        @date 2026-09-07 10:20:04
         """
         sections: list[str] = []
         if self.safety_text:
             sections.append(f"【平台安全】\n{self.safety_text}")
+        from app.modules.tool.datetime_ops import format_current_time_section
+
+        sections.append(format_current_time_section())
         if self.persona_text:
             sections.append("【系统人格】\n" + self.persona_text)
         if self.identity_text:
@@ -72,13 +76,20 @@ class TurnContextBlocks:
 
 
 def label_third_party_observation(text: str) -> str:
-    """为 RAG/技能观察加第三人资料前缀（幂等）。"""
+    """规范化 RAG/技能观察文案：不再注入第三人资料前缀（避免泄漏到用户可见答案）。
+
+    若仍带历史前缀则剥离，保持调用点兼容。
+
+    @author 赵振明
+    @date 2026-09-07 11:08:04
+    """
     raw = (text or "").strip()
     if not raw:
         return raw
     if raw.startswith(THIRD_PARTY_OBS_PREFIX):
-        return raw
-    return f"{THIRD_PARTY_OBS_PREFIX}\n{raw}"
+        rest = raw[len(THIRD_PARTY_OBS_PREFIX) :].lstrip("\n")
+        return rest.strip()
+    return raw
 
 
 async def build_turn_context_blocks(

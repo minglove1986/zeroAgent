@@ -28,6 +28,7 @@ type LlmModelRow = {
   display_name: string;
   max_input_tokens: number | null;
   max_output_tokens: number | null;
+  supports_reasoning: boolean;
   enabled: boolean;
   source_status: string;
   allow_system_chat: boolean;
@@ -208,6 +209,13 @@ export default function LlmModelsPage() {
       dataIndex: "source_status",
       width: 120,
       render: (v: string) => statusTag(v),
+    },
+    {
+      title: "支持思考",
+      dataIndex: "supports_reasoning",
+      width: 100,
+      render: (v: boolean) =>
+        v ? <Tag color="blue">是</Tag> : <Tag>否</Tag>,
     },
     {
       title: "启用",

@@ -136,15 +136,79 @@ async def upsert_memory(
     source: str = "manual",
     confidence: float = 1.0,
 ) -> UserMemory:
-    """同 user+type+key 更新，否则新建。"""
-    stmt = select(UserMemory).where(
-        UserMemory.user_id == user_id,
-        UserMemory.memory_type == memory_type,
-        UserMemory.memory_key == memory_key,
-        UserMemory.deleted_at.is_(None),
+    """同 user+type+key 更新，否则新建；含软删行则复活。
+
+    多 Worker 并发时靠 Redis 短锁串行化同 key 写入，避免双 INSERT。
+
+    @author 赵振明
+    @date 2026-08-20 17:12:00
+    """
+    import time
+
+    lock_key = f"za:memupsert:{user_id}:{memory_type}:{memory_key}"
+    client = _redis_client()
+    got_lock = False
+    if client is not None:
+        for _ in range(40):
+            try:
+                if client.set(lock_key, "1", nx=True, ex=20):
+                    got_lock = True
+                    break
+            except Exception:  # noqa: BLE001
+                break
+            time.sleep(0.05)
+
+    try:
+        return await _upsert_memory_unlocked(
+            db,
+            user_id=user_id,
+            memory_type=memory_type,
+            memory_key=memory_key,
+            memory_value=memory_value,
+            source=source,
+            confidence=confidence,
+        )
+    finally:
+        if client is not None and got_lock:
+            try:
+                client.delete(lock_key)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+async def _upsert_memory_unlocked(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    memory_type: str,
+    memory_key: str,
+    memory_value: str,
+    source: str = "manual",
+    confidence: float = 1.0,
+) -> UserMemory:
+    """无锁写入：优先活跃行，其次复活软删行。
+
+    @author 赵振明
+    @date 2026-08-20 17:12:00
+    """
+    # 活跃优先（deleted_at IS NULL 排前），同 key 多行时取最早创建
+    stmt = (
+        select(UserMemory)
+        .where(
+            UserMemory.user_id == user_id,
+            UserMemory.memory_type == memory_type,
+            UserMemory.memory_key == memory_key,
+        )
+        .order_by(UserMemory.deleted_at.is_not(None), UserMemory.created_at.asc())
     )
-    row = (await db.execute(stmt)).scalar_one_or_none()
+    rows = list((await db.execute(stmt)).scalars().all())
     now = datetime.now(timezone.utc).replace(tzinfo=None)
+    row = rows[0] if rows else None
+    # 并发历史脏数据：同 key 多余活跃行软删，只留一条
+    for extra in rows[1:]:
+        if extra.deleted_at is None:
+            extra.deleted_at = now
+            extra.is_archived = 1
     if row is None:
         row = UserMemory(
             id=f"mem_{uuid.uuid4().hex[:16]}",
@@ -162,7 +226,38 @@ async def upsert_memory(
         row.confidence = confidence
         row.updated_at = now
         row.is_archived = 0
-    await db.commit()
+        row.deleted_at = None
+    try:
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        # 唯一约束竞态：回滚后按活跃行再更新一次
+        await db.rollback()
+        from sqlalchemy.exc import IntegrityError
+
+        if not isinstance(exc, IntegrityError):
+            raise
+        again = (
+            await db.execute(
+                select(UserMemory)
+                .where(
+                    UserMemory.user_id == user_id,
+                    UserMemory.memory_type == memory_type,
+                    UserMemory.memory_key == memory_key,
+                    UserMemory.deleted_at.is_(None),
+                )
+                .order_by(UserMemory.created_at.asc())
+            )
+        ).scalars().first()
+        if again is None:
+            raise
+        again.memory_value = memory_value
+        again.source = source
+        again.confidence = confidence
+        again.updated_at = now
+        again.is_archived = 0
+        await db.commit()
+        await db.refresh(again)
+        return again
     await db.refresh(row)
     return row
 
@@ -195,8 +290,92 @@ def _extract_display_name(text: str) -> str | None:
     return None
 
 
+def _extract_email(text: str) -> str | None:
+    """从自称联系方式话术中解析邮箱。
+
+    @author 赵振明
+    @date 2026-08-20 15:41:34
+    """
+    import re
+
+    raw = text or ""
+    # 优先「我的邮箱/邮件」邻近片段，避免误抓助手回声中的地址
+    labeled = re.search(
+        r"(?:我的)?(?:邮箱|邮件|电子邮箱|email|e-mail)"
+        r"[是为：:\s]*([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})",
+        raw,
+        re.IGNORECASE,
+    )
+    if labeled:
+        return labeled.group(1).strip()[:120]
+    # 兜底：含联系方式语义时取正文首个邮箱
+    if re.search(r"(?:邮箱|邮件|email|联系方式|contact)", raw, re.IGNORECASE):
+        m = re.search(
+            r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
+            raw,
+        )
+        if m:
+            return m.group(0).strip()[:120]
+    return None
+
+
+def _extract_phone(text: str) -> str | None:
+    """从自称联系方式话术中解析中国大陆手机号。
+
+    @author 赵振明
+    @date 2026-08-20 15:41:34
+    """
+    import re
+
+    raw = text or ""
+    labeled = re.search(
+        r"(?:我的)?(?:电话|手机|手机号|联系电话|号码)"
+        r"[是为：:\s]*((?:\+?86[-\s]?)?1[3-9]\d{9})",
+        raw,
+    )
+    if labeled:
+        digits = re.sub(r"\D", "", labeled.group(1))
+        if digits.startswith("86") and len(digits) == 13:
+            digits = digits[2:]
+        return digits[:20] if len(digits) == 11 else None
+    if re.search(r"(?:电话|手机|号码|联系方式|contact)", raw, re.IGNORECASE):
+        m = re.search(r"(?<!\d)(1[3-9]\d{9})(?!\d)", raw)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _contact_memory_key(kind: str, allowed: set[str]) -> str | None:
+    """联系方式落库 key：独立 email/phone 优先，否则回落 contact。
+
+    @author 赵振明
+    @date 2026-08-20 15:41:34
+    """
+    if kind == "email":
+        if "email" in allowed:
+            return "email"
+        if "contact" in allowed:
+            return "contact"
+        return None
+    if kind == "phone":
+        if "phone" in allowed:
+            return "phone"
+        if "contact" in allowed:
+            return "contact"
+        return None
+    return None
+
+
 def parse_auto_extract_rules(text: str) -> list[dict[str, Any]]:
-    """MOCK / 轻量规则抽取（仅白名单 key）。"""
+    """Mock / LLM 失败时的轻量兜底（仅白名单 key）。
+
+    设计约束：字段扩展靠 Catalog→LLM，禁止为每个运营字段加规则。
+    此处仅保留：姓名话术、邮箱/手机**形态**映射到已启用的 email|phone|contact、
+    以及既有偏好/部门/爱好粗匹配（种子兼容）。
+
+    @author 赵振明
+    @date 2026-08-20 16:10:29
+    """
     from app.modules.memory.extract_catalog_cache import allowed_field_keys
 
     allowed = allowed_field_keys()
@@ -211,6 +390,38 @@ def parse_auto_extract_rules(text: str) -> list[dict[str, Any]]:
                     "memory_value": name,
                 }
             )
+    email = _extract_email(text)
+    if email:
+        email_key = _contact_memory_key("email", allowed)
+        if email_key:
+            found.append(
+                {
+                    "memory_type": "fact",
+                    "memory_key": email_key,
+                    "memory_value": email,
+                }
+            )
+    phone = _extract_phone(text)
+    if phone:
+        phone_key = _contact_memory_key("phone", allowed)
+        if phone_key:
+            # 同 key（多为 contact）时合并，避免 upsert 互相覆盖
+            existing = next(
+                (i for i in found if i.get("memory_key") == phone_key),
+                None,
+            )
+            if existing and phone_key == "contact":
+                prev = str(existing["memory_value"])
+                if phone not in prev:
+                    existing["memory_value"] = f"{prev}; {phone}"[:200]
+            elif not existing or phone_key != "contact":
+                found.append(
+                    {
+                        "memory_type": "fact",
+                        "memory_key": phone_key,
+                        "memory_value": phone,
+                    }
+                )
     if ("以后请" in text or "请用" in text or "习惯" in text) and "brevity" in allowed:
         found.append(
             {
@@ -401,7 +612,11 @@ async def persist_extracted_memories(
     user_id: str,
     items: list[dict[str, Any]],
 ) -> dict[str, int]:
-    """Embedding 去重后写入 MySQL，并 best-effort 写 Milvus。"""
+    """Embedding / 同 key / 联系方式指纹去重后写入 MySQL，并 best-effort 写 Milvus。
+
+    @author 赵振明
+    @date 2026-08-20 17:12:00
+    """
     from app.modules.memory.embedding import cosine_similarity, embed_texts
     from app.modules.memory.milvus_store import search_similar, upsert_memory_vector
 
@@ -412,12 +627,37 @@ async def persist_extracted_memories(
     existing_vecs: list[list[float]] = []
     if existing:
         existing_vecs = await embed_texts([m.memory_value for m in existing])
+    fingerprints = {
+        fp
+        for m in existing
+        if (fp := _contact_value_fingerprint(str(m.memory_value or ""))) is not None
+    }
 
     threshold = get_settings().memory_dedupe_threshold
     saved = 0
     skipped = 0
     for it in items:
         value = str(it.get("memory_value") or "")
+        mtype = str(it["memory_type"])
+        mkey = str(it["memory_key"])
+        # 同 key 且值未变：跳过
+        same_key = next(
+            (
+                m
+                for m in existing
+                if m.memory_type == mtype and m.memory_key == mkey
+            ),
+            None,
+        )
+        if same_key is not None and str(same_key.memory_value) == value:
+            skipped += 1
+            continue
+        # 跨 key 联系方式指纹（phone/contact 同号）已存在则不新建
+        fp = _contact_value_fingerprint(value)
+        if fp and fp in fingerprints and same_key is None:
+            skipped += 1
+            continue
+
         vec = (await embed_texts([value]))[0]
 
         milvus_hits = search_similar(user_id=user_id, vector=vec, top_k=1)
@@ -432,8 +672,8 @@ async def persist_extracted_memories(
         row = await upsert_memory(
             db,
             user_id=user_id,
-            memory_type=str(it["memory_type"]),
-            memory_key=str(it["memory_key"]),
+            memory_type=mtype,
+            memory_key=mkey,
             memory_value=value,
             source="auto_sliding_expired",
             confidence=float(it.get("confidence", 0.8)),
@@ -450,8 +690,33 @@ async def persist_extracted_memories(
             await db.refresh(row)
 
         existing_vecs.append(vec)
+        existing.append(row)
+        if fp:
+            fingerprints.add(fp)
         saved += 1
     return {"saved": saved, "skipped": skipped}
+
+
+def _contact_value_fingerprint(value: str) -> str | None:
+    """规范化手机号/邮箱指纹，用于跨 key 去重。
+
+    @author 赵振明
+    @date 2026-08-20 17:12:00
+    """
+    import re
+
+    raw = value or ""
+    digits = re.sub(r"\D", "", raw)
+    if digits.startswith("86") and len(digits) >= 13:
+        digits = digits[2:]
+    if len(digits) >= 11:
+        phone = digits[-11:]
+        if phone[0] == "1" and len(phone) == 11:
+            return f"phone:{phone}"
+    m = re.search(r"[\w.+-]+@[\w.-]+\.\w+", raw)
+    if m:
+        return f"email:{m.group(0).lower()}"
+    return None
 
 
 def memory_to_dict(m: UserMemory) -> dict[str, Any]:

@@ -87,7 +87,7 @@ async def test_create_rejects_duplicate_in_same_category(db_factory) -> None:
             await store.create_keyword(
                 db,
                 category="leave",
-                phrase="请假",
+                phrase="我要请假",
                 match_mode="contains",
                 enabled=True,
                 priority=10,
@@ -105,7 +105,7 @@ async def test_update_revision_conflict(db_factory) -> None:
                 await db.execute(
                     select(IntentL2Keyword).where(
                         IntentL2Keyword.category == "leave",
-                        IntentL2Keyword.phrase == "请假",
+                        IntentL2Keyword.phrase == "我要请假",
                     )
                 )
             )
@@ -125,7 +125,7 @@ async def test_update_revision_conflict(db_factory) -> None:
 
 
 @pytest.mark.asyncio
-async def test_soft_delete_system_seed_rejected(db_factory) -> None:
+async def test_soft_delete_system_seed_allowed(db_factory) -> None:
     async with db_factory() as db:
         await store.ensure_seed_if_empty(db)
         row = (
@@ -133,17 +133,18 @@ async def test_soft_delete_system_seed_rejected(db_factory) -> None:
                 await db.execute(
                     select(IntentL2Keyword).where(
                         IntentL2Keyword.category == "leave",
-                        IntentL2Keyword.phrase == "请假",
+                        IntentL2Keyword.phrase == "我要请假",
                     )
                 )
             )
             .scalars()
             .one()
         )
-        with pytest.raises(ValueError):
-            await store.soft_delete_keyword(
-                db, keyword_id=row.id, actor_id="usr_admin"
-            )
+        deleted = await store.soft_delete_keyword(
+            db, keyword_id=row.id, actor_id="usr_admin"
+        )
+        assert deleted.deleted_at is not None
+        assert deleted.enabled == 0
 
 
 @pytest.mark.asyncio
@@ -155,17 +156,21 @@ async def test_reset_default_seeds_restores_seed_phrase(db_factory) -> None:
                 await db.execute(
                     select(IntentL2Keyword).where(
                         IntentL2Keyword.category == "leave",
-                        IntentL2Keyword.phrase == "请假",
+                        IntentL2Keyword.phrase == "我要请假",
                     )
                 )
             )
             .scalars()
             .one()
         )
-        # 模拟管理员误改
+        # 模拟管理员误改后软删
         leave.phrase = "已被改"
         leave.revision = 3
+        leave.deleted_at = None
         await db.commit()
+        await store.soft_delete_keyword(
+            db, keyword_id=leave.id, actor_id="usr_admin"
+        )
         count = await store.reset_default_seeds(db, actor_id="usr_admin")
         assert count >= 1
         restored = (
@@ -179,7 +184,37 @@ async def test_reset_default_seeds_restores_seed_phrase(db_factory) -> None:
             .scalars()
             .one()
         )
-        assert restored.phrase == "请假"
+        assert restored.phrase == "我要请假"
+        assert restored.deleted_at is None
+        assert restored.enabled == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_soft_deletes_obsolete_system_seed(db_factory) -> None:
+    async with db_factory() as db:
+        await store.ensure_seed_if_empty(db)
+        obsolete = IntentL2Keyword(
+            id="l2k_obsolete_sum",
+            category="doc_summarize",
+            phrase="总结",
+            match_mode="contains",
+            enabled=1,
+            priority=100,
+            origin="system",
+            seed_code="l2:总结",
+            revision=1,
+            created_by="system_seed",
+            updated_by="system_seed",
+        )
+        db.add(obsolete)
+        await db.commit()
+        stats = await store.sync_system_seeds(
+            db, actor_id="usr_admin", restore_deleted=False
+        )
+        assert stats["soft_deleted"] >= 1
+        row = await db.get(IntentL2Keyword, "l2k_obsolete_sum")
+        assert row is not None
+        assert row.deleted_at is not None
 
 
 @pytest.mark.asyncio
@@ -199,7 +234,7 @@ async def test_test_match_with_candidate(db_factory) -> None:
         candidate = await store.create_keyword(
             db,
             category="meta_reply",
-            phrase="别帮我总结",
+            phrase="别乱帮我总结啦",
             match_mode="contains",
             enabled=True,
             priority=1,
@@ -208,7 +243,7 @@ async def test_test_match_with_candidate(db_factory) -> None:
         )
         result = await store.test_match(
             db,
-            text="别帮我总结赵世龙的简历",
+            text="别乱帮我总结啦赵世龙的简历",
             candidates=[
                 {
                     "category": candidate.category,

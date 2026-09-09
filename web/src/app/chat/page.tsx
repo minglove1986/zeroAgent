@@ -25,9 +25,9 @@ import { ProcessPanel } from "@/components/ProcessPanel";
 import { apiJson } from "@/lib/api";
 import {
   applyProcessEvent,
-  collapseProcess,
   emptyProcess,
   hasVisibleProcess,
+  retainProcessAfterDone,
   type LiveProcess,
 } from "@/lib/chatProcess";
 import {
@@ -54,6 +54,18 @@ type CardPayload = {
   body_md?: string;
   required?: boolean;
   options?: { id: string; label: string }[];
+  fields?: {
+    name: string;
+    label?: string;
+    type?: string;
+    required?: boolean;
+    max_length?: number;
+  }[];
+  meta?: {
+    allow_free_intent?: boolean;
+    clarify_kind?: string;
+    original_user_content?: string;
+  };
 };
 
 type ChatItem =
@@ -68,7 +80,7 @@ type ChatItem =
       text: string;
       messageId?: string;
       rating?: "up" | "down";
-      citations?: { title?: string; snippet?: string }[];
+      citations?: { title?: string; snippet?: string; url?: string; source?: string }[];
       process?: LiveProcess;
       stopped?: boolean;
     }
@@ -86,6 +98,69 @@ type ContextInfo = {
   tokens: number;
   window_tokens: number;
 };
+
+const CITE_SNIPPET_MAX_CHARS = 50;
+
+/** 出处摘要：超过 50 字默认折叠，可展开；标题外链由调用方渲染。 */
+function CitationSnippet({ text }: { text?: string }) {
+  const raw = String(text || "").trim();
+  const [open, setOpen] = useState(false);
+  if (!raw) return null;
+  const chars = Array.from(raw);
+  const needFold = chars.length > CITE_SNIPPET_MAX_CHARS;
+  const shown =
+    !needFold || open
+      ? raw
+      : `${chars.slice(0, CITE_SNIPPET_MAX_CHARS).join("")}…`;
+  return (
+    <span className="cite-snippet">
+      <span className="cite-snippet-text">{shown}</span>
+      {needFold ? (
+        <button
+          type="button"
+          className="cite-fold-btn"
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setOpen((v) => !v);
+          }}
+        >
+          {open ? "收起" : "展开"}
+        </button>
+      ) : null}
+    </span>
+  );
+}
+
+function CitationList({
+  citations,
+}: {
+  citations: { title?: string; snippet?: string; url?: string; source?: string }[];
+}) {
+  if (!citations.length) return null;
+  return (
+    <ul className="msg-citations">
+      {citations.map((c, i) => (
+        <li key={i}>
+          {c.url ? (
+            <a
+              className="cite-title"
+              href={c.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={c.url}
+            >
+              {c.title || c.url}
+            </a>
+          ) : (
+            <span className="cite-title">{c.title}</span>
+          )}
+          <CitationSnippet text={c.snippet} />
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 type ConvListItem = {
   id: string;
@@ -111,17 +186,38 @@ type ModelOption = {
   display_name: string;
   max_input_tokens?: number | null;
   is_system_default?: boolean;
+  /** 目录同步的思考能力位；缺省/false 不展示深度思考 */
+  supports_reasoning?: boolean;
 };
+
+/**
+ * 当前会话模型是否支持深度思考（空选=系统默认或列表首项）。
+ * @author 赵振明
+ * @date 2026-08-19 16:19:46
+ */
+function modelSupportsReasoning(
+  options: ModelOption[],
+  selected: string,
+): boolean {
+  if (!options.length) return false;
+  const name = selected.trim();
+  const hit = name
+    ? options.find((m) => m.model_name === name)
+    : options.find((m) => m.is_system_default) || options[0];
+  return hit?.supports_reasoning === true;
+}
 
 function fmtTokens(n: number): string {
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
   return String(n);
 }
 
+/**
+ * 历史兼容：曾用于发新消息时清空旧过程区。
+ * 现保留各轮过程，默认展开，由用户手动折叠。
+ */
 function stripOldProcess(items: ChatItem[]): ChatItem[] {
-  return items.map((it) =>
-    it.kind === "assistant" && it.process ? { ...it, process: undefined } : it,
-  );
+  return items;
 }
 
 /**
@@ -178,7 +274,7 @@ function upsertAssistantProcess(
 function patchPendingAssistantText(
   items: ChatItem[],
   text: string,
-  citations?: { title?: string; snippet?: string }[],
+  citations?: { title?: string; snippet?: string; url?: string; source?: string }[],
 ): ChatItem[] {
   const next = [...items];
   for (let i = next.length - 1; i >= 0; i -= 1) {
@@ -275,6 +371,7 @@ export default function ChatPage() {
   const [error, setError] = useState("");
   const [pendingCard, setPendingCard] = useState<CardPayload | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
+  const [intentText, setIntentText] = useState("");
   const [agents, setAgents] = useState<{ id: string; name: string; memory_access?: string }[]>(
     [],
   );
@@ -288,7 +385,40 @@ export default function ChatPage() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [deepThink, setDeepThink] = useState(false);
   const [webSearch, setWebSearch] = useState(false);
+  const [webSearchAvailable, setWebSearchAvailable] = useState(false);
   const [hoverMsgId, setHoverMsgId] = useState<string | null>(null);
+
+  const canDeepThink = useMemo(
+    () => modelSupportsReasoning(modelOptions, selectedModel),
+    [modelOptions, selectedModel],
+  );
+
+  useEffect(() => {
+    if (!canDeepThink) setDeepThink(false);
+  }, [canDeepThink]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await apiJson<{ available?: boolean }>(
+          "/api/v1/web-search/availability",
+        );
+        if (cancelled) return;
+        const ok = res.code === 0 && Boolean(res.data?.available);
+        setWebSearchAvailable(ok);
+        if (!ok) setWebSearch(false);
+      } catch {
+        if (!cancelled) {
+          setWebSearchAvailable(false);
+          setWebSearch(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const streamRef = useRef<HTMLElement>(null);
@@ -628,6 +758,9 @@ export default function ChatPage() {
     const prev = selectedModel;
     setSelectedModel(next);
     applyContextWindowForModel(next, modelOptions);
+    if (!modelSupportsReasoning(modelOptions, next)) {
+      setDeepThink(false);
+    }
     if (!conversationId) {
       setError("");
       return;
@@ -861,7 +994,12 @@ export default function ChatPage() {
     }
 
     let assistant = "";
-    const citations: { title?: string; snippet?: string }[] = [];
+    const citations: {
+      title?: string;
+      snippet?: string;
+      url?: string;
+      source?: string;
+    }[] = [];
     let outcome: "ok" | "failed" | "aborted" = "ok";
     const ac = new AbortController();
     abortRef.current = ac;
@@ -878,6 +1016,7 @@ export default function ChatPage() {
           content: text,
           supersede_pending_card: true,
           deep_think: deepThink,
+          web_search: webSearch,
         },
         (event, data) => {
           if (gen !== sessionGenRef.current) return;
@@ -905,7 +1044,11 @@ export default function ChatPage() {
             citations.push({
               title: String(data.title ?? ""),
               snippet: String(data.snippet ?? ""),
+              url: data.url ? String(data.url) : undefined,
+              source: data.source ? String(data.source) : undefined,
             });
+            const cites = [...citations];
+            setItems((prev) => patchPendingAssistantText(prev, assistant, cites));
           } else if (event === "card") {
             const card = data as unknown as CardPayload;
             setPendingCard(card);
@@ -938,9 +1081,7 @@ export default function ChatPage() {
                     next[i] = {
                       ...it,
                       messageId: mid,
-                      process: hasVisibleProcess(it.process)
-                        ? collapseProcess(it.process!)
-                        : it.process,
+                      process: retainProcessAfterDone(it.process),
                     };
                     break;
                   }
@@ -949,7 +1090,7 @@ export default function ChatPage() {
               });
             } else {
               setItems((prev) =>
-                upsertAssistantProcess(prev, (p) => collapseProcess(p)),
+                upsertAssistantProcess(prev, (p) => retainProcessAfterDone(p) ?? p),
               );
             }
             if (status === "rejected_no_citation") {
@@ -1048,12 +1189,54 @@ export default function ChatPage() {
     }
   }
 
+  async function onCardDismiss() {
+    if (!pendingCard || !conversationId || streamPhaseRef.current !== "idle") {
+      return;
+    }
+    const cardId = pendingCard.card_id;
+    setError("");
+    try {
+      await apiJson<{ dismissed_ids?: string[] }>("/api/v1/messages/dismiss-card", {
+        method: "POST",
+        body: JSON.stringify({
+          conversation_id: conversationId,
+          card_id: cardId,
+        }),
+      });
+      setPendingCard(null);
+      pendingCardRef.current = null;
+      setSelected([]);
+      setIntentText("");
+      setItems((prev) =>
+        prev.map((it) =>
+          it.kind === "card" && it.card.card_id === cardId
+            ? { ...it, skipped: true }
+            : it,
+        ),
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "取消卡片失败");
+    }
+  }
+
   async function onCardSubmit() {
     if (!pendingCard || !conversationId || streamPhaseRef.current !== "idle") {
       return;
     }
     const gen = sessionGenRef.current;
     const cardId = pendingCard.card_id;
+    const freeIntent = intentText.trim().slice(0, 200);
+    const allowFree =
+      pendingCard.type === "route_clarify" ||
+      pendingCard.meta?.allow_free_intent === true;
+    if (allowFree) {
+      if (!freeIntent && selected.length === 0) {
+        setError("请选择选项或填写意图说明");
+        return;
+      }
+    } else if (selected.length === 0) {
+      return;
+    }
     streamPhaseRef.current = "streaming";
     setStreamPhase("streaming");
     setError("");
@@ -1062,13 +1245,20 @@ export default function ChatPage() {
     const ac = new AbortController();
     abortRef.current = ac;
     let outcome: "ok" | "failed" | "aborted" = "ok";
+    const payload: Record<string, unknown> = {
+      action: "submit",
+      selected_option_ids: freeIntent ? [] : selected,
+    };
+    if (freeIntent) {
+      payload.form = { intent_text: freeIntent };
+    }
     try {
       await postSse(
         "/api/v1/messages/card-action",
         {
           conversation_id: conversationId,
           card_id: cardId,
-          payload: { selected_option_ids: selected },
+          payload,
         },
         (event, data) => {
           if (gen !== sessionGenRef.current) return;
@@ -1107,9 +1297,7 @@ export default function ChatPage() {
                   next[i] = {
                     ...it,
                     messageId: mid,
-                    process: hasVisibleProcess(it.process)
-                      ? collapseProcess(it.process!)
-                      : it.process,
+                    process: retainProcessAfterDone(it.process),
                   };
                   break;
                 }
@@ -1124,6 +1312,7 @@ export default function ChatPage() {
         setPendingCard(null);
         pendingCardRef.current = null;
         setSelected([]);
+        setIntentText("");
       }
     } catch (err) {
       if (isAbortError(err)) {
@@ -1229,9 +1418,7 @@ export default function ChatPage() {
                   next[i] = {
                     ...it,
                     messageId: mid,
-                    process: hasVisibleProcess(it.process)
-                      ? collapseProcess(it.process!)
-                      : it.process,
+                    process: retainProcessAfterDone(it.process),
                   };
                   break;
                 }
@@ -1529,14 +1716,7 @@ export default function ChatPage() {
                         <div className="chat-stopped-hint">已停止</div>
                       ) : null}
                       {item.citations?.length ? (
-                        <ul className="msg-citations">
-                          {item.citations.map((c, i) => (
-                            <li key={i}>
-                              <span className="cite-title">{c.title}</span>
-                              <span className="cite-snippet">{c.snippet}</span>
-                            </li>
-                          ))}
-                        </ul>
+                        <CitationList citations={item.citations} />
                       ) : null}
                       {item.messageId ? (
                         <div
@@ -1627,28 +1807,69 @@ export default function ChatPage() {
                       <div className="card-options">
                         {(item.card.options || []).map((opt) => {
                           const on = selected.includes(opt.id);
+                          const freeOn = intentText.trim().length > 0;
                           return (
                             <button
                               key={opt.id}
                               type="button"
                               className={`chip ${on ? "is-on" : ""}`}
-                              onClick={() => setSelected([opt.id])}
-                              disabled={busy}
+                              onClick={() => {
+                                setIntentText("");
+                                setSelected([opt.id]);
+                              }}
+                              disabled={busy || freeOn}
                             >
                               {opt.label}
                             </button>
                           );
                         })}
                       </div>
-                      <button
-                        type="button"
-                        className="btn btn-sm"
-                        style={{ marginTop: 12 }}
-                        disabled={busy || selected.length === 0}
-                        onClick={onCardSubmit}
+                      {item.card.type === "route_clarify" ||
+                      item.card.meta?.allow_free_intent ? (
+                        <textarea
+                          className="chat-textarea"
+                          style={{ marginTop: 12, minHeight: 64 }}
+                          placeholder="用自己的话说明意图（填写后将忽略上方选项）"
+                          value={intentText}
+                          maxLength={200}
+                          disabled={busy}
+                          onChange={(e) => {
+                            setIntentText(e.target.value);
+                            if (e.target.value.trim()) {
+                              setSelected([]);
+                            }
+                          }}
+                          rows={2}
+                        />
+                      ) : null}
+                      <div
+                        style={{
+                          marginTop: 12,
+                          display: "flex",
+                          gap: 8,
+                          flexWrap: "wrap",
+                        }}
                       >
-                        提交并续跑
-                      </button>
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          disabled={
+                            busy ||
+                            (intentText.trim().length === 0 && selected.length === 0)
+                          }
+                          onClick={onCardSubmit}
+                        >
+                          提交并续跑
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-ghost"
+                          disabled={busy}
+                          onClick={() => void onCardDismiss()}
+                        >
+                          取消
+                        </button>
+                      </div>
                     </>
                   ) : (
                     <p className="card-block-tip">卡片已处理或待答</p>
@@ -1680,7 +1901,7 @@ export default function ChatPage() {
                 className="chat-textarea"
                 placeholder={
                   pendingCard
-                    ? "发消息将跳过当前卡片…"
+                    ? "可直接发消息继续（将跳过当前卡）…"
                     : busy
                       ? "输入后 Enter 加入排队…"
                       : "发消息或输入 / 选择技能"
@@ -1713,24 +1934,28 @@ export default function ChatPage() {
                     ))}
                   </select>
                 </label>
-                <button
-                  type="button"
-                  className={`tool-btn ${deepThink ? "is-on" : ""}`}
-                  onClick={() => setDeepThink((v) => !v)}
-                  title="开启后调用模型原生思考，过程显示在上方思考区"
-                >
-                  <span className="tool-ico">🧠</span>
-                  <span>深度思考</span>
-                </button>
-                <button
-                  type="button"
-                  className={`tool-btn ${webSearch ? "is-on" : ""}`}
-                  onClick={() => setWebSearch((v) => !v)}
-                  title="占位开关（未接入联网）"
-                >
-                  <span className="tool-ico">🌐</span>
-                  <span>联网搜索</span>
-                </button>
+                {canDeepThink ? (
+                  <button
+                    type="button"
+                    className={`tool-btn ${deepThink ? "is-on" : ""}`}
+                    onClick={() => setDeepThink((v) => !v)}
+                    title="开启后调用模型原生思考，过程显示在上方思考区"
+                  >
+                    <span className="tool-ico">🧠</span>
+                    <span>深度思考</span>
+                  </button>
+                ) : null}
+                {webSearchAvailable ? (
+                  <button
+                    type="button"
+                    className={`tool-btn ${webSearch ? "is-on" : ""}`}
+                    onClick={() => setWebSearch((v) => !v)}
+                    title="开启后本轮允许联网搜索；未开启时若需要实时信息将弹出确认"
+                  >
+                    <span className="tool-ico">🌐</span>
+                    <span>联网搜索</span>
+                  </button>
+                ) : null}
                 <span className="tool-spacer" />
                 <span className="tool-hint">
                   {busy

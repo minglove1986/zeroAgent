@@ -97,6 +97,7 @@ async def available_llm_models(
                     "model_name": i.get("model_name"),
                     "display_name": i.get("display_name") or i.get("model_name"),
                     "max_input_tokens": i.get("max_input_tokens"),
+                    "supports_reasoning": bool(i.get("supports_reasoning")),
                     "is_system_default": bool(i.get("is_system_default")),
                 }
                 for i in items

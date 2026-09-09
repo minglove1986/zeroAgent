@@ -33,8 +33,19 @@ from app.modules.conversation.process_narration import (
     iter_stage_enter,
     iter_stage_leave,
 )
+from app.modules.conversation.turn_trace import clip as trace_clip
+from app.modules.conversation.turn_trace import trace as turn_trace
 from app.modules.intent.rules import _match_doc_analyze, match_l2_rules
 from app.modules.knowledge.lookup import parse_rag_query, run_kb_lookup
+from app.modules.agent.graph.plan_normalize import (
+    normalize_plan_steps,
+    parse_planner_payload,
+)
+from app.modules.agent.graph.plan_replan import (
+    SKILL_ERROR_WEB_BLOCKED,
+    build_replan_blacklist,
+    should_replan_after_step,
+)
 from app.modules.llm.gateway import get_chat_model
 
 PlanStepKind = Literal["rag_search", "execute_skill", "call_agent", "respond"]
@@ -60,6 +71,7 @@ class AgentState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
     agent_id: str
     user_id: str | None
+    conversation_id: str | None
     user_content: str
     skill_catalog: list[dict[str, Any]]
     plan: list[PlanStep]
@@ -71,12 +83,39 @@ class AgentState(TypedDict, total=False):
     usage: dict[str, Any]
     max_steps: int
     context_system: str
+    # 分栏 sections + 短记忆历史（供 respond 按 token 预算打包；与 legacy 一致）
+    context_sections: list[str]
+    context_history: list[dict[str, Any]]
     llm_model: str | None
     enable_thinking: bool
+    plan_intent: str | None
+    plan_rationale: str | None
+    plan_signals: dict[str, bool]
+    replan_count: int
+    replan_blacklist: list[dict[str, Any]]
+    last_step_failure: str | None
+    need_replan: bool
 
 
 def _runtime_ctx(config: RunnableConfig) -> dict[str, Any]:
     return dict(config.get("configurable") or {})
+
+
+def _trace_conv_user(
+    state: AgentState, config: RunnableConfig | None = None
+) -> tuple[str | None, str | None]:
+    """从 state/config 取会话与用户 id，供 turn_trace。
+
+    @author 赵振明
+    @date 2026-09-08 13:54:26
+    """
+    ctx = _runtime_ctx(config) if config else {}
+    conv = state.get("conversation_id") or ctx.get("conversation_id")
+    user = state.get("user_id") or ctx.get("user_id")
+    return (
+        str(conv) if conv else None,
+        str(user) if user else None,
+    )
 
 
 def _resolve_llm_model(state: AgentState, config: RunnableConfig) -> str | None:
@@ -108,14 +147,22 @@ def _mock_plan_steps(
     *,
     skill_catalog: list[dict[str, Any]],
 ) -> list[PlanStep]:
-    """MOCK_EXTERNAL 下按规格 §5.4 关键字规则产出计划。"""
+    """MOCK_EXTERNAL：与规格决策优先级对齐的关键字计划。"""
+    from app.modules.agent.graph.plan_caps import (
+        BOUNDARY_RESPOND_TEXT,
+        enrich_catalog_caps,
+        pick_web_skill_id,
+    )
+    from app.modules.agent.graph.plan_signals import extract_plan_signals
+
     text = (user_content or "").strip()
-    lowered = text
+    catalog = enrich_catalog_caps(list(skill_catalog or []))
+    signals = extract_plan_signals(text)
 
     doc_hit = _match_doc_analyze(text)
-    doc_kw = any(k in lowered for k in _DOC_SKILL_KEYWORDS)
+    doc_kw = any(k in text for k in _DOC_SKILL_KEYWORDS) or signals.get("doc")
     if doc_hit is not None or doc_kw:
-        skill_id = _pick_doc_understand_skill(skill_catalog)
+        skill_id = _pick_doc_understand_skill(catalog)
         if skill_id:
             task = str((doc_hit.slots or {}).get("task") if doc_hit else "summarize")
             return [
@@ -128,16 +175,13 @@ def _mock_plan_steps(
                 }
             ]
 
+    # 强 KB 语境优先（可含「最新」）；不盲信 L2「搜索」人名误判
     l2 = match_l2_rules(text)
-    rag_kw = any(
-        k in lowered
-        for k in ("搜索", "查知识库", "检索知识库", "知识库", "在知识库", "从知识库")
-    )
-    if (l2 is not None and l2.intent == "kb_lookup") or rag_kw:
+    if signals.get("kb"):
         query = parse_rag_query(text)
-        if l2 is not None and l2.query:
+        if l2 is not None and l2.intent == "kb_lookup" and l2.query:
             query = l2.query
-        filters = (l2.slots or {}).get("filters") if l2 else None
+        filters = (l2.slots or {}).get("filters") if l2 and l2.intent == "kb_lookup" else None
         args: dict[str, Any] = {"query": query or text}
         if isinstance(filters, dict) and filters:
             args["filters"] = filters
@@ -147,6 +191,50 @@ def _mock_plan_steps(
                 "kind": "rag_search",
                 "skill_id": None,
                 "args": args,
+                "status": "pending",
+            },
+            {
+                "id": _new_step_id(),
+                "kind": "respond",
+                "skill_id": None,
+                "args": {"query": text},
+                "status": "pending",
+            },
+        ]
+
+    # 纯时效 / web
+    if signals.get("web"):
+        web_id = pick_web_skill_id(catalog)
+        if web_id:
+            return [
+                {
+                    "id": _new_step_id(),
+                    "kind": "execute_skill",
+                    "skill_id": web_id,
+                    "args": {"instruction": text},
+                    "status": "pending",
+                }
+            ]
+
+    # 裸「搜索」：有 web 用 web，否则边界 respond（不再默认 rag）
+    if any(k in text for k in ("搜索", "查一下", "搜一下")):
+        web_id = pick_web_skill_id(catalog)
+        if web_id:
+            return [
+                {
+                    "id": _new_step_id(),
+                    "kind": "execute_skill",
+                    "skill_id": web_id,
+                    "args": {"instruction": text},
+                    "status": "pending",
+                }
+            ]
+        return [
+            {
+                "id": _new_step_id(),
+                "kind": "respond",
+                "skill_id": None,
+                "args": {"answer": BOUNDARY_RESPOND_TEXT, "query": text},
                 "status": "pending",
             }
         ]
@@ -162,22 +250,16 @@ def _mock_plan_steps(
     ]
 
 
+def _planner_system_prompt(catalog: list[dict[str, Any]]) -> str:
+    from app.modules.agent.graph.planner_prompt import build_planner_system_prompt
+
+    return build_planner_system_prompt(catalog)
+
+
 def _extract_json_plan(text: str) -> list[dict[str, Any]] | None:
-    raw = (text or "").strip()
-    if not raw:
-        return None
-    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
-    if fence:
-        raw = fence.group(1).strip()
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    if isinstance(parsed, dict) and isinstance(parsed.get("steps"), list):
-        return list(parsed["steps"])
-    if isinstance(parsed, list):
-        return parsed
-    return None
+    """兼容旧调用：仅返回 steps；intent 见 parse_planner_payload。"""
+    steps, _, _ = parse_planner_payload(text)
+    return steps or None
 
 
 def _normalize_plan_steps(
@@ -185,60 +267,16 @@ def _normalize_plan_steps(
     *,
     skill_catalog: list[dict[str, Any]],
     max_steps: int,
+    intent: str | None = None,
+    user_content: str = "",
 ) -> list[PlanStep]:
-    """将 LLM/Mock 产出规范为 PlanStep 列表。"""
-    allowed_kinds = {"rag_search", "execute_skill", "call_agent", "respond"}
-    catalog_ids = {str(s.get("id") or "") for s in skill_catalog}
-    out: list[PlanStep] = []
-    for item in raw_steps[: max(1, max_steps)]:
-        kind = str(item.get("kind") or item.get("type") or "respond")
-        if kind not in allowed_kinds:
-            kind = "respond"
-        skill_id = item.get("skill_id")
-        if kind == "execute_skill":
-            sid = str(skill_id or "")
-            if sid not in catalog_ids:
-                sid = _pick_doc_understand_skill(skill_catalog) or ""
-            if not sid:
-                kind = "respond"
-            else:
-                skill_id = sid
-        args = dict(item.get("args") or {})
-        out.append(
-            {
-                "id": str(item.get("id") or _new_step_id()),
-                "kind": kind,  # type: ignore[typeddict-item]
-                "skill_id": str(skill_id) if skill_id else None,
-                "args": args,
-                "status": "pending",
-            }
-        )
-    return out or [
-        {
-            "id": _new_step_id(),
-            "kind": "respond",
-            "skill_id": None,
-            "args": {},
-            "status": "pending",
-        }
-    ]
-
-
-def _planner_system_prompt(catalog: list[dict[str, Any]]) -> str:
-    skills_lines = []
-    for s in catalog:
-        skills_lines.append(
-            f"- {s.get('id')}: {s.get('name')} — {s.get('description') or ''}"
-        )
-    skills_block = "\n".join(skills_lines) if skills_lines else "（无绑定技能）"
-    return (
-        "你是任务规划器。根据用户问题产出 JSON 计划，仅使用以下 step.kind："
-        "rag_search | execute_skill | call_agent | respond。\n"
-        "可用技能：\n"
-        f"{skills_block}\n"
-        "输出格式：{\"steps\":[{\"kind\":\"...\",\"skill_id\":null,\"args\":{}}]}\n"
-        "规则：检索类用 rag_search；需整篇文档理解选文档理解技能 execute_skill；"
-        "简单问答用 respond；call_agent 仅白名单互调。"
+    """将 LLM/Mock 产出规范为 PlanStep 列表（守卫见 plan_normalize）。"""
+    return normalize_plan_steps(  # type: ignore[return-value]
+        raw_steps,
+        intent=intent,
+        user_content=user_content,
+        skill_catalog=skill_catalog,
+        max_steps=max_steps,
     )
 
 
@@ -248,11 +286,11 @@ async def _plan_with_llm(
     skill_catalog: list[dict[str, Any]],
     max_steps: int,
     model: str | None = None,
-) -> list[PlanStep]:
-    """真模型 JSON 计划；非法 JSON 降级单步 respond。
+) -> tuple[list[PlanStep], str | None, str | None]:
+    """真模型 JSON 计划；非法 JSON 降级单步 respond。返回 (plan, intent, rationale)。
 
     @author 赵振明
-    @date 2026-07-30 13:03:49
+    @date 2026-09-08 15:18:00
     """
     chat = get_chat_model(model=model)
     sys_prompt = _planner_system_prompt(skill_catalog)
@@ -266,20 +304,31 @@ async def _plan_with_llm(
         content = ai.content if isinstance(ai, AIMessage) else str(ai)
         text = content if isinstance(content, str) else str(content or "")
     except Exception:  # noqa: BLE001
-        return _normalize_plan_steps(
+        plan = _normalize_plan_steps(
             [{"kind": "respond", "args": {"query": user_content}}],
             skill_catalog=skill_catalog,
             max_steps=max_steps,
+            user_content=user_content,
         )
+        return plan, None, None
 
-    raw = _extract_json_plan(text)
-    if not raw:
-        return _normalize_plan_steps(
+    raw_steps, intent, rationale = parse_planner_payload(text)
+    if not raw_steps:
+        plan = _normalize_plan_steps(
             [{"kind": "respond", "args": {"query": user_content}}],
             skill_catalog=skill_catalog,
             max_steps=max_steps,
+            user_content=user_content,
         )
-    return _normalize_plan_steps(raw, skill_catalog=skill_catalog, max_steps=max_steps)
+        return plan, None, None
+    plan = _normalize_plan_steps(
+        raw_steps,
+        skill_catalog=skill_catalog,
+        max_steps=max_steps,
+        intent=intent,
+        user_content=user_content,
+    )
+    return plan, intent, rationale
 
 
 async def _node_plan(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
@@ -288,23 +337,51 @@ async def _node_plan(state: AgentState, config: RunnableConfig) -> dict[str, Any
     catalog = list(state.get("skill_catalog") or [])
     user_content = str(state.get("user_content") or "")
     max_steps = int(state.get("max_steps") or settings.agent_plan_max_steps)
+    intent: str | None = None
+    rationale: str | None = None
 
     if settings.mock_external:
         raw_steps = _mock_plan_steps(user_content, skill_catalog=catalog)
-        plan = _normalize_plan_steps(raw_steps, skill_catalog=catalog, max_steps=max_steps)
+        plan = _normalize_plan_steps(
+            raw_steps,
+            skill_catalog=catalog,
+            max_steps=max_steps,
+            user_content=user_content,
+        )
     else:
-        plan = await _plan_with_llm(
+        plan, intent, rationale = await _plan_with_llm(
             user_content,
             skill_catalog=catalog,
             max_steps=max_steps,
             model=_resolve_llm_model(state, config),
         )
 
+    kinds = ",".join(str(s.get("kind") or "") for s in plan)
+    conv, user = _trace_conv_user(state, config)
+    from app.modules.agent.graph.plan_signals import extract_plan_signals
+
+    signals = extract_plan_signals(user_content)
+    turn_trace(
+        "plan",
+        "done",
+        conv=conv,
+        user=user,
+        steps=len(plan),
+        kinds=kinds,
+        intent=intent or "",
+        rationale=trace_clip(str(rationale or "")),
+        sig_web=int(bool(signals.get("web"))),
+        sig_kb=int(bool(signals.get("kb"))),
+    )
+
     return {
         "plan": plan,
         "plan_cursor": 0,
         "citations": list(state.get("citations") or []),
         "messages": [HumanMessage(content=user_content)],
+        "plan_intent": intent,
+        "plan_rationale": rationale,
+        "plan_signals": signals,
     }
 
 
@@ -347,6 +424,39 @@ async def _execute_skill_step(
     skill_id = str(step.get("skill_id") or "")
     args = dict(step.get("args") or {})
     instruction = str(args.get("instruction") or state.get("user_content") or "")
+
+    # 联网搜索：Policy 门禁（CONFIRM 出结构化卡，不堆提示词）
+    from app.modules.web_search.availability import get_web_search_availability
+    from app.modules.web_search.confirm_card import build_web_search_confirm_card
+    from app.modules.web_search.policy import WebSearchDecision, decide_web_search_skill
+
+    avail = await get_web_search_availability(db)
+    decision = decide_web_search_skill(
+        admin_available=bool(avail.get("available")),
+        user_allow=bool(ctx.get("allow_web_search")),
+        skill_id=skill_id,
+    )
+    conv, user = _trace_conv_user(state)
+    turn_trace(
+        "web_search_policy",
+        "decide",
+        conv=conv or str(ctx.get("conversation_id") or "") or None,
+        user=user or str(ctx.get("user_id") or "") or None,
+        skill=skill_id,
+        decision=getattr(decision, "value", None) or str(decision),
+    )
+    if decision == WebSearchDecision.CONFIRM:
+        # 挂起上下文写入卡 meta，确认后 Resume 本技能步（禁止整轮重规划）
+        card = build_web_search_confirm_card(
+            original_user_content=str(state.get("user_content") or instruction),
+            resume_skill_id=skill_id,
+            resume_instruction=instruction,
+            resume_agent_id=str(state.get("agent_id") or "") or None,
+        )
+        return "需要确认是否开启联网搜索。", [], card
+    if decision == WebSearchDecision.BLOCK:
+        return f"联网搜索当前不可用。\n{SKILL_ERROR_WEB_BLOCKED}", [], None
+
     result = await run_skill_react(
         db=db,
         skill_id=skill_id,
@@ -380,15 +490,88 @@ def _respond_system_content(state: AgentState) -> str:
     return f"{_RESPOND_PREAMBLE}\n\n【来源边界】\n{SOURCE_BOUNDARY_RULE}"
 
 
+def _dict_messages_to_lc(messages: list[dict[str, Any]]) -> list[BaseMessage]:
+    """将 pack_turn_messages 产出转为 LangChain Message。
+
+    @author 赵振明
+    @date 2026-09-08 13:38:39
+    """
+    out: list[BaseMessage] = []
+    for m in messages:
+        role = str(m.get("role") or "")
+        content = str(m.get("content") or "")
+        if role == "system":
+            out.append(SystemMessage(content=content))
+        elif role == "assistant":
+            out.append(AIMessage(content=content))
+        else:
+            out.append(HumanMessage(content=content))
+    return out
+
+
+def _build_respond_lc_messages(
+    state: AgentState, *, user_content: str
+) -> list[BaseMessage]:
+    """按 PRD 记忆分层与 token 预算打包 respond 消息（短历史 + 长记/事实 sections）。
+
+    设计思路：与 legacy ``_build_llm_messages`` 共用 ``pack_turn_messages``——
+    安全/身份/人格/边界 → 长期记忆占比封顶 → 短记忆历史（旧→新丢）→ 本轮用户。
+    另注入此前 plan 步骤 observation，避免取证结果在 respond 中丢失。
+
+    @author 赵振明
+    @date 2026-09-08 15:18:00
+    """
+    from app.modules.llm.context_budget import pack_turn_messages
+    from app.modules.llm.model_resolve import resolve_window_tokens
+
+    sections = [str(s).strip() for s in (state.get("context_sections") or []) if str(s).strip()]
+    if not sections:
+        blob = str(state.get("context_system") or "").strip()
+        if blob:
+            sections = [blob]
+        else:
+            sections = [f"【来源边界】\n{SOURCE_BOUNDARY_RULE}"]
+
+    obs_parts: list[str] = []
+    for step in state.get("plan") or []:
+        if str(step.get("status") or "") not in ("done", "failed"):
+            continue
+        if str(step.get("kind") or "") == "respond":
+            continue
+        obs = str(step.get("observation") or "").strip()
+        if obs:
+            kind = str(step.get("kind") or "")
+            obs_parts.append(f"[{kind}] {obs}")
+    if obs_parts:
+        sections = list(sections) + ["【步骤观察】\n" + "\n---\n".join(obs_parts)]
+
+    history = [
+        {"role": str(t.get("role") or ""), "content": str(t.get("content") or "")}
+        for t in (state.get("context_history") or [])
+        if isinstance(t, dict)
+    ]
+    model_name = str(state.get("llm_model") or "").strip() or None
+    win = resolve_window_tokens(model_name)
+    packed = pack_turn_messages(
+        model_name=model_name or "default",
+        sections=sections,
+        history=history,
+        user_content=user_content,
+        max_input_tokens=win,
+        extra_system=[_RESPOND_PREAMBLE],
+    )
+    return _dict_messages_to_lc(packed.messages)
+
+
 async def _execute_respond(
     state: AgentState, step: PlanStep, config: RunnableConfig | None = None
 ) -> str:
-    """执行 respond 步：注入分栏上下文后流式生成，并向 custom stream 推 token。
+    """执行 respond 步：注入分栏上下文 + 短记忆历史后流式生成，并向 custom stream 推 token。
 
     开启 enable_thinking 时同步推 thought_delta（reasoning_content 或 <think> 标签）。
 
     @author 赵振明
-    @date 2026-08-03 16:01:46
+    @date 2026-09-08 13:38:39
     """
     args = dict(step.get("args") or {})
     # 先宣告「整理回答」，再推思考/正文，避免思考跑在阶段标签前面
@@ -409,10 +592,7 @@ async def _execute_respond(
         model=str(state.get("llm_model") or "") or None,
         enable_thinking=enable_thinking,
     )
-    messages = [
-        SystemMessage(content=_respond_system_content(state)),
-        HumanMessage(content=user_content),
-    ]
+    messages = _build_respond_lc_messages(state, user_content=user_content)
     splitter = _ThinkTagSplitter()
     answer_parts: list[str] = []
     try:
@@ -651,9 +831,11 @@ async def _node_execute(state: AgentState, config: RunnableConfig) -> dict[str, 
     step = dict(plan[cursor])
     kind = str(step.get("kind") or "respond")
     citations = list(state.get("citations") or [])
+    cites_before = len(citations)
     deferred_card = state.get("deferred_card")
     final_answer = str(state.get("final_answer") or "")
     error = state.get("error")
+    obs = ""
 
     try:
         if kind == "rag_search":
@@ -678,10 +860,41 @@ async def _node_execute(state: AgentState, config: RunnableConfig) -> dict[str, 
         step["observation"] = obs
 
     plan[cursor] = step  # type: ignore[assignment]
+    need_replan = should_replan_after_step(
+        step,
+        citations_after=citations,
+        citations_before_len=cites_before,
+        has_deferred_card=bool(deferred_card),
+        replan_count=int(state.get("replan_count") or 0),
+    )
+    blacklist = list(state.get("replan_blacklist") or [])
+    last_fail = state.get("last_step_failure")
+    if need_replan:
+        # 丢弃后续未执行步（含 respond），禁止先 respond 再 replan
+        plan = plan[: cursor + 1]
+        blacklist = build_replan_blacklist(step)
+        last_fail = trace_clip(str(obs or step.get("status") or ""))
+
+    conv, user = _trace_conv_user(state, config)
+    turn_trace(
+        "execute",
+        "step",
+        conv=conv,
+        user=user,
+        cursor=cursor,
+        kind=kind,
+        skill=step.get("skill_id"),
+        status=step.get("status"),
+        obs=trace_clip(str(obs or "")),
+        need_replan=int(need_replan),
+    )
     out: dict[str, Any] = {
         "plan": plan,
         "plan_cursor": cursor + 1,
         "citations": citations,
+        "need_replan": need_replan,
+        "replan_blacklist": blacklist,
+        "last_step_failure": last_fail,
     }
     if final_answer:
         out["final_answer"] = final_answer
@@ -692,24 +905,159 @@ async def _node_execute(state: AgentState, config: RunnableConfig) -> dict[str, 
     return out
 
 
-def _should_continue(state: AgentState) -> Literal["execute", "aggregate"]:
-    """还有未完成步骤且未提前 respond 则继续 execute。"""
+def _should_continue(state: AgentState) -> Literal["execute", "aggregate", "replan"]:
+    """路由：确认卡/答案结束；取证失败 replan；否则继续或汇总。"""
+    next_node: Literal["execute", "aggregate", "replan"]
+    why: str
     if state.get("deferred_card"):
-        return "aggregate"
-    if state.get("final_answer"):
-        return "aggregate"
-    plan = state.get("plan") or []
-    cursor = int(state.get("plan_cursor") or 0)
-    max_steps = int(state.get("max_steps") or get_settings().agent_plan_max_steps)
-    if cursor >= len(plan) or cursor >= max_steps:
-        return "aggregate"
-    return "execute"
+        next_node, why = "aggregate", "deferred_card"
+    elif state.get("need_replan") and int(state.get("replan_count") or 0) < 1:
+        next_node, why = "replan", "need_replan"
+    elif state.get("final_answer"):
+        next_node, why = "aggregate", "final_answer"
+    else:
+        plan = state.get("plan") or []
+        cursor = int(state.get("plan_cursor") or 0)
+        max_steps = int(state.get("max_steps") or get_settings().agent_plan_max_steps)
+        if cursor >= len(plan):
+            next_node, why = "aggregate", "cursor_end"
+        elif cursor >= max_steps:
+            next_node, why = "aggregate", "max_steps"
+        else:
+            next_node, why = "execute", "continue"
+    conv, user = _trace_conv_user(state)
+    turn_trace(
+        "execute",
+        "route",
+        conv=conv,
+        user=user,
+        next=next_node,
+        why=why,
+    )
+    return next_node
+
+
+async def _node_replan(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+    """失败后有限次重规划；重置 plan/cursor，避开黑名单。
+
+    @author 赵振明
+    @date 2026-09-08 15:18:00
+    """
+    from app.modules.agent.graph.planner_prompt import build_planner_system_prompt
+
+    settings = get_settings()
+    catalog = list(state.get("skill_catalog") or [])
+    user_content = str(state.get("user_content") or "")
+    max_steps = int(state.get("max_steps") or settings.agent_plan_max_steps)
+    blacklist = list(state.get("replan_blacklist") or [])
+    last_fail = str(state.get("last_step_failure") or "")
+    count = int(state.get("replan_count") or 0) + 1
+    state_intent: str | None = state.get("plan_intent")
+
+    for item in iter_stage_enter("plan"):
+        _emit_sse_pair(item[0], item[1])
+    _emit_sse_pair(
+        "thought_delta",
+        {"delta": "检索无结果，正在改换方案…", "source": "narration"},
+    )
+
+    if settings.mock_external:
+        raw = _mock_plan_steps(user_content, skill_catalog=catalog)
+        plan = _normalize_plan_steps(
+            raw,
+            skill_catalog=catalog,
+            max_steps=max_steps,
+            user_content=user_content,
+            intent=state_intent,
+        )
+    else:
+        chat = get_chat_model(model=_resolve_llm_model(state, config))
+        sys_prompt = build_planner_system_prompt(
+            catalog, blacklist=blacklist, last_failure=last_fail
+        )
+        try:
+            ai = await chat.ainvoke(
+                [
+                    SystemMessage(content=sys_prompt),
+                    HumanMessage(content=user_content),
+                ]
+            )
+            content = ai.content if isinstance(ai, AIMessage) else str(ai)
+            text = content if isinstance(content, str) else str(content or "")
+            raw_steps, intent, _rationale = parse_planner_payload(text)
+            state_intent = intent
+            plan = _normalize_plan_steps(
+                raw_steps or [{"kind": "respond", "args": {"query": user_content}}],
+                skill_catalog=catalog,
+                max_steps=max_steps,
+                intent=intent,
+                user_content=user_content,
+            )
+        except Exception:  # noqa: BLE001
+            plan = _normalize_plan_steps(
+                [{"kind": "respond", "args": {"query": user_content}}],
+                skill_catalog=catalog,
+                max_steps=max_steps,
+                user_content=user_content,
+            )
+
+    if plan and blacklist:
+        ban = blacklist[0]
+        first = plan[0]
+        same_kind = str(first.get("kind")) == str(ban.get("kind"))
+        ban_sid = ban.get("skill_id")
+        same_skill = (not ban_sid) or (
+            str(first.get("skill_id") or "") == str(ban_sid or "")
+        )
+        if same_kind and same_skill:
+            plan = _normalize_plan_steps(
+                [{"kind": "respond", "args": {"query": user_content}}],
+                skill_catalog=catalog,
+                max_steps=max_steps,
+                user_content=user_content,
+            )
+
+    for item in iter_stage_leave("plan", ok=True):
+        _emit_sse_pair(item[0], item[1])
+
+    conv, user = _trace_conv_user(state, config)
+    turn_trace(
+        "replan",
+        "done",
+        conv=conv,
+        user=user,
+        replan_count=count,
+        kinds=",".join(str(s.get("kind") or "") for s in plan),
+    )
+    return {
+        "plan": plan,
+        "plan_cursor": 0,
+        "need_replan": False,
+        "replan_count": count,
+        "plan_intent": state_intent,
+        "final_answer": "",
+    }
 
 
 async def _node_aggregate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     """汇总 observation → final_answer。"""
+    conv, user = _trace_conv_user(state, config)
+
+    def _done(payload: dict[str, Any]) -> dict[str, Any]:
+        answer = str(payload.get("final_answer") or "")
+        turn_trace(
+            "aggregate",
+            "done",
+            conv=conv,
+            user=user,
+            ok=bool(payload.get("ok", True)) and not payload.get("error"),
+            answer_len=len(answer),
+            cite_n=len(list(state.get("citations") or [])),
+        )
+        return payload
+
     if state.get("final_answer"):
-        return {"final_answer": str(state["final_answer"]), "ok": True}
+        return _done({"final_answer": str(state["final_answer"]), "ok": True})
 
     if state.get("deferred_card"):
         answer = "请补充信息。"
@@ -718,7 +1066,7 @@ async def _node_aggregate(state: AgentState, config: RunnableConfig) -> dict[str
             if obs:
                 answer = obs
                 break
-        return {"final_answer": answer, "ok": True}
+        return _done({"final_answer": answer, "ok": True})
 
     parts: list[str] = []
     for step in state.get("plan") or []:
@@ -733,10 +1081,10 @@ async def _node_aggregate(state: AgentState, config: RunnableConfig) -> dict[str
             answer = f"未能生成有效回答：{upstream}"
         else:
             answer = "未能生成有效回答。"
-        return {"final_answer": answer, "ok": False, "error": state.get("error")}
+        return _done({"final_answer": answer, "ok": False, "error": state.get("error")})
 
     if len(parts) == 1:
-        return {"final_answer": parts[0], "ok": True}
+        return _done({"final_answer": parts[0], "ok": True})
 
     citations = list(state.get("citations") or [])
     cite_hint = ""
@@ -748,7 +1096,7 @@ async def _node_aggregate(state: AgentState, config: RunnableConfig) -> dict[str
     settings = get_settings()
     if settings.mock_external:
         answer = "\n\n".join(parts) + cite_hint
-        return {"final_answer": answer.strip(), "ok": True}
+        return _done({"final_answer": answer.strip(), "ok": True})
 
     model = get_chat_model(model=str(state.get("llm_model") or "") or None)
     context_system = str(state.get("context_system") or "").strip()
@@ -760,7 +1108,8 @@ async def _node_aggregate(state: AgentState, config: RunnableConfig) -> dict[str
     sys_msg = (
         "你是回答汇总助手。仅基于下列步骤观察汇总最终答案，"
         "不得编造无引用的知识库事实。"
-        "观察中带「第三人资料」标注的内容不得当作当前用户身份。\n\n"
+        "知识库/技能观察中的人名与经历不得当作当前用户身份。"
+        "禁止在最终答案中输出内部标注或前缀标签。\n\n"
         f"{boundary}"
     )
     user_msg = "步骤观察：\n" + "\n---\n".join(parts) + cite_hint
@@ -770,13 +1119,15 @@ async def _node_aggregate(state: AgentState, config: RunnableConfig) -> dict[str
         )
         content = ai.content if isinstance(ai, AIMessage) else str(ai)
         text = content if isinstance(content, str) else str(content or "")
-        return {"final_answer": text.strip() or parts[-1], "ok": True}
+        return _done({"final_answer": text.strip() or parts[-1], "ok": True})
     except Exception as exc:  # noqa: BLE001
-        return {
-            "final_answer": "\n\n".join(parts),
-            "ok": False,
-            "error": f"aggregate_llm: {exc}",
-        }
+        return _done(
+            {
+                "final_answer": "\n\n".join(parts),
+                "ok": False,
+                "error": f"aggregate_llm: {exc}",
+            }
+        )
 
 
 _compiled_graph = None
@@ -787,6 +1138,7 @@ def _build_plan_execute_graph():
     graph = StateGraph(AgentState)
     graph.add_node("plan", _node_plan)
     graph.add_node("execute", _node_execute)
+    graph.add_node("replan", _node_replan)
     graph.add_node("aggregate", _node_aggregate)
 
     graph.set_entry_point("plan")
@@ -794,8 +1146,9 @@ def _build_plan_execute_graph():
     graph.add_conditional_edges(
         "execute",
         _should_continue,
-        {"execute": "execute", "aggregate": "aggregate"},
+        {"execute": "execute", "aggregate": "aggregate", "replan": "replan"},
     )
+    graph.add_edge("replan", "execute")
     graph.add_edge("aggregate", END)
     return graph.compile()
 
@@ -808,15 +1161,24 @@ def get_plan_execute_graph():
     return _compiled_graph
 
 
+def reset_plan_execute_graph() -> None:
+    """测试或热更新时丢弃已编译图。"""
+    global _compiled_graph
+    _compiled_graph = None
+
+
 async def load_agent_skill_catalog(
     db: AsyncSession,
     agent_id: str,
 ) -> list[dict[str, Any]]:
-    """加载 Agent 绑定技能目录（供 Planner prompt）。
+    """加载 Agent 绑定技能目录（含 tool_ids / caps，供 Planner）。
 
     @author 赵振明
-    @date 2026-07-27 09:15:32
+    @date 2026-09-08 15:18:00
     """
+    from app.models.agent import SkillTool
+    from app.modules.agent.graph.plan_caps import infer_skill_caps
+
     links = (
         await db.execute(select(AgentSkill).where(AgentSkill.agent_id == agent_id))
     ).scalars().all()
@@ -824,19 +1186,39 @@ async def load_agent_skill_catalog(
         return []
     skill_ids = [lnk.skill_id for lnk in links]
     skills = (
-        await db.execute(select(Skill).where(Skill.id.in_(skill_ids)))
+        await db.execute(
+            select(Skill).where(
+                Skill.id.in_(skill_ids),
+                Skill.status == "published",
+            )
+        )
     ).scalars().all()
     by_id = {s.id: s for s in skills}
+    tool_rows = (
+        await db.execute(select(SkillTool).where(SkillTool.skill_id.in_(skill_ids)))
+    ).scalars().all()
+    tools_by_skill: dict[str, list[str]] = {}
+    for row in tool_rows:
+        tools_by_skill.setdefault(row.skill_id, []).append(row.tool_id)
+
     catalog: list[dict[str, Any]] = []
     for sid in skill_ids:
         skill = by_id.get(sid)
         if skill is None:
             continue
+        tool_ids = list(tools_by_skill.get(sid) or [])
         catalog.append(
             {
                 "id": skill.id,
                 "name": skill.name,
                 "description": skill.description or "",
+                "tool_ids": tool_ids,
+                "workflow_id": skill.workflow_id,
+                "caps": infer_skill_caps(
+                    skill.id,
+                    tool_ids=tool_ids,
+                    workflow_id=skill.workflow_id,
+                ),
             }
         )
     return catalog
@@ -894,19 +1276,34 @@ async def stream_plan_execute(
     model: str | None = None,
     enable_thinking: bool = False,
     skip_understand_stage: bool = False,
+    allow_web_search: bool = False,
+    exclude_web_search_skill: bool = False,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """流式执行 Plan-Execute：yield stage/thought_delta，最后 yield (__result__, result)。
 
     skip_understand_stage：Turn Graph 已报过「理解」时置 True，避免重复。
+    allow_web_search：用户本轮是否授权联网（Policy ALLOW）。
+    exclude_web_search_skill：从目录剔除联网技能（用户确认「否」后续跑防死循环）。
 
     @author 赵振明
-    @date 2026-08-03 15:59:40
+    @date 2026-09-07 17:22:45
     """
     settings = get_settings()
     catalog = await load_agent_skill_catalog(db, agent_id)
+    from app.modules.web_search.availability import get_web_search_availability
+    from app.modules.web_search.policy import filter_skill_catalog
+
+    avail = await get_web_search_availability(db)
+    catalog = filter_skill_catalog(
+        catalog,
+        admin_available=bool(avail.get("available")),
+        exclude_web_search_skill=bool(exclude_web_search_skill),
+    )
     steps_cap = max(1, int(max_steps or settings.agent_plan_max_steps))
 
     context_system = ""
+    context_sections: list[str] = []
+    context_history: list[dict[str, Any]] = []
     if user_id and conversation_id:
         blocks = await build_turn_context_blocks(
             db,
@@ -915,12 +1312,30 @@ async def stream_plan_execute(
             memory_access=memory_access,
             agent_id=agent_id,
         )
-        context_system = "\n\n".join(blocks.system_sections())
+        context_sections = list(blocks.system_sections())
+        context_system = "\n\n".join(context_sections)
+        # 与 legacy 一致：stream_mock_reply 已 append 本轮 user → 历史用 [:-1]
+        context_history = [
+            {"role": str(t.get("role") or ""), "content": str(t.get("content") or "")}
+            for t in (blocks.short_turns[:-1] if blocks.short_turns else [])
+            if isinstance(t, dict)
+        ]
 
     llm_model = str(model).strip() if model else None
+    turn_trace(
+        "plan_execute",
+        "start",
+        conv=conversation_id,
+        user=user_id,
+        agent=agent_id,
+        allow_web=bool(allow_web_search),
+        exclude_web_skill=bool(exclude_web_search_skill),
+        max_steps=steps_cap,
+    )
     initial: dict[str, Any] = {
         "agent_id": agent_id,
         "user_id": user_id,
+        "conversation_id": conversation_id,
         "user_content": user_content,
         "skill_catalog": catalog,
         "plan": [],
@@ -929,8 +1344,13 @@ async def stream_plan_execute(
         "final_answer": "",
         "max_steps": steps_cap,
         "context_system": context_system,
+        "context_sections": context_sections,
+        "context_history": context_history,
         "llm_model": llm_model,
         "enable_thinking": bool(enable_thinking),
+        "replan_count": 0,
+        "need_replan": False,
+        "replan_blacklist": [],
     }
     config: RunnableConfig = {
         "configurable": {
@@ -945,6 +1365,7 @@ async def stream_plan_execute(
             "context_system": context_system,
             "llm_model": llm_model,
             "enable_thinking": bool(enable_thinking),
+            "allow_web_search": bool(allow_web_search),
         }
     }
 

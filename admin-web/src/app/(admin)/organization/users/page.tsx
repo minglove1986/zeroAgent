@@ -1,6 +1,13 @@
 "use client";
 
+/**
+ * 用户管理列表（含手机/身份证列与查看入口）。
+ *
+ * @author 赵振明
+ * @date 2026-08-11 15:41:23
+ */
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import {
   App,
   Button,
@@ -31,9 +38,11 @@ type UserOut = {
   main_department_id: string;
   role: string;
   status: UserStatus;
+  id_card?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
   last_login_at?: string | null;
+  last_login_ip?: string | null;
 };
 
 type DepartmentLite = { id: string; name: string };
@@ -57,6 +66,21 @@ const ROLE_LABEL: Record<string, string> = {
   department_admin: "部门管理员",
   platform_admin: "平台管理员",
   super_admin: "超级管理员",
+};
+
+const PHONE_RULE = {
+  pattern: /^1[3-9]\d{9}$/,
+  message: "须为 11 位大陆手机号",
+};
+
+/** 选填身份证：空通过，有值才校验格式。 */
+const ID_CARD_RULE = {
+  validator: async (_: unknown, value: string | undefined) => {
+    if (!value || !String(value).trim()) return;
+    if (!/^[0-9]{17}[0-9Xx]$/.test(String(value).trim())) {
+      throw new Error("须为 18 位身份证号（末位数字或 X）");
+    }
+  },
 };
 
 export default function UsersPage() {
@@ -93,6 +117,10 @@ export default function UsersPage() {
       if (res.code === 0 && res.data) {
         setItems(res.data.items);
         setTotal(res.data.total);
+      } else {
+        message.error(res.message || "加载用户失败");
+        setItems([]);
+        setTotal(0);
       }
     } catch (err) {
       message.error(`加载失败：${(err as Error).message}`);
@@ -116,9 +144,16 @@ export default function UsersPage() {
   const onCreate = async () => {
     try {
       const values = await createForm.validateFields();
+      const body = {
+        ...values,
+        id_card: values.id_card?.trim() || null,
+        department_ids: values.department_ids?.length
+          ? values.department_ids
+          : [values.main_department_id],
+      };
       const res = await apiJson<UserOut>("/api/v1/users", {
         method: "POST",
-        body: JSON.stringify(values),
+        body: JSON.stringify(body),
       });
       if (res.code === 0) {
         message.success("创建成功");
@@ -137,9 +172,16 @@ export default function UsersPage() {
     if (!editing) return;
     try {
       const values = await editForm.validateFields();
+      const body = {
+        ...values,
+        id_card:
+          values.id_card === undefined || values.id_card === ""
+            ? null
+            : values.id_card,
+      };
       const res = await apiJson<UserOut>(`/api/v1/users/${editing.id}`, {
         method: "PUT",
-        body: JSON.stringify(values),
+        body: JSON.stringify(body),
       });
       if (res.code === 0) {
         message.success("更新成功");
@@ -153,10 +195,7 @@ export default function UsersPage() {
     }
   };
 
-  const onToggleStatus = async (
-    userId: string,
-    current: UserStatus,
-  ) => {
+  const onToggleStatus = async (userId: string, current: UserStatus) => {
     const next: UserStatus = current === "disabled" ? "active" : "disabled";
     const action = next === "active" ? "启用" : "停用";
     modal.confirm({
@@ -191,10 +230,9 @@ export default function UsersPage() {
       cancelText: "取消",
       okButtonProps: { danger: true },
       onOk: async () => {
-        const res = await apiJson<{ id: string }>(
-          `/api/v1/users/${userId}`,
-          { method: "DELETE" },
-        );
+        const res = await apiJson<{ id: string }>(`/api/v1/users/${userId}`, {
+          method: "DELETE",
+        });
         if (res.code === 0) {
           message.success("已标记离职");
           loadUsers();
@@ -210,24 +248,41 @@ export default function UsersPage() {
       title: "用户名",
       dataIndex: "username",
       width: 140,
-      render: (v: string) => <span style={{ fontFamily: "monospace" }}>{v}</span>,
+      render: (v: string) => (
+        <span style={{ fontFamily: "monospace" }}>{v}</span>
+      ),
     },
     { title: "显示名", dataIndex: "name", width: 120 },
     { title: "工号", dataIndex: "employee_no", width: 120 },
     {
+      title: "手机",
+      dataIndex: "phone",
+      width: 130,
+      render: (v: string | null | undefined) =>
+        v || <span style={{ color: "var(--text-secondary)" }}>—</span>,
+    },
+    {
+      title: "身份证",
+      dataIndex: "id_card",
+      width: 180,
+      render: (v: string | null | undefined) =>
+        v ? (
+          <span style={{ fontFamily: "monospace", fontSize: 12 }}>{v}</span>
+        ) : (
+          <span style={{ color: "var(--text-secondary)" }}>—</span>
+        ),
+    },
+    {
       title: "主部门",
       dataIndex: "main_department_id",
       width: 140,
-      render: (v: string) =>
-        departments.find((d) => d.id === v)?.name || v,
+      render: (v: string) => departments.find((d) => d.id === v)?.name || v,
     },
     {
       title: "角色",
       dataIndex: "role",
       width: 120,
-      render: (v: string) => (
-        <Tag color="blue">{ROLE_LABEL[v] || v}</Tag>
-      ),
+      render: (v: string) => <Tag color="blue">{ROLE_LABEL[v] || v}</Tag>,
     },
     {
       title: "状态",
@@ -238,10 +293,35 @@ export default function UsersPage() {
       ),
     },
     {
+      title: "最后登录",
+      dataIndex: "last_login_at",
+      width: 170,
+      render: (v: string | null | undefined) =>
+        v ? (
+          new Date(v).toLocaleString()
+        ) : (
+          <span style={{ color: "var(--text-secondary)" }}>从未登录</span>
+        ),
+    },
+    {
+      title: "最后 IP",
+      dataIndex: "last_login_ip",
+      width: 140,
+      render: (v: string | null | undefined) =>
+        v ? (
+          <span style={{ fontFamily: "monospace", fontSize: 12 }}>{v}</span>
+        ) : (
+          <span style={{ color: "var(--text-secondary)" }}>—</span>
+        ),
+    },
+    {
       title: "操作",
-      width: 220,
+      width: 260,
       render: (_: unknown, record: UserOut) => (
         <Space size="small">
+          <Link href={`/organization/users/${record.id}`}>
+            <Button size="small">查看</Button>
+          </Link>
           <Button
             size="small"
             onClick={() => {
@@ -334,6 +414,7 @@ export default function UsersPage() {
           loading={loading}
           columns={columns}
           dataSource={items}
+          scroll={{ x: 1400 }}
           pagination={{
             current: page,
             pageSize,
@@ -399,6 +480,40 @@ export default function UsersPage() {
             <Input />
           </Form.Item>
           <Form.Item
+            label="邮箱"
+            name="email"
+            rules={[
+              { required: true, message: "必填" },
+              { type: "email", message: "邮箱格式不正确" },
+            ]}
+          >
+            <Input />
+          </Form.Item>
+          <Form.Item
+            label="手机号"
+            name="phone"
+            rules={[{ required: true, message: "必填" }, PHONE_RULE]}
+          >
+            <Input placeholder="11 位大陆号" />
+          </Form.Item>
+          <Form.Item label="身份证号" name="id_card" rules={[ID_CARD_RULE]}>
+            <Input placeholder="选填，18 位" />
+          </Form.Item>
+          <Form.Item
+            label="职位"
+            name="position"
+            rules={[{ required: true, message: "必填" }]}
+          >
+            <Input />
+          </Form.Item>
+          <Form.Item
+            label="入职日期"
+            name="hire_date"
+            rules={[{ required: true, message: "必填" }]}
+          >
+            <Input placeholder="YYYY-MM-DD" />
+          </Form.Item>
+          <Form.Item
             label="主部门"
             name="main_department_id"
             rules={[{ required: true, message: "必填" }]}
@@ -438,8 +553,11 @@ export default function UsersPage() {
           <Form.Item label="邮箱" name="email">
             <Input />
           </Form.Item>
-          <Form.Item label="手机号" name="phone">
+          <Form.Item label="手机号" name="phone" rules={[PHONE_RULE]}>
             <Input />
+          </Form.Item>
+          <Form.Item label="身份证号" name="id_card" rules={[ID_CARD_RULE]}>
+            <Input placeholder="选填，清空则删除" />
           </Form.Item>
           <Form.Item label="职位" name="position">
             <Input />

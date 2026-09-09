@@ -74,6 +74,9 @@ async def test_identity_from_users_not_short_memory(db_session, seed_user):
     assert "尹庆为" not in blocks.identity_text
     assert any("尹庆为" in t.get("content", "") for t in blocks.short_turns)
     assert SOURCE_BOUNDARY_RULE in blocks.boundary_text
+    joined = "\n".join(blocks.system_sections())
+    assert "【当前时间】" in joined
+    assert "Asia/Shanghai" in joined
 
 
 @pytest.mark.asyncio
@@ -133,20 +136,23 @@ async def test_unknown_user_identity_fallback(db_session):
     assert "姓名未提供" in blocks.identity_text
 
 
-def test_label_third_party_observation_prefix():
+def test_label_third_party_observation_no_prefix():
+    """观察文案不再注入第三人资料前缀。"""
     out = label_third_party_observation("检索命中：尹庆为简历")
-    assert out.startswith("【")
-    assert "第三人" in out
-    assert "尹庆为简历" in out
+    assert out == "检索命中：尹庆为简历"
+    assert "第三人" not in out
 
 
-def test_label_third_party_observation_idempotent():
-    """重复调用 label_third_party_observation 不叠前缀。"""
-    text = "检索命中：尹庆为简历"
+def test_label_third_party_observation_strips_legacy_prefix():
+    """历史前缀若仍存在则剥离，且幂等。"""
+    from app.modules.conversation.context_blocks import THIRD_PARTY_OBS_PREFIX
+
+    text = f"{THIRD_PARTY_OBS_PREFIX}\n检索命中：尹庆为简历"
     first = label_third_party_observation(text)
     second = label_third_party_observation(first)
+    assert first == "检索命中：尹庆为简历"
     assert first == second
-    assert second.count("第三人资料") == 1
+    assert "第三人" not in second
 
 
 @pytest.mark.asyncio
@@ -164,6 +170,10 @@ async def test_execute_respond_uses_context_system(monkeypatch):
             captured.extend(messages)
             return AIMessage(content="ok")
 
+        async def astream(self, messages):
+            captured.extend(messages)
+            yield AIMessage(content="ok")
+
     monkeypatch.setattr(pe, "get_chat_model", lambda **_k: FakeModel())
     state = {
         "user_content": "你好",
@@ -172,6 +182,11 @@ async def test_execute_respond_uses_context_system(monkeypatch):
             "【用户记忆】\n- reply_style: 简洁\n"
             "【来源边界】\n" + SOURCE_BOUNDARY_RULE
         ),
+        "context_sections": [
+            "【当前用户身份】\n姓名：测试员",
+            "【用户记忆】\n- reply_style: 简洁",
+            "【来源边界】\n" + SOURCE_BOUNDARY_RULE,
+        ],
     }
     out = await pe._execute_respond(state, {"kind": "respond", "args": {}})
     assert out == "ok"
@@ -180,10 +195,128 @@ async def test_execute_respond_uses_context_system(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_execute_rag_search_labels_third_party(monkeypatch):
-    """RAG 观察须经 label_third_party_observation 标注。"""
+async def test_execute_respond_includes_short_history(monkeypatch):
+    """Plan-Execute respond 须按 token 预算注入短记忆历史（非仅本轮 user）。"""
+    from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+
     from app.modules.agent.graph import plan_execute as pe
-    from app.modules.conversation.context_blocks import THIRD_PARTY_OBS_PREFIX
+    from app.modules.conversation.context_blocks import SOURCE_BOUNDARY_RULE
+
+    captured: list[BaseMessage] = []
+
+    class FakeModel:
+        async def astream(self, messages):
+            captured.extend(messages)
+            yield AIMessage(content="上一轮在聊请假流程")
+
+    monkeypatch.setattr(pe, "get_chat_model", lambda **_k: FakeModel())
+    state = {
+        "user_content": "上一轮咱们聊的是什么",
+        "context_sections": [
+            "【当前用户身份】\n姓名：测试员",
+            "【来源边界】\n" + SOURCE_BOUNDARY_RULE,
+        ],
+        "context_history": [
+            {"role": "user", "content": "帮我查一下请假流程"},
+            {"role": "assistant", "content": "请假需提前在 OA 提交。"},
+        ],
+        "llm_model": "test-model",
+    }
+    out = await pe._execute_respond(state, {"kind": "respond", "args": {}})
+    assert "请假" in out
+    texts = [str(getattr(m, "content", "") or "") for m in captured]
+    assert any("帮我查一下请假流程" in t for t in texts)
+    assert any("请假需提前在 OA 提交" in t for t in texts)
+    assert any(
+        isinstance(m, HumanMessage) and "上一轮咱们聊的是什么" in str(m.content)
+        for m in captured
+    )
+
+
+@pytest.mark.asyncio
+async def test_stream_plan_execute_wires_short_history(monkeypatch, db_session, seed_user):
+    """stream_plan_execute 须把 Redis 短记忆装入 context_history（已 append 本轮则去重）。"""
+    import uuid
+
+    from app.modules.agent.graph import plan_execute as pe
+
+    cid = f"c_hist_{uuid.uuid4().hex[:12]}"
+    append_short_memory(
+        user_id=seed_user.id,
+        conversation_id=cid,
+        role="user",
+        content="昨天说的报销规则",
+    )
+    append_short_memory(
+        user_id=seed_user.id,
+        conversation_id=cid,
+        role="assistant",
+        content="报销需贴发票。",
+    )
+    current = "上一轮聊了啥"
+    append_short_memory(
+        user_id=seed_user.id,
+        conversation_id=cid,
+        role="user",
+        content=current,
+    )
+
+    captured_initial: dict = {}
+
+    class FakeGraph:
+        async def astream(self, initial, config=None, stream_mode=None):
+            captured_initial.update(initial)
+            yield (
+                "updates",
+                {
+                    "aggregate": {
+                        "final_answer": "ok",
+                        "plan": [],
+                        "plan_cursor": 0,
+                        "citations": [],
+                    }
+                },
+            )
+
+    async def fake_catalog(*_a, **_k):
+        return []
+
+    async def fake_avail(*_a, **_k):
+        return {"available": False}
+
+    monkeypatch.setattr(pe, "get_plan_execute_graph", lambda: FakeGraph())
+    monkeypatch.setattr(pe, "load_agent_skill_catalog", fake_catalog)
+    monkeypatch.setattr(
+        "app.modules.web_search.availability.get_web_search_availability",
+        fake_avail,
+    )
+
+    async for ev, _data in pe.stream_plan_execute(
+        db=db_session,
+        agent_id="agent_system",
+        user_content=current,
+        user_id=seed_user.id,
+        conversation_id=cid,
+        memory_access="all",
+        skip_understand_stage=True,
+    ):
+        if ev == "__result__":
+            break
+
+    hist = list(captured_initial.get("context_history") or [])
+    assert any(t.get("content") == "昨天说的报销规则" for t in hist)
+    assert any(t.get("content") == "报销需贴发票。" for t in hist)
+    assert all(t.get("content") != current for t in hist)
+    assert captured_initial.get("context_sections")
+    assert any(
+        "当前用户身份" in str(s) for s in (captured_initial.get("context_sections") or [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_rag_search_labels_third_party(monkeypatch):
+    """RAG 观察经规范化后不含第三人资料前缀。"""
+    from app.modules.agent.graph import plan_execute as pe
 
     async def fake_lookup(*_a, **_k):
         return {
@@ -197,16 +330,16 @@ async def test_execute_rag_search_labels_third_party(monkeypatch):
         {"kind": "rag_search", "args": {"query": "尹庆为"}},
         {"db": object(), "user_id": "u1"},
     )
-    assert obs.startswith(THIRD_PARTY_OBS_PREFIX)
+    assert "第三人" not in obs
+    assert not obs.startswith("【知识库")
     assert "尹庆为简历摘要" in obs
     assert cites
 
 
 @pytest.mark.asyncio
 async def test_execute_skill_step_labels_third_party(monkeypatch):
-    """技能步观察须经 label_third_party_observation 标注。"""
+    """技能步观察经规范化后不含第三人资料前缀。"""
     from app.modules.agent.graph import plan_execute as pe
-    from app.modules.conversation.context_blocks import THIRD_PARTY_OBS_PREFIX
 
     async def fake_skill_react(*_a, **_k):
         return {
@@ -214,14 +347,21 @@ async def test_execute_skill_step_labels_third_party(monkeypatch):
             "citations": [{"snippet": "尹庆为", "title": "简历"}],
         }
 
+    async def fake_avail(*_a, **_k):
+        return {"available": False}
+
     monkeypatch.setattr(pe, "run_skill_react", fake_skill_react)
+    monkeypatch.setattr(
+        "app.modules.web_search.availability.get_web_search_availability",
+        fake_avail,
+    )
     obs, cites, card = await pe._execute_skill_step(
         {"agent_id": "ag_x", "user_content": "查尹庆为"},
         {"kind": "skill", "skill_id": "sk_x", "args": {"instruction": "查尹庆为"}},
         {"db": object(), "user_id": "u1"},
     )
-    assert obs.startswith(THIRD_PARTY_OBS_PREFIX)
-    assert "第三人" in obs
+    assert "第三人" not in obs
+    assert not obs.startswith("【知识库")
     assert "尹庆为简历摘要" in obs
     assert cites
     assert card is None

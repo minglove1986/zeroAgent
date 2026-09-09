@@ -17,28 +17,34 @@ from app.core.config import get_settings
 def test_get_chat_model_enable_thinking_sets_extra_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """enable_thinking=True 时 extra_body.thinking 须为 enabled。"""
+    """enable_thinking=True 时须发 reasoning_effort=medium，禁止 thinking 键。"""
     monkeypatch.setenv("MOCK_EXTERNAL", "false")
     get_settings.cache_clear()
+    from app.modules.llm import models_cache
     from app.modules.llm.lc_chat import get_chat_model
 
+    models_cache.reset_models_catalog_for_tests()
     chat = get_chat_model(model="MiniMax-M3", enable_thinking=True)
     extra = getattr(chat, "extra_body", None) or {}
-    assert extra.get("thinking") == {"type": "adaptive"}
+    assert extra.get("reasoning_effort") == "medium"
+    assert "thinking" not in extra
     get_settings.cache_clear()
 
 
 def test_get_chat_model_default_disables_thinking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """默认仍 disabled，避免 M3 推理占满输出。"""
+    """默认须 reasoning_effort=none，避免默认出思考。"""
     monkeypatch.setenv("MOCK_EXTERNAL", "false")
     get_settings.cache_clear()
+    from app.modules.llm import models_cache
     from app.modules.llm.lc_chat import get_chat_model
 
+    models_cache.reset_models_catalog_for_tests()
     chat = get_chat_model(model="MiniMax-M3")
     extra = getattr(chat, "extra_body", None) or {}
-    assert extra.get("thinking") == {"type": "disabled"}
+    assert extra.get("reasoning_effort") == "none"
+    assert "thinking" not in extra
     get_settings.cache_clear()
 
 
@@ -50,6 +56,39 @@ def test_chunk_reasoning_reads_additional_kwargs() -> None:
     chunk.additional_kwargs = {"reasoning_content": "先分析问题"}
     chunk.content = ""
     assert _chunk_reasoning(chunk) == "先分析问题"
+
+
+def test_chat_model_preserves_minimax_reasoning_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ChatOpenAI 默认丢弃非标 reasoning_content；LiteLLM 路径必须保留。
+
+    MiniMax 深度思考走 delta.reasoning_content，若不透传到 additional_kwargs，
+    前端 thought_delta 为空，看起来像「没注入思考」。
+    """
+    monkeypatch.setenv("MOCK_EXTERNAL", "false")
+    get_settings.cache_clear()
+    from langchain_core.messages import AIMessageChunk
+
+    from app.modules.agent.graph.plan_execute import _chunk_reasoning
+    from app.modules.llm.lc_chat import get_chat_model
+
+    chat = get_chat_model(model="MiniMax-M3", enable_thinking=True)
+    raw = {
+        "id": "chunk_1",
+        "object": "chat.completion.chunk",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"reasoning_content": "逐步想清楚", "content": None},
+                "finish_reason": None,
+            }
+        ],
+    }
+    gen = chat._convert_chunk_to_generation_chunk(raw, AIMessageChunk, None)
+    assert gen is not None
+    assert _chunk_reasoning(gen.message) == "逐步想清楚"
+    get_settings.cache_clear()
 
 
 def test_think_tag_splitter_routes_to_thought_and_content() -> None:

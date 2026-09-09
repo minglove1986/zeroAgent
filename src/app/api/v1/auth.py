@@ -81,6 +81,7 @@ async def login(
         user_agent=ua,
     )
     user.last_login_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    user.last_login_ip = client_ip
 
     request.session["user_id"] = user.id
     request.session["username"] = user.username

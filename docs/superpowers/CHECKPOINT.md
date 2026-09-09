@@ -10,12 +10,12 @@
 
 | 项 | 值 |
 |---|---|
-| 更新时间 | 2026-08-10 13:57:08（东八区） |
-| 能力 | 管理端持久壳规范写入 PRD（D48 / Org §9.0） |
-| 改动 | 主 PRD §12.1.1+D48；`权限用户菜单PRD` v1.0.4 §9.0；白名单/AGENTS/cursor 规则同步 |
-| 测 | 文档对齐；运行时壳与 prompts 占位此前已落地 |
-| 下一步 | Agent 新建管理页按 D48 检查清单执行 |
-| 备注 | 菜单 path 与页面必须同仓 `(admin)`；禁页内包 AdminLayout |
+| 更新时间 | 2026-09-09 15:22:34（东八区） |
+| 能力 | L2 种子去重：线索短词不入库；砍冗余金句 |
+| 改动 | `l2_seed`/`policy`；迁移 `0052`；管理端 hint；相关测 |
+| 测 | L2 相关 36 passed |
+| 下一步 | API 热更 + alembic 0052；硬刷管理端看 leave 无「请假」短词种子 |
+| 备注 | 线索仍走 `LEAVE_CLUE_PHRASES` 常量 |
 
 ### 新会话开场（复制）
 
@@ -32,6 +32,16 @@ cd D:\HermesWork\zeroAgent
 # 可选：.\scripts\deploy-docker.ps1 -Full
 # 可选：.\scripts\deploy-docker.ps1 -Embed
 # 停止：.\scripts\deploy-docker.ps1 -Down
+
+# Docker 栈已在跑时的热更新（不动 DB；备份镜像后 rebuild + 滚动重启）
+cd D:\HermesWork\zeroAgent
+.\scripts\deploy-update.cmd
+# 或：.\scripts\deploy-update.ps1
+# 可选：-SkipApi / -SkipFrontends / -NoBuild / -NoBackup
+
+# 对话路径 DEBUG（需 LOG_LEVEL=DEBUG + 已 rebuild API）
+docker logs -f --tail 200 zeroagent-api 2>&1 | Select-String turn_trace
+# 按会话：docker logs --since 30m zeroagent-api 2>&1 | Select-String "turn_trace.*conv=你的会话id"
 
 # 本机热更新重启（API+Web 不在容器内开发时用）
 cd D:\HermesWork\zeroAgent
@@ -69,6 +79,167 @@ $env:PYTHONPATH = "src"
 ---
 
 ## 断点日志（只追加）
+
+### 2026-09-09 15:22:34
+- L2 种子去重：线索短词（请假/年假…）改常量不入库；去掉提交/办理请假、请两/三天假、我没让你总结/概括。
+- 迁移 `0052_l2_seed_dedupe`；policy 合并线索常量；测 36 passed。
+- **下一刀**：热更 API + 跑 0052，管理端 leave 仅办理金句。
+
+### 2026-09-09 15:08:00
+- 修管理端 L2「还是不能删」：后端 soft_delete+reload 不复活；前端静态 `Modal.confirm` 无 App 上下文 + Tag × 连带打开编辑。
+- `AdminLayout` 包 antd `App`；L2 页改 `App.useApp().modal/message`；关闭图标不触发编辑。
+- admin 已 `deploy-update`（SkipApi）。
+- **下一刀**：硬刷管理端验证删词确认框。
+
+### 2026-09-09 10:47:52
+- L2 关键词瘦身落地：DEFAULT_SEED 收紧；leave 金句门禁；doc/搜人默认空；系统种子可软删 + sync/reset；迁移 0051。
+- Spec/Plan：`2026-09-09-l2-keyword-slim-design.md` / `2026-09-09-l2-keyword-slim.md`。
+- 测：L2 相关 40 passed；前端 deletable 3 passed。
+- **下一刀**：迁移 + 热更后手验金样例与管理端删种子/恢复默认。
+
+### 2026-09-09 10:29:47
+- L2 关键词瘦身设计定稿：`docs/superpowers/specs/2026-09-09-l2-keyword-slim-design.md`。
+- 裁定：宁可漏 L3；显式查库 9 条；leave 短词仅线索 + 办理金句才短路；meta 仅纠正；doc/搜人默认空；系统种子可软删，恢复默认按 DEFAULT_SEED 重建。
+- **下一刀**：用户审定 spec → writing-plans → 实现（将推翻「种子禁删」前后端）。
+
+### 2026-09-09 09:53:27
+- 修管理端 L2 关键词「删除不管用」：系统种子前端仍 `closable`，后端 `soft_delete_keyword` 拒绝 → 表现为删不掉。
+- 前端：`isL2KeywordDeletable`；种子无关闭图标；自定义 Tag 关闭 + 编辑弹窗「删除」；种子编辑提示可停用。
+- 测：`deletable.test.ts` 3；`test_delete_system_seed_rejected_via_api` 等 API 4 passed。
+
+### 2026-09-08 14:14:21
+- 文档命令改为 Docker 镜像部署：`deploy-update` 重建 API 后，用 `docker logs -f zeroagent-api | Select-String turn_trace`（规格 §6 / CHECKPOINT 备忘已改）。
+
+### 2026-09-08 13:58:08
+- 落地对话 `turn_trace` DEBUG：统一助手 + Turn/runtime/Plan-Execute 关键节点一行摘要；规格 `2026-09-08-turn-trace-debug-design.md`；计划 `2026-09-08-turn-trace-debug.md`。
+- 查看：`LOG_LEVEL=DEBUG` 下 `grep turn_trace`；按 `conv=` 串一轮。不含 Skill ReAct 轮次。
+- 顺带：`settings.log_level` 接入 `create_app`/`lifespan`；Docker API `uvicorn --log-level ${LOG_LEVEL}`，否则 DEBUG 默认不可见。
+
+### 2026-09-08 13:44:28
+- 修复系统对话「无上一轮记忆」：根因是默认 Plan-Execute 只注入 `system_sections`，丢掉 Redis `short_turns`。
+- `stream_plan_execute` 写入 `context_sections` + `context_history`（本轮 user 已 append 时 `[:-1]`）；`_execute_respond` 经 `pack_turn_messages` 按 token 预算注入。
+- `respond_only` 同步修复；`test_execute_respond_includes_short_history` / `test_stream_plan_execute_wires_short_history` 落地。
+- 下一步：热更 API 后人工验「上一轮聊了什么」。
+
+### 2026-09-07 17:02:40
+- 落地联网搜索：Facade+SearXNG Provider、管理端配置/总开关、`0048_web_search`、`test_web_search` 8 passed。
+
+### 2026-09-07 15:53:55
+- 落地 `numeric_ops`（Decimal 计算 / 静态单位 / 币种小数位）与 `skill_numeric` 种子；`test_numeric_ops` 9 passed。
+
+### 2026-09-07 13:38:19
+- 修 route_clarify「否，随便聊聊」死胡同：`stream_after_card_action` 用原问题走系统 Agent 续答；`test_route_clarify_p2` 3 passed。
+
+### 2026-09-07 13:09:26
+- 再修 deploy-update：Quiet `docker stop` 的 stderr「Container Stopping」在 EAP=Stop 下变 NativeCommandError；Invoke-Compose 临时 Continue。
+
+### 2026-09-07 13:02:30
+- 修 deploy-update.ps1：`$exitCode = Invoke-Compose` 把 docker stdout 当失败；改 `$script:ComposeExitCode`。
+
+### 2026-09-07 12:01:29
+- 新增 `scripts/README.md`：部署/热更新/本机重启/冒烟脚本选型与用法。
+
+### 2026-09-07 11:57:38
+- 新增 Windows 热更新：`scripts/deploy-update.ps1` + `deploy-update.cmd`（对齐 `.sh`：备份 → build → 滚动重启；参数 `-SkipApi`/`-SkipFrontends`/`-NoBuild`/`-NoBackup`）。相对 `.sh`：后端一并 build worker/beat。
+
+### 2026-09-07 11:08:04
+- 废止观察前缀「【知识库/技能观察·第三人资料】」注入；label 改为剥离历史前缀；边界文案保留身份隔离；context_source_boundary 13 passed。
+
+### 2026-09-07 10:24:03
+- 落地 datetime_ops：注入【当前时间】；FC `datetime_ops`（now/shift/diff/parse）；种子 skill_datetime→agent_system；0046 待本机 upgrade；22 相关测 passed。
+
+### 2026-08-20 17:29:20
+- 管理端技能管理 MVP：菜单 skills→/skills；列表/启停/删；0045 已升；系统种子不可删。
+
+### 2026-08-20 17:18:56
+- 修手机记忆双条：immediate 跳过 idle/window；upsert 锁+同 key 合并软删多余；0044 去重+活跃唯一；库内 15011586502 已留 1 条活跃。
+
+### 2026-08-20 16:53:08
+- 真 Skill 落地：0043 种子+agent_system 绑定；extract_user_memories；不可删仅停用；系统开关；49 相关测 passed。
+
+### 2026-08-20 16:18:16
+- 记忆抽取整块 Skill + memory_candidate；废止按字段扩展硬编码路径；61 相关测 passed。
+
+### 2026-08-20 15:44:19
+- 规则抽取补邮箱/手机；即时 `rule_hit`；白名单测 14 passed。须 Celery。
+
+### 2026-08-20 15:32:14
+- 修管理端记忆白名单「重载缓存」405：前端漏传 POST，与 L2/persona 对齐。
+
+### 2026-08-20 12:23:01
+- P1：办理 vs 咨询 `handle_or_ask`；skill_id meta；相关 18 passed；不做管理端 L3 UI。
+
+### 2026-08-20 12:13:43
+- P0.5：route_clarify 自由意图输入 + suppress 再澄清；卡 API 422；员工端互斥输入；18 passed。
+
+### 2026-08-20 11:58:41
+- P0 落地：policy 无 form 禁卡；中置信请假 intent_confirm；kb「您是不是想查」；skill_unbound；fixture；相关 27 passed。
+
+### 2026-08-20 11:46:59
+- 规格自我审核：收口办理vs咨询/fixture/leave确认/取消用词/skill_unbound；附 §6 审核表。
+
+### 2026-08-20 11:43:32
+- 规格改为紧扣七项短板：表单解耦、假设确认、开放输入、退出、L3 fixture、技能路由、policy 收拢。
+
+### 2026-08-20 11:34:14
+- 架构师主导起草 `2026-08-20-intent-clarify-architecture.md`：漏斗软确认、表单解耦、退出=dismiss；PE 不做意图确认。
+
+### 2026-08-20 11:21:50
+- 删除 `2026-08-20-route-clarify-free-intent-design.md`；另开「澄清」需求讨论。
+
+### 2026-08-20 10:59:17
+- 起草 route_clarify B′ 规格：自由意图输入 + 跳过续跑 + suppress_route_clarify；待审阅。
+
+### 2026-08-20 10:44:18
+- L3 `_L3_SYSTEM` 改为各 intent「含义/下游/禁止」契约；`test_l3_system_contract` 通过。
+
+### 2026-08-20 09:51:54
+- 修复请假澄清卡误触发：`leave_intent_allowed` + L4 `ask_form_guard`；聊天卡增加取消；测 6+64 passed。
+
+### 2026-08-19 19:22:34
+- Docker 重建部署 api/web/admin_web/worker/litellm；健康检查 200；alembic `0042_llm_supports_reasoning`。
+
+### 2026-08-19 16:22:38
+- 统一思考参数已实现：`reasoning_effort` + `supports_reasoning` 同步/显隐；测 18 passed；待升 `0042` 并重同步。
+
+### 2026-08-19 11:58:20
+- 统一思考参数设计已写：`docs/superpowers/specs/2026-08-19-unified-reasoning-effort-design.md`；待审阅后写计划。
+
+### 2026-08-19 11:16:09
+- 系统对话深度思考不可见：ChatOpenAI 丢弃 MiniMax `reasoning_content`；`_LiteLLMChatOpenAI` 写回 additional_kwargs；测 12 passed。
+
+### 2026-08-12 09:38:26
+- LiteLLM 用量成本：`modules/litellm` + `/api/v1/admin/litellm/spend/by-model` + 用量页；测 5 passed；不碰系统 usage。
+
+### 2026-08-11 16:22:07
+- 管理端 404/500 插画拦截：`ErrorHero` + 壳内 not-found/error + 根兜底；素材 `public/error/`；catch-all 改 `notFound()`。
+
+### 2026-08-11 15:44:19
+- 用户 id_card + 详情四 Tab：迁移 `0041` 已升；API 聚合/审计列表；管理端列表与 `/organization/users/[user_id]`；测 8 passed。
+
+### 2026-08-11 14:51:51
+- 用户列表「最后登录 / 最后 IP」：`users.last_login_ip` + 登录写入；迁移 `0040` 已升；管理端用户表两列已加；登录测通过。
+
+### 2026-08-11 14:41:25
+- 用户管理无数据：前端默认 `status=active&status=disabled`，后端单值只取 `disabled` 导致空列表；已改为多值并集，api 已热更重启。
+
+### 2026-08-11 14:34:49
+- 种子超管：迁移 `0039` 用户 `root` / role=`super_admin`；登录已验；生产须改密。
+
+### 2026-08-11 14:29:15
+- 续：修复角色页三元表达式语法 500；menus/roles 页面 200；FALLBACK 补菜单管理入口。
+
+### 2026-08-11 14:22:15
+- 菜单维护：`org.menus` + manage 全量 API + `/organization/menus` 页；角色菜单权限改中文树勾选（平台只读）；`0038` 已升；菜单 API 测 16 passed。
+
+### 2026-08-11 14:05:55
+- L2 页强化：去掉英文 code 主展示，Collapse + 中文类名 + 用途 hint；Docker `admin_web` 重建失败（代理），已停容器并用本机 `npm run dev :3001` 热更新。
+
+### 2026-08-11 14:02:49
+- L2 关键词页改为分类卡片 + Tag 云（含/等/前徽标、停用灰显、分类「+」预填、Tag 关闭软删）；editForm/testForm 拆分；备忘 `docs/superpowers/specs/2026-08-11-l2-keywords-category-tags-design.md`。
+
+### 2026-08-11 13:39:01
+- 管理端「记忆抽取白名单 / L2 关键词」侧栏消失：根因 0031 未给 `platform_admin` 授 `system.*`，M1 菜单过滤后生效；`0037` + 常量/测试已补；本地已升迁移并清 `za:actor:m:*`。「缓存健康度」为概览卡片，非菜单项。
 
 ### 2026-08-10 13:57:08
 - 持久壳标准入 PRD：主 PRD D48 + §12.1.1 检查清单；Org PRD v1.0.4 §9.0；AGENTS/白名单/cursor 同步。
@@ -775,6 +946,16 @@ $env:PYTHONPATH = "src"
 - 用户要求「帮我更新」：已停旧前端并重启 `npm run dev`；后端 :8000 仍健康。
 - 请浏览器强刷后验证 `/chat` 流式输出。
 
+### 2026-09-08 09:17:03
+- 引擎目录同步落地：`web_search_engines` 通用表、`0050` 迁移、sync/list/patch API、管理页「同步引擎」+ 开关。
+- 运行时 searxng 只用本库启用 engines；零启用 → `no_engines_enabled`。
+- 单测 24 passed。部署后须同步引擎再对话。
+
+### 2026-09-08 09:01:41
+- 对话「北京天气」技能跑通但无信息：JSON API 空结果；后台 HTML 有 bing/sogou/360search。
+- 根因：无 Cookie 时默认只打 brave/ddg/startpage（CAPTCHA）；显式 `engines` 后 27/5 条正常。
+- 已修 `searxng.py` + 单测；**须热更 API 容器**后再对话验证。
+
 ### 2026-07-22 08:49:34
 - 用户反馈聊天非流式：根因是 Next `rewrites` 代理会缓冲完整 SSE。
 - 新增 `web/src/app/api/v1/messages/send/route.ts` 与 `card-action/route.ts` 透传 `upstream.body`。
@@ -803,3 +984,39 @@ $env:PYTHONPATH = "src"
 - `.env` 已 `MOCK_EXTERNAL=false`；LiteLLM 配置含 `MiniMax-M3`；Compose 注入 `MINIMAX_API_KEY`（密钥仅在本地 `.env`）。
 - **未做**：对 MySQL 跑 Alembic；后端/前端常驻进程；litellm healthcheck 镜像内 wget 可能失败导致 unhealthy（接口可用则忽略或改探针）。
 - **下一刀**：Alembic upgrade + 启后端/前端联调。
+
+### 2026-09-08 10:56:20
+- 确认对接千帆「百度搜索」：二选一 Provider、最小网页、管理端字段自适应、解耦扩展 Facade。
+- Spec 落盘：`docs/superpowers/specs/2026-09-08-baidu-web-search-provider-design.md`。
+- 密钥仅会话联调使用，**未**写入仓库/本断点。
+- **下一刀**：用户审阅 spec → 实现计划 → BaiduProvider + Admin UI。
+
+### 2026-09-08 11:05:00
+- 落地 `BaiduProvider`：registry/facade/settings/availability/engine_catalog + Admin 字段自适应。
+- Plan：`docs/superpowers/plans/2026-09-08-baidu-web-search-provider.md`。
+- 单测 34 passed；真实上游 Bearer 鉴权成功（密钥未入库）。
+- **下一刀**：热更后管理页切百度并保存 Key，对话侧验联网搜索。
+
+### 2026-09-08 14:40:55
+- 联网确认卡 Interrupt/Resume：选「是」恢复 `skill_web_search`，禁止整轮重规划误走 KB。
+- Spec：`docs/superpowers/specs/2026-09-08-web-search-confirm-resume-design.md`；Plan：`docs/superpowers/plans/2026-09-08-web-search-confirm-resume.md`。
+- 改动：`confirm_card` resume_*、`_stream_resume_web_search_skill`、`stream_after_card_action` enable。
+- 测：`tests/test_web_search_confirm_resume.py` + policy → 9 passed。
+- **下一刀**：`deploy-update` 后手验天气问询 → 确认开启 → 过程为联网技能。
+
+### 2026-09-08 15:33:42
+- Planner 升级落地：signals/caps/normalize/replan/prompt；空检索先 replan 禁抢跑 respond；respond 注入步骤观察；catalog 带 caps。
+- Spec/Plan：`2026-09-08-planner-upgrade-design.md` / `2026-09-08-planner-upgrade.md`。
+- 测：planner_* + plan_execute_graph + confirm_resume → 33 passed（runtime_langgraph_flag 仍失败）。
+- **下一刀**：热更 API 后手验天气/制度/空检索/确认卡路径。
+
+### 2026-09-08 17:04:39
+- 联网出处 P0：`web_items_to_citations` + executor attach；前端 citation 带 url 并可点，citation 事件即时刷列表。
+- 测：`test_web_search_citations` + `test_web_search` → 14 passed。
+- **下一刀**：deploy-update 后手验联网问答出处；再定 P1 侧栏。
+
+### 2026-09-09 09:36:38
+- 用量成本：Docker API 调 `http://litellm:4000`；控制台曾错误拼成 `http://litellm:4000/ui`。
+- 根因2：`/spend/logs?summarize=true` 返回 `models: {name: spend}`，flatten 未识别 → 空表。
+- 修：`LITELLM_UI_BASE_URL` + flatten 顶层 models；测 7 passed。
+- **下一刀**：rebuild/restart api 后手验用量与控制台链接。

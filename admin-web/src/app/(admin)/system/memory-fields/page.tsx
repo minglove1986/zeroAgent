@@ -98,14 +98,18 @@ export default function MemoryFieldsPage() {
 
   async function handleReloadCache() {
     try {
-      const res = await apiJson<{ field_count: number; message?: string }>("/api/v1/memory/extract-fields/reload-cache");
+      // 后端仅注册 POST /reload-cache；缺 method 时 fetch 默认 GET → 405 Method Not Allowed
+      const res = await apiJson<{ field_count: number }>(
+        "/api/v1/memory/extract-fields/reload-cache",
+        { method: "POST" },
+      );
       if (res.code === 0) {
-        message.success(`缓存已重载 (${res.data?.field_count} 个字段)`);
+        message.success(`缓存已重载 (${res.data?.field_count ?? 0} 个字段)`);
         loadFields();
       } else {
-        message.error(res.data?.message || "重载失败");
+        message.error(res.message || "重载失败");
       }
-    } catch (e) {
+    } catch {
       message.error("网络错误");
     }
   }

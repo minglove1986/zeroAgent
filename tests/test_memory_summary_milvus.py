@@ -95,3 +95,54 @@ async def test_persist_extracted_skips_similar(monkeypatch: pytest.MonkeyPatch) 
 
     await engine.dispose()
     config.get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_upsert_same_key_does_not_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """同 user+type+key 二次写入应更新而非再插一行（防并发双写的应用层底线）。"""
+    from app.core import config
+    from app.modules.memory.service import list_long_memories, upsert_memory
+    from sqlalchemy import select
+    from app.models.memory import UserMemory
+
+    monkeypatch.setenv("MOCK_EXTERNAL", "true")
+    config.get_settings.cache_clear()
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as db:
+        r1 = await upsert_memory(
+            db,
+            user_id="usr_phone",
+            memory_type="fact",
+            memory_key="phone",
+            memory_value="15011586502",
+            source="auto_sliding_expired",
+        )
+        r2 = await upsert_memory(
+            db,
+            user_id="usr_phone",
+            memory_type="fact",
+            memory_key="phone",
+            memory_value="15011586502",
+            source="auto_sliding_expired",
+        )
+        assert r1.id == r2.id
+        rows = (
+            await db.execute(
+                select(UserMemory).where(
+                    UserMemory.user_id == "usr_phone",
+                    UserMemory.memory_key == "phone",
+                    UserMemory.deleted_at.is_(None),
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+        listed = await list_long_memories(db, "usr_phone", memory_access="all")
+        assert len([m for m in listed if m.memory_key == "phone"]) == 1
+
+    await engine.dispose()
+    config.get_settings.cache_clear()

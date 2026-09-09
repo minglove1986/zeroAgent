@@ -61,6 +61,7 @@ def _row_to_dict(row: LlmModel) -> dict[str, Any]:
         "display_name": row.display_name,
         "max_input_tokens": row.max_input_tokens,
         "max_output_tokens": row.max_output_tokens,
+        "supports_reasoning": bool(row.supports_reasoning),
         "enabled": bool(row.enabled),
         "source_status": row.source_status,
         "allow_system_chat": bool(row.allow_system_chat),

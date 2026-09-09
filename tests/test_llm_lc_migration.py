@@ -114,14 +114,18 @@ def test_system_agent_mode_from_settings(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_get_chat_model_puts_thinking_in_extra_body(monkeypatch: pytest.MonkeyPatch) -> None:
-    """thinking 须走 extra_body，禁止进 model_kwargs（否则 OpenAI SDK TypeError）。"""
+    """reasoning_effort 须走 extra_body，禁止进 model_kwargs。"""
     monkeypatch.setenv("MOCK_EXTERNAL", "false")
     get_settings.cache_clear()
+    from app.modules.llm import models_cache
     from app.modules.llm.lc_chat import get_chat_model
 
+    models_cache.reset_models_catalog_for_tests()
     chat = get_chat_model(model="MiniMax-M3")
     extra = getattr(chat, "extra_body", None) or {}
     model_kwargs = getattr(chat, "model_kwargs", None) or {}
-    assert extra.get("thinking") == {"type": "disabled"}
+    assert extra.get("reasoning_effort") == "none"
+    assert "thinking" not in extra
     assert "thinking" not in model_kwargs
+    assert "reasoning_effort" not in model_kwargs
     get_settings.cache_clear()

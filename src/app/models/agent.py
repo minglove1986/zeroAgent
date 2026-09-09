@@ -74,6 +74,9 @@ class Skill(Base):
     current_version: Mapped[str] = mapped_column(String(20), default="v1.0")
     status: Mapped[str] = mapped_column(String(20), default="draft")
     workflow_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # system=平台种子（不可删除，仅可停用）；custom=运营自建
+    origin: Mapped[str] = mapped_column(String(16), nullable=False, default="custom")
+    seed_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_by: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 

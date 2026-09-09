@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     rabbitmq_url: str = "amqp://zeroagent:rabbitpass@127.0.0.1:5672//"
 
     litellm_proxy_url: str = "http://127.0.0.1:4000"
+    # 浏览器可打开的 LiteLLM 控制台基址；空则回退 litellm_proxy_url
+    # Docker 内 proxy 常为 http://litellm:4000，须单独设本机 http://127.0.0.1:4000
+    litellm_ui_base_url: str = ""
     litellm_master_key: str = "sk-litellm-dev"
     litellm_model: str = "MiniMax-M3"
     litellm_embed_model: str = "text-embedding-3-small"
@@ -81,6 +84,8 @@ class Settings(BaseSettings):
 
     # 记忆抽取短防抖空闲（秒）；Turn Graph 调度优先用此值
     memory_extract_debounce_seconds: int = 30
+    # 系统配置：是否启用记忆抽取（可被 Redis 覆盖）
+    memory_extract_enabled: bool = True
 
     # Plan-Execute 主图最大计划步数
     agent_plan_max_steps: int = 5

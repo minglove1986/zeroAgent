@@ -125,6 +125,33 @@ async def test_login_success_sets_cookie(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_login_records_last_login_at_and_ip(client: AsyncClient) -> None:
+    """登录成功写 last_login_at / last_login_ip，列表可见。
+
+    @author 赵振明
+    @date 2026-08-11 14:48:55
+    """
+    await _create_user(client)
+    resp = await client.post(
+        "/api/v1/auth/login",
+        json={"username": "wangxiao", "password": "123456"},
+        headers={"X-Forwarded-For": "203.0.113.10"},
+    )
+    assert resp.status_code == 200
+    client.cookies.clear()
+
+    listed = await client.get(
+        "/api/v1/users?search=wangxiao",
+        headers=_admin_headers(),
+    )
+    assert listed.status_code == 200
+    items = listed.json()["data"]["items"]
+    assert len(items) == 1
+    assert items[0]["last_login_at"] is not None
+    assert items[0]["last_login_ip"] == "203.0.113.10"
+
+
+@pytest.mark.asyncio
 async def test_login_writes_platform_admin_role(client: AsyncClient) -> None:
     await client.post(
         "/api/v1/users",

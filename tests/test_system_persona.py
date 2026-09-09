@@ -33,6 +33,12 @@ def _reset_persona():
     reset_persona_for_tests()
 
 
+def test_default_persona_forbids_false_memory_claim() -> None:
+    """种子人格须禁止未落库即声称已写入记忆。"""
+    assert "已写入记忆" in DEFAULT_PERSONA_PROMPT or "禁止声称" in DEFAULT_PERSONA_PROMPT
+    assert "后台抽取" in DEFAULT_PERSONA_PROMPT or "记忆由后台" in DEFAULT_PERSONA_PROMPT
+
+
 def test_persona_fallback_inject_and_disable() -> None:
     set_persona_fallback(
         {
@@ -57,9 +63,10 @@ def test_system_sections_safety_before_persona() -> None:
     sections = blocks.system_sections()
     assert sections[0].startswith("【平台安全】")
     assert PLATFORM_SAFETY_RULE in sections[0]
-    assert sections[1].startswith("【系统人格】")
-    assert "某某公司" in sections[1]
-    assert sections[2].startswith("【当前用户身份】")
+    assert sections[1].startswith("【当前时间】")
+    assert sections[2].startswith("【系统人格】")
+    assert "某某公司" in sections[2]
+    assert sections[3].startswith("【当前用户身份】")
 
 
 def test_disabled_persona_still_has_safety() -> None:
@@ -70,6 +77,7 @@ def test_disabled_persona_still_has_safety() -> None:
     )
     sections = blocks.system_sections()
     assert sections[0].startswith("【平台安全】")
+    assert sections[1].startswith("【当前时间】")
     assert not any(s.startswith("【系统人格】") for s in sections)
 
 

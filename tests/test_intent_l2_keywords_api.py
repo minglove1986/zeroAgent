@@ -14,10 +14,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 import app.models  # noqa: F401
 from app.main import create_app
+from app.models.intent_l2 import IntentL2Keyword
 from app.modules.intent import l2_catalog_store as store
 from app.modules.intent.l2_catalog_cache import get_catalog, reset_l2_catalog_for_tests
 from app.modules.intent.rules import match_l2_rules
 from app.shared.db import Base, get_db
+from sqlalchemy import select
 
 
 @pytest.fixture()
@@ -107,6 +109,36 @@ async def test_create_and_match_after_reload(
             headers={"X-Role": "platform_admin", "X-User-Id": "usr_admin"},
         )
         assert r2.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_delete_system_seed_allowed_via_api(
+    db_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """系统种子经 DELETE API 须 200（可软删，恢复默认可找回）。"""
+    reset_l2_catalog_for_tests()
+    async with _http_client(db_factory, monkeypatch) as client:
+        async with db_factory() as db:
+            await store.ensure_seed_if_empty(db)
+            row = (
+                (
+                    await db.execute(
+                        select(IntentL2Keyword).where(
+                            IntentL2Keyword.category == "leave",
+                            IntentL2Keyword.phrase == "我要请假",
+                        )
+                    )
+                )
+                .scalars()
+                .one()
+            )
+            kid = row.id
+        r = await client.delete(
+            f"/api/v1/intent/l2-keywords/{kid}",
+            headers={"X-Role": "platform_admin", "X-User-Id": "usr_admin"},
+        )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["deleted"] is True
 
 
 @pytest.mark.asyncio

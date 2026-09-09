@@ -151,11 +151,17 @@ def schedule_memory_extract(
     allow_memory_write: bool = True,
     route_reason: str = "",
     route_kind: str = "",
+    intent_features: list[str] | None = None,
     idle_seconds: int | None = None,
 ) -> dict[str, Any]:
     """对话结束后异步调度（不 await LLM）。
 
-    返回调度结果摘要，供单测断言。
+    立即入队：显式记住 / memory_candidate（旁路）/ 格式兜底命中。
+    扩展字段靠 Catalog→LLM，不靠为本字段写规则。
+    本轮已 immediate 时不再投 window/idle，避免多 Worker 并发双写同 key。
+
+    @author 赵振明
+    @date 2026-08-20 17:12:00
     """
     result: dict[str, Any] = {"scheduled": [], "skipped": False}
     if should_skip_extract(
@@ -165,6 +171,13 @@ def schedule_memory_extract(
         route_kind=route_kind,
     ):
         result["skipped"] = True
+        return result
+
+    from app.modules.memory.extract_settings import is_memory_extract_enabled
+
+    if not is_memory_extract_enabled():
+        result["skipped"] = True
+        result["skip_reason"] = "memory_extract_disabled"
         return result
 
     settings = get_settings()
@@ -177,16 +190,31 @@ def schedule_memory_extract(
 
     _touch_idle(conversation_id, idle)
 
-    # 显式记住 / 规则可抽到事实：立即投递；正文取短记忆全文（「记住我的名字」本身不含姓名）
+    from app.modules.intent.memory_signal import is_memory_candidate
     from app.modules.memory.service import parse_auto_extract_rules
 
+    feats = list(intent_features or [])
+    candidate = is_memory_candidate(
+        text=transcript,
+        features=feats,
+        reason=route_reason,
+    )
+    # 格式/Mock 兜底命中：仅加速「我叫…」等已有兜底，不是字段扩展机制
     rule_hits = parse_auto_extract_rules(transcript)
-    want_immediate = is_explicit_remember(transcript) or bool(rule_hits)
+    want_immediate = (
+        is_explicit_remember(transcript) or candidate or bool(rule_hits)
+    )
+    immediate_ok = False
     if want_immediate:
         full_now = build_transcript_from_short(
             user_id=user_id, conversation_id=conversation_id, fallback=transcript
         )
-        trigger = "explicit" if is_explicit_remember(transcript) else "rule_hit"
+        if is_explicit_remember(transcript):
+            trigger = "explicit"
+        elif candidate:
+            trigger = "skill_immediate"
+        else:
+            trigger = "rule_hit"
         if _dispatch_celery(
             user_id=user_id,
             conversation_id=conversation_id,
@@ -195,6 +223,11 @@ def schedule_memory_extract(
             trigger=trigger,
         ):
             result["scheduled"].append(trigger)
+            immediate_ok = True
+
+    # 已即时抽取：同 transcript 再投 window/idle 易与多 Worker 竞态双插
+    if immediate_ok:
+        return result
 
     turns = load_short_memory(user_id=user_id, conversation_id=conversation_id)
     if len(turns) >= window_n and not _window_recently_fired(conversation_id):

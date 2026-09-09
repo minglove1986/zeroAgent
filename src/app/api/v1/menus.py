@@ -1,47 +1,62 @@
 """菜单管理 API（PRD §5 / 权限用户菜单PRD.md §9.13）。
 
 @author 赵振明
-@date 2026-08-07
+@date 2026-08-11 14:16:34
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+import logging
+
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.schemas.menu import MenuOut, MenuTreeNode
-from app.core.actor import Actor, get_actor, is_platform_admin, is_super_admin, resolve_actor
+from app.core.actor import (
+    Actor,
+    is_platform_admin,
+    is_super_admin,
+    resolve_actor,
+)
+from app.core.redis_client import get_redis
 from app.core.response import fail, ok
 from app.models.menu import BUILTIN_MENUS, Menu
+from app.models.role import RoleMenuPermission
 from app.shared.db import get_db
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/v1/menus", tags=["menus"])
 
 
 class MenuCreateBody(BaseModel):
     """创建自定义菜单请求体。"""
+
     code: str = Field(min_length=1, max_length=64)
     name: str = Field(min_length=1, max_length=64)
     icon: str | None = Field(default=None, max_length=64)
     path: str | None = Field(default=None, max_length=255)
     parent_code: str | None = Field(default=None, max_length=64)
     sort: int = 0
-    app: str = "both"
+    app: str = "admin"
 
 
 class MenuUpdateBody(BaseModel):
     """更新菜单请求体。"""
+
     name: str | None = Field(default=None, min_length=1, max_length=64)
     icon: str | None = Field(default=None, max_length=64)
     path: str | None = Field(default=None, max_length=255)
+    parent_code: str | None = Field(default=None, max_length=64)
     sort: int | None = None
     is_visible: bool | None = None
-
-router = APIRouter(prefix="/api/v1/menus", tags=["menus"])
+    app: str | None = Field(default=None, max_length=16)
 
 
 def _menu_to_dict(menu: Menu) -> dict:
+    """菜单 ORM → 响应 dict。"""
     return {
         "code": menu.code,
         "name": menu.name,
@@ -69,28 +84,53 @@ def _build_tree(items: list[dict]) -> list[dict]:
     return roots
 
 
+def _clear_all_actor_caches() -> int:
+    """扫描并删除 za:actor:m:*，菜单结构变更后强制重载。"""
+    client = get_redis()
+    if client is None:
+        return 0
+    try:
+        keys = list(client.scan_iter(match="za:actor:m:*", count=200))
+        if not keys:
+            return 0
+        return int(client.delete(*keys))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("clear actor caches failed: %s", exc)
+        return 0
+
+
 @router.get("", response_model=None)
 async def list_menus(
     request: Request,
     app: str | None = None,
+    manage: int = Query(0, ge=0, le=1),
     db: AsyncSession = Depends(get_db),
     actor: Actor = Depends(resolve_actor),
 ) -> dict | JSONResponse:
-    """列出菜单定义；按 Actor 菜单并集过滤（超管可见全部可见菜单）。
+    """列出菜单定义。
+
+    默认：仅可见菜单，并按 Actor 菜单并集过滤（超管见全部可见项）。
+    manage=1：平台管理员/超管可读全量（含隐藏），供菜单管理/角色授权页。
 
     @author 赵振明
-    @date 2026-08-10 09:43:31
+    @date 2026-08-11 14:16:34
     """
     if not actor.user_id:
         return JSONResponse(status_code=401, content=fail(40101, "未登录"))
 
-    stmt = select(Menu).where(Menu.is_visible.is_(True))
+    if manage:
+        if not (is_platform_admin(actor) or is_super_admin(actor)):
+            return JSONResponse(status_code=403, content=fail(40301, "需 platform_admin"))
+        stmt = select(Menu)
+    else:
+        stmt = select(Menu).where(Menu.is_visible.is_(True))
+
     if app:
         stmt = stmt.where(Menu.app.in_([app, "both"]))
     stmt = stmt.order_by(Menu.sort.asc(), Menu.code.asc())
     rows = (await db.execute(stmt)).scalars().all()
     items = [_menu_to_dict(r) for r in rows]
-    if not actor.is_super_admin:
+    if not manage and not actor.is_super_admin:
         allowed = set(actor.menus)
         items = [i for i in items if i["code"] in allowed]
     return ok({"items": items, "total": len(items)})
@@ -100,59 +140,74 @@ async def list_menus(
 async def menu_tree(
     request: Request,
     app: str | None = None,
+    manage: int = Query(0, ge=0, le=1),
     db: AsyncSession = Depends(get_db),
     actor: Actor = Depends(resolve_actor),
 ) -> dict | JSONResponse:
-    """菜单树（前端构建侧栏用）；按角色过滤。
+    """菜单树；manage=1 时供管理页/角色授权（含隐藏、不过滤并集）。
 
     @author 赵振明
-    @date 2026-08-10 09:43:31
+    @date 2026-08-11 14:16:34
     """
     if not actor.user_id:
         return JSONResponse(status_code=401, content=fail(40101, "未登录"))
 
-    stmt = select(Menu).where(Menu.is_visible.is_(True))
+    if manage:
+        if not (is_platform_admin(actor) or is_super_admin(actor)):
+            return JSONResponse(status_code=403, content=fail(40301, "需 platform_admin"))
+        stmt = select(Menu)
+    else:
+        stmt = select(Menu).where(Menu.is_visible.is_(True))
+
     if app:
         stmt = stmt.where(Menu.app.in_([app, "both"]))
     stmt = stmt.order_by(Menu.sort.asc(), Menu.code.asc())
     rows = (await db.execute(stmt)).scalars().all()
     items = [_menu_to_dict(r) for r in rows]
-    if not actor.is_super_admin:
+    if not manage and not actor.is_super_admin:
         allowed = set(actor.menus)
         items = [i for i in items if i["code"] in allowed]
     return ok({"items": _build_tree(items), "total": len(items)})
 
 
-class MenuCreateBody(BaseModel):
-    """创建自定义菜单请求体。"""
-    code: str = Field(min_length=1, max_length=64)
-    name: str = Field(min_length=1, max_length=64)
-    icon: str | None = Field(default=None, max_length=64)
-    path: str | None = Field(default=None, max_length=255)
-    parent_code: str | None = Field(default=None, max_length=64)
-    sort: int = 0
-    app: str = "both"
-
-
 @router.post("", response_model=None)
 async def create_menu(
-    request: Request,
     body: MenuCreateBody,
     db: AsyncSession = Depends(get_db),
+    actor: Actor = Depends(resolve_actor),
 ) -> dict | JSONResponse:
-    """创建菜单（仅 super_admin）。"""
-    actor = get_actor(request)
+    """创建自定义菜单（仅 super_admin）；并自动授超管可见。
+
+    @author 赵振明
+    @date 2026-08-11 14:16:34
+    """
+    if not actor.user_id:
+        return JSONResponse(status_code=401, content=fail(40101, "未登录"))
     if not is_super_admin(actor):
         return JSONResponse(status_code=403, content=fail(40301, "需 super_admin"))
 
     exists = await db.get(Menu, body.code)
     if exists is not None:
-        return JSONResponse(status_code=409, content=fail(40901, f"菜单 code 已存在：{body.code}"))
+        return JSONResponse(
+            status_code=409, content=fail(40901, f"菜单 code 已存在：{body.code}")
+        )
 
-    # 内置 code 保护
     builtin_codes = {m[0] for m in BUILTIN_MENUS}
     if body.code in builtin_codes:
-        return JSONResponse(status_code=409, content=fail(40901, f"内置 code 不可用作自定义：{body.code}"))
+        return JSONResponse(
+            status_code=409,
+            content=fail(40901, f"内置 code 不可用作自定义：{body.code}"),
+        )
+
+    if body.parent_code:
+        parent = await db.get(Menu, body.parent_code)
+        if parent is None:
+            return JSONResponse(
+                status_code=422, content=fail(42201, "parent_code 不存在")
+            )
+
+    if body.app not in {"admin", "web", "both"}:
+        return JSONResponse(status_code=422, content=fail(42201, "app 须为 admin/web/both"))
 
     menu = Menu(
         code=body.code,
@@ -166,19 +221,33 @@ async def create_menu(
         is_builtin=False,
     )
     db.add(menu)
+    db.add(
+        RoleMenuPermission(
+            role_code="super_admin",
+            menu_code=body.code,
+            can_view=True,
+            can_edit=True,
+        )
+    )
     await db.commit()
     await db.refresh(menu)
+    _clear_all_actor_caches()
     return ok(_menu_to_dict(menu))
 
 
 @router.delete("/{code}", response_model=None)
 async def delete_menu(
     code: str,
-    request: Request,
     db: AsyncSession = Depends(get_db),
+    actor: Actor = Depends(resolve_actor),
 ) -> dict | JSONResponse:
-    """删除菜单（仅 super_admin；内置不可删）。"""
-    actor = get_actor(request)
+    """删除菜单（仅 super_admin；内置不可删）。
+
+    @author 赵振明
+    @date 2026-08-11 14:16:34
+    """
+    if not actor.user_id:
+        return JSONResponse(status_code=401, content=fail(40101, "未登录"))
     if not is_super_admin(actor):
         return JSONResponse(status_code=403, content=fail(40301, "需 super_admin"))
 
@@ -188,20 +257,39 @@ async def delete_menu(
     if menu.is_builtin:
         return JSONResponse(status_code=403, content=fail(40301, "内置菜单不可删除"))
 
+    children = (
+        await db.execute(select(Menu.code).where(Menu.parent_code == code).limit(1))
+    ).scalar_one_or_none()
+    if children:
+        return JSONResponse(
+            status_code=409, content=fail(40901, "存在子菜单，请先删除或移走子项")
+        )
+
+    await db.execute(
+        RoleMenuPermission.__table__.delete().where(
+            RoleMenuPermission.menu_code == code
+        )
+    )
     await db.delete(menu)
     await db.commit()
+    _clear_all_actor_caches()
     return ok({"code": code, "deleted": True})
 
 
 @router.put("/{code}", response_model=None)
 async def update_menu(
     code: str,
-    request: Request,
     body: MenuUpdateBody,
     db: AsyncSession = Depends(get_db),
+    actor: Actor = Depends(resolve_actor),
 ) -> dict | JSONResponse:
-    """更新菜单（仅 super_admin）。"""
-    actor = get_actor(request)
+    """更新菜单（仅 super_admin）。
+
+    @author 赵振明
+    @date 2026-08-11 14:16:34
+    """
+    if not actor.user_id:
+        return JSONResponse(status_code=401, content=fail(40101, "未登录"))
     if not is_super_admin(actor):
         return JSONResponse(status_code=403, content=fail(40301, "需 super_admin"))
 
@@ -215,20 +303,32 @@ async def update_menu(
         menu.icon = body.icon
     if body.path is not None:
         menu.path = body.path
+    if body.parent_code is not None:
+        if body.parent_code == code:
+            return JSONResponse(
+                status_code=422, content=fail(42201, "parent_code 不能是自身")
+            )
+        if body.parent_code:
+            parent = await db.get(Menu, body.parent_code)
+            if parent is None:
+                return JSONResponse(
+                    status_code=422, content=fail(42201, "parent_code 不存在")
+                )
+            menu.parent_code = body.parent_code
+        else:
+            menu.parent_code = None
     if body.sort is not None:
         menu.sort = body.sort
     if body.is_visible is not None:
         menu.is_visible = body.is_visible
+    if body.app is not None:
+        if body.app not in {"admin", "web", "both"}:
+            return JSONResponse(
+                status_code=422, content=fail(42201, "app 须为 admin/web/both")
+            )
+        menu.app = body.app
+
     await db.commit()
     await db.refresh(menu)
-
-    # 失效超管以外所有用户的缓存（菜单可见性变化）
-    from app.core.actor import invalidate_actor_cache
-    from app.models.role import Role
-    from sqlalchemy import select
-
-    # 简化：失效所有非超管用户缓存
-    user_ids_rows = await db.execute(select(Role.code).where(Role.code != "super_admin"))
-    # 此处不直接取 user_ids；通过触发 Redis 失效走更精确的链路
-    # v1.0 简化：admin 主动刷新缓存；非即时生效场景容许
+    _clear_all_actor_caches()
     return ok(_menu_to_dict(menu))

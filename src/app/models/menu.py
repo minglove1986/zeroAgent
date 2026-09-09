@@ -1,7 +1,7 @@
 """菜单数据模型（PRD §5.2）。
 
 @author 赵振明
-@date 2026-08-07
+@date 2026-08-11 13:34:50
 """
 
 from __future__ import annotations
@@ -40,8 +40,9 @@ BUILTIN_MENUS: tuple[tuple, ...] = (
     ("overview", "总览", "DashboardOutlined", "/overview", None, 10, "admin"),
     ("group.agents", "智能体", None, None, None, 20, "admin"),
     ("agents", "Agent 管理", "RobotOutlined", "/agents", "group.agents", 21, "admin"),
-    ("models", "模型与服务商", "CloudOutlined", "/system/llm-models", "group.agents", 22, "admin"),
-    ("prompts", "Prompt 模板", "FileTextOutlined", "/prompts", "group.agents", 23, "admin"),
+    ("skills", "技能管理", "ThunderboltOutlined", "/skills", "group.agents", 22, "admin"),
+    ("models", "模型与服务商", "CloudOutlined", "/system/llm-models", "group.agents", 23, "admin"),
+    ("prompts", "Prompt 模板", "FileTextOutlined", "/prompts", "group.agents", 24, "admin"),
     ("group.knowledge", "知识与编排", None, None, None, 30, "admin"),
     ("knowledge", "知识库", "BookOutlined", "/knowledge", "group.knowledge", 31, "admin"),
     ("workflows", "工作流", "BranchesOutlined", "/workflows", "group.knowledge", 32, "admin"),
@@ -59,6 +60,8 @@ BUILTIN_MENUS: tuple[tuple, ...] = (
      "/organization/roles", "group.org", 52, "admin"),
     ("org.departments", "部门管理", "ApartmentOutlined",
      "/organization/departments", "group.org", 53, "admin"),
+    ("org.menus", "菜单管理", "MenuOutlined",
+     "/organization/menus", "group.org", 54, "admin"),
     ("group.operations", "运维审计", None, None, None, 60, "admin"),
     ("operations.usage", "用量成本", "BarChartOutlined",
      "/operations/usage", "group.operations", 61, "admin"),
@@ -68,4 +71,9 @@ BUILTIN_MENUS: tuple[tuple, ...] = (
      "/operations/audit", "group.operations", 63, "admin"),
     ("chat", "系统对话", "MessageOutlined", "/chat", None, 10, "web"),
     ("profile", "个人中心", "UserOutlined", "/profile", None, 20, "web"),
+)
+
+# 平台管理员默认可见菜单（主 PRD D37：含记忆白名单 / L2 / 系统人格）
+PLATFORM_ADMIN_DEFAULT_MENU_CODES: frozenset[str] = frozenset(
+    {m[0] for m in BUILTIN_MENUS if m[6] == "admin"}
 )

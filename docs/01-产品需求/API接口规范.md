@@ -311,6 +311,18 @@ Web 系统对话页绑定本组接口。
 }
 ```
 
+`route_clarify` 卡额外支持自由意图（与选项互斥）：
+
+```json
+{
+  "action": "submit",
+  "form": { "intent_text": "帮我查差旅报销标准" }
+}
+```
+
+- `intent_text` 最长 200 字；有文本时服务端忽略选项，拼装「原问题 + 补充意图」续跑，并抑制本轮再出路由澄清卡。  
+- 既无选项又无 `intent_text` → **422**（须选题或填写意图）。  
+
 成功后服务端续跑；若需流式回复，响应为 SSE（同 `/messages/send`）。  
 同一 `card_id` **不可重复提交**（422）；过期返回业务错误。
 
@@ -400,15 +412,16 @@ LLM 调用一律经本地/集群 **LiteLLM Proxy**，业务禁止直连厂商。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/admin/llm-models` | 目录列表（含 `source_status`） |
+| GET | `/admin/llm-models` | 目录列表（含 `source_status`、`supports_reasoning`） |
 | POST | `/admin/llm-models/sync` | 从 LiteLLM 同步 |
-| PATCH | `/admin/llm-models/{id}` | 启停、补 `max_input_tokens`、系统白名单 |
+| PATCH | `/admin/llm-models/{id}` | 启停、补 `max_input_tokens`、系统白名单（**不含**改 `supports_reasoning`） |
 | GET | `/admin/agents/{agent_id}/llm-models` | 读 Agent 绑定 |
 | PUT | `/admin/agents/{agent_id}/llm-models` | 全量替换绑定（含默认） |
-| GET | `/llm-models/available` | 员工端可选列表；`conversation_id` 或 `agent_id` |
+| GET | `/llm-models/available` | 员工端可选列表；`conversation_id` 或 `agent_id`；item 含 `supports_reasoning` |
 | PATCH | `/conversations/{id}` | 更新 `selected_model`（白名单校验；`null` 清空） |
 
-`source_status`：`active` \| `incomplete` \| `missing_in_litellm`。LiteLLM 缺失强制 `enabled=false`；管理员关闭不同步自动打开。非法选模返回业务码 `40031`。
+`source_status`：`active` \| `incomplete` \| `missing_in_litellm`。LiteLLM 缺失强制 `enabled=false`；管理员关闭不同步自动打开。非法选模返回业务码 `40031`。  
+`supports_reasoning`：由同步从 LiteLLM `/model/info` 覆盖写入；未知/缺字段为 `false`；员工端仅对该字段为 `true` 的模型展示「深度思考」。对话请求统一 `reasoning_effort`（关=`none` / 开=`medium`），不按厂商写死 `thinking.type`。
 
 ### 12.4 消息反馈审阅 `/admin/feedbacks`
 
@@ -453,6 +466,7 @@ LLM 调用一律经本地/集群 **LiteLLM Proxy**，业务禁止直连厂商。
 
 | 版本 | 说明 |
 |---|---|
+| v0.8.5 | LLM 目录 `supports_reasoning`；对话统一 `reasoning_effort`；员工端按能力位显隐深度思考 |
 | v0.8.4 | 管理端 `/admin/feedbacks` 审阅/汇总；员工端反馈 Celery 异步校准 + 仅踩站内通知/Webhook；`alert_webhooks` 表 |
 | v0.8.3 | 连续发送：`dismiss-card` + `supersede_pending_card`；42213 未 supersede 时仍返回 |
 | v0.8.2 | LLM 模型治理：`/admin/llm-models`、员工端可选列表与会话 `selected_model`；经 LlmGateway |

@@ -1,7 +1,8 @@
 /**
  * 对话过程可见：阶段 / 合成叙述 / 模型思考归并（仅本轮内存）。
+ * 完成后默认展开，折叠仅由用户手动触发。
  * @author 赵振明
- * @date 2026-08-03 16:17:37
+ * @date 2026-09-07 13:16:34
  */
 
 export type StageStatus = "running" | "done" | "error";
@@ -68,8 +69,15 @@ export function applyProcessEvent(
   return prev;
 }
 
-export function collapseProcess(prev: LiveProcess): LiveProcess {
-  return { ...prev, collapsed: true };
+/**
+ * 本轮 SSE 结束后保留过程区，并强制默认展开（不自动折叠）。
+ * 无可见内容时原样返回，避免空面板。
+ */
+export function retainProcessAfterDone(
+  process: LiveProcess | undefined,
+): LiveProcess | undefined {
+  if (!process || !hasVisibleProcess(process)) return process;
+  return { ...process, collapsed: false };
 }
 
 /** 是否仍有可展示的过程区（阶段或任一思考即可）。 */

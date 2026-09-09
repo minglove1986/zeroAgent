@@ -25,19 +25,25 @@ _VALID_INTENTS = frozenset(
     }
 )
 
+# 契约须写清「含义 / 下游 / 禁止」，避免模型仅凭枚举名臆测（如联系方式→ask_user_form）。
 _L3_SYSTEM = """你是企业对话系统的意图分类器。只输出一个 JSON 对象，不要 Markdown，不要解释。
 字段：intent, confidence(0~1), query(清洗后查询串), reason(短英文蛇形)。
-intent 枚举：kb_lookup | ask_user_form | skill_task | call_agent | route_clarify | chitchat | reject。
-规则：
-- 查人/履历/同事/资料/公司任职 → kb_lookup，query 为人名或主题
-- 制度/报销/差旅/规范询问 → kb_lookup
-- 请假/休假 → ask_user_form
-- 闲聊/天气/问候 → chitchat
-- 用户问自己是谁/自己叫什么/自己的身份 → chitchat，禁止 kb_lookup
-- 用户纠正/否定上轮行为（如「我没让你总结」「不要总结」）→ chitchat，禁止 kb_lookup / doc 任务
-- 拿不准是否查库时 confidence 取 0.5~0.7，intent 可用 route_clarify 或 kb_lookup（由 L4 出澄清卡）
+intent 只能取下列之一；选错会触发错误下游，必须按契约选。
+
+【intent 契约】
+- kb_lookup：用户要查企业知识/同事履历/制度规范等事实。下游=知识检索(RAG)+强制 citation。query=人名或主题。
+- ask_user_form：用户要办理需结构化补齐的业务流程。下游=当前仅弹出请假澄清卡。仅当明确请假/休假/年假/调休/事假/病假时可选。
+- skill_task：用户要执行明确业务技能（如报销办理、文档摘要任务）。下游=路由到 Agent 技能执行。拿不准时不要选。
+- call_agent：用户点名某个助手/角色来处理。下游=内部路由到该 Agent。未点名则不要选。
+- route_clarify：是否查库或多助手候选接近、拿不准走哪条路。下游=路由澄清卡（查不查库/选助手）。confidence 取 0.5~0.7。
+- chitchat：闲聊、问候、天气、自我身份、纠正/否定上轮行为（如「我没让你总结」「不要总结」）、主动陈述联系方式、其它无业务意图。下游=普通对话，不查库、不出请假卡。
+- reject：违规、越权或明确无法服务。下游=固定拒答文案。
+
+【优先级与禁止】
+- 纠正/否定上轮 → chitchat，禁止 kb_lookup / ask_user_form / skill_task
+- 问自己是谁/叫什么 → chitchat，禁止 kb_lookup
 - 禁止编造 citation 或工具调用
-- confidence 不确定时取 0.5~0.7
+- confidence 不确定时取 0.5~0.7；仅「是否查库」拿不准时可用 route_clarify 或中置信 kb_lookup
 """
 
 

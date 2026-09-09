@@ -82,6 +82,10 @@ APP_ENV=development
 APP_VERSION=1.0.0
 LOG_LEVEL=DEBUG
 
+# 对话路径追踪（Docker）：重建 API 镜像后
+#   docker logs -f --tail 200 zeroagent-api 2>&1 | Select-String turn_trace
+#   （Linux: docker logs -f --tail 200 zeroagent-api 2>&1 | grep turn_trace）
+
 # === MySQL ===
 MYSQL_ROOT_PASSWORD=rootpass
 MYSQL_DATABASE=zeroagent

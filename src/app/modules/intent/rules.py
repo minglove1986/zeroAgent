@@ -13,6 +13,8 @@ from typing import Any
 
 from app.modules.intent.decision import IntentDecision
 from app.modules.intent.l2_catalog_cache import get_catalog
+from app.modules.intent.l2_seed import LEAVE_CLUE_PHRASES, LEAVE_HANDLE_PHRASES
+from app.modules.intent.policy import has_consult_cue, leave_intent_allowed
 from app.modules.knowledge.lookup import parse_rag_query
 
 
@@ -100,18 +102,37 @@ def _person_kb_decision(raw: str, *, reason: str, feature: str) -> IntentDecisio
     return decision
 
 
-def _build_person_search_re() -> re.Pattern[str]:
-    """由 catalog 中 person_search_verb 组装「动作+裸人名」正则。"""
+def _build_person_search_re() -> re.Pattern[str] | None:
+    """由 catalog 中 person_search_verb 组装「动作+裸人名」正则；无动词则不匹配。"""
     verbs = [str(x.get("phrase") or "") for x in _catalog_items("person_search_verb")]
     verbs = [re.escape(v) for v in verbs if v]
     if not verbs:
-        verbs = [re.escape("搜索"), re.escape("查一下")]
+        return None
     # 长动词优先
     verbs.sort(key=len, reverse=True)
     alt = "|".join(verbs)
     return re.compile(
         rf"^(?:帮我)?(?:{alt})\s*([\u4e00-\u9fff]{{2,4}})\s*$"
     )
+
+
+def _leave_handle_phrase(raw: str) -> str | None:
+    """请假 L2 短路：仅办理金句（或非线索自定义短语）；跳过线索短词。
+
+    @author 赵振明
+    @date 2026-09-09 10:41:38
+    """
+    for item in _catalog_items("leave"):
+        if not _phrase_hit(raw, item):
+            continue
+        phrase = str(item.get("phrase") or "")
+        if not phrase:
+            continue
+        # 线索短词单独命中不短路；金句与运营自定义非线索短语可短路
+        if phrase in LEAVE_CLUE_PHRASES and phrase not in LEAVE_HANDLE_PHRASES:
+            continue
+        return phrase
+    return None
 
 
 def match_l2_rules(text: str) -> IntentDecision | None:
@@ -131,14 +152,19 @@ def match_l2_rules(text: str) -> IntentDecision | None:
             features=[f"rule:explicit_kb:{hit_kb}"],
         )
 
-    if _any_phrase(raw, "leave"):
+    hit_leave = _leave_handle_phrase(raw)
+    if (
+        hit_leave
+        and leave_intent_allowed(raw)
+        and not has_consult_cue(raw)
+    ):
         return IntentDecision(
             intent="ask_user_form",
             confidence=0.9,
             funnel_layer="L2",
             query=raw,
             reason="leave_request",
-            features=["rule:leave_request"],
+            features=[f"rule:leave_request:{hit_leave}"],
             slots={"form": "leave"},
         )
 
@@ -174,11 +200,13 @@ def match_l2_rules(text: str) -> IntentDecision | None:
         decision.slots["filters"] = build_retrieval_filters(decision)
         return decision
 
-    m_search = _build_person_search_re().match(raw)
-    if m_search:
-        name = m_search.group(1)
-        return _person_kb_decision(
-            name, reason="person_dossier", feature="rule:person_search"
-        )
+    person_re = _build_person_search_re()
+    if person_re is not None:
+        m_search = person_re.match(raw)
+        if m_search:
+            name = m_search.group(1)
+            return _person_kb_decision(
+                name, reason="person_dossier", feature="rule:person_search"
+            )
 
     return None

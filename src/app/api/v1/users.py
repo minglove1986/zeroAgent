@@ -1,7 +1,7 @@
 """用户接口（v1.0 增强：列表/详情/编辑/重置密码/部门/角色）。
 
 @author 赵振明
-@date 2026-08-10 09:49:08
+@date 2026-08-11 15:34:59
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ from app.core.permissions import require_menu
 from app.core.response import fail, ok
 from app.core.security import hash_password
 from app.models.department import Department, UserDepartment
-from app.models.role import UserRole
+from app.models.role import Role, UserRole
 from app.models.user import User
 from app.modules.audit import service as audit_service
 from app.modules.sessions import service as session_service
@@ -152,6 +152,16 @@ async def create_user(
             content=fail(40901, "用户名或工号已存在"),
         )
 
+    if body.id_card:
+        id_dup = await db.scalar(
+            select(User.id).where(User.id_card == body.id_card)
+        )
+        if id_dup:
+            return JSONResponse(
+                status_code=409,
+                content=fail(40901, "身份证号已存在"),
+            )
+
     user = User(
         id=_new_user_id(),
         username=body.username,
@@ -165,6 +175,7 @@ async def create_user(
         main_department_id=body.main_department_id,
         role=body.role,
         status="active",
+        id_card=body.id_card,
     )
     db.add(user)
     await db.flush()
@@ -207,7 +218,9 @@ async def create_user(
 @router.get("", response_model=None)
 async def list_users(
     request: Request,
-    status: str | None = Query(default=None, description="active/disabled/terminated"),
+    status: list[str] | None = Query(
+        default=None, description="可重复：active/disabled/terminated"
+    ),
     role: str | None = Query(default=None),
     department_id: str | None = Query(default=None),
     search: str | None = Query(default=None, description="name/username/employee_no 模糊匹配"),
@@ -220,6 +233,10 @@ async def list_users(
 
     - platform_admin / super_admin：全量
     - department_admin（M1.5）：仅本部门（主+兼职）只读列表
+    - status 支持多值（管理端默认 active+disabled）
+
+    @author 赵振明
+    @date 2026-08-11 14:41:25
     """
     is_full = is_platform_admin(actor) or is_super_admin(actor)
     is_da = is_department_admin(actor)
@@ -241,7 +258,17 @@ async def list_users(
             )
         )
     if status:
-        stmt = stmt.where(User.status == status)
+        allowed = {"active", "disabled", "terminated"}
+        statuses = [s for s in status if s in allowed]
+        if not statuses:
+            return JSONResponse(
+                status_code=422,
+                content=fail(42201, "status 必须是 active/disabled/terminated"),
+            )
+        if len(statuses) == 1:
+            stmt = stmt.where(User.status == statuses[0])
+        else:
+            stmt = stmt.where(User.status.in_(statuses))
     if role:
         stmt = stmt.where(User.role == role)
     if department_id:
@@ -303,15 +330,100 @@ async def get_user(
     role_rows = await db.execute(
         select(UserRole.role_code).where(UserRole.user_id == user_id)
     )
-    extra_roles = [r for r in role_rows.scalars().all()]
+    extra_roles = [r for r in role_rows.scalars().all() if r != user.role]
+
+    dept_ids = [d.department_id for d in depts]
+    name_map: dict[str, str] = {}
+    if dept_ids:
+        dname_rows = await db.execute(
+            select(Department.id, Department.name).where(Department.id.in_(dept_ids))
+        )
+        name_map = {row[0]: row[1] for row in dname_rows.all()}
+
+    role_codes = [user.role, *extra_roles]
+    role_name_map: dict[str, str] = {}
+    rname_rows = await db.execute(
+        select(Role.code, Role.name).where(Role.code.in_(role_codes))
+    )
+    role_name_map = {row[0]: row[1] for row in rname_rows.all()}
 
     out = _user_to_dict(user)
     out["departments"] = [
-        {"department_id": d.department_id, "is_primary": bool(d.is_primary)}
+        {
+            "id": d.department_id,
+            "name": name_map.get(d.department_id) or d.department_id,
+            "is_primary": bool(d.is_primary),
+        }
         for d in depts
+    ]
+    out["roles"] = [
+        {
+            "code": user.role,
+            "name": role_name_map.get(user.role) or user.role,
+            "is_primary": True,
+        },
+        *[
+            {
+                "code": c,
+                "name": role_name_map.get(c) or c,
+                "is_primary": False,
+            }
+            for c in extra_roles
+        ],
     ]
     out["extra_roles"] = extra_roles
     return ok(out)
+
+
+@router.get("/{user_id}/audit-logs", response_model=None)
+async def list_user_audit_logs(
+    user_id: str,
+    request: Request,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    actor: Actor = Depends(resolve_actor),
+) -> dict | JSONResponse:
+    """用户相关操作日志（与 get_user 同权限）。
+
+    @author 赵振明
+    @date 2026-08-11 15:40:06
+    """
+    if not actor.user_id:
+        return JSONResponse(status_code=401, content=fail(40101, "未登录"))
+
+    user = await db.get(User, user_id)
+    if user is None or user.deleted_at is not None:
+        return JSONResponse(status_code=404, content=fail(40401, "user not found"))
+
+    is_full = is_platform_admin(actor) or is_super_admin(actor)
+    if user_id != actor.user_id and not is_full:
+        if not (
+            is_department_admin(actor) and await _user_in_dept_scope(db, actor, user)
+        ):
+            return JSONResponse(status_code=403, content=fail(40301, "无权查看该用户"))
+
+    rows, total = await audit_service.query_for_user(
+        db, user_id=user_id, page=page, page_size=page_size
+    )
+    items = [
+        {
+            "id": r.id,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "actor_id": r.actor_id,
+            "actor_role": r.actor_role,
+            "action": r.action,
+            "summary": r.summary,
+            "result": r.result,
+            "client_ip": r.client_ip,
+            "resource_type": r.resource_type,
+            "resource_id": r.resource_id,
+        }
+        for r in rows
+    ]
+    return ok(
+        {"items": items, "total": total, "page": page, "page_size": page_size}
+    )
 
 
 @router.put("/{user_id}", response_model=None)
@@ -341,6 +453,19 @@ async def update_user(
         user.position = body.position
     if body.hire_date is not None:
         user.hire_date = body.hire_date
+    if "id_card" in body.model_fields_set:
+        if body.id_card:
+            id_dup = await db.scalar(
+                select(User.id).where(
+                    User.id_card == body.id_card, User.id != user_id
+                )
+            )
+            if id_dup:
+                return JSONResponse(
+                    status_code=409,
+                    content=fail(40901, "身份证号已存在"),
+                )
+        user.id_card = body.id_card
     if body.main_department_id is not None:
         dept = await db.get(Department, body.main_department_id)
         if dept is None:

@@ -805,6 +805,36 @@ textarea {
   border-radius: 0 0.5rem 0.5rem 0;
 }
 .cite-title { color: var(--accent); margin-right: 0.4rem; }
+a.cite-title {
+  text-decoration: none;
+  display: inline;
+  word-break: break-all;
+}
+a.cite-title:hover {
+  text-decoration: underline;
+}
+.cite-snippet {
+  display: block;
+  margin-top: 0.15rem;
+  line-height: 1.4;
+}
+.cite-snippet-text {
+  word-break: break-word;
+}
+.cite-fold-btn {
+  margin-left: 0.35rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.cite-fold-btn:hover {
+  opacity: 0.85;
+}
 
 .msg-actions {
   display: flex;

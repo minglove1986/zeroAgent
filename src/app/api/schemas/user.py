@@ -1,15 +1,35 @@
 """用户 API Schema（含扩展字段）。
 
 @author 赵振明
-@date 2026-08-07
+@date 2026-08-11 15:34:59
 """
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+_ID_CARD_RE = re.compile(r"^[0-9]{17}[0-9Xx]$")
+_PHONE_CN_RE = re.compile(r"^1[3-9]\d{9}$")
+
+
+def normalize_id_card(value: str | None) -> str | None:
+    """空串→None；末位 x→X；格式非法抛 ValueError。
+
+    @author 赵振明
+    @date 2026-08-11 15:34:59
+    """
+    if value is None:
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    if not _ID_CARD_RE.match(s):
+        raise ValueError("身份证号须为 18 位（末位数字或 X）")
+    return s[:-1] + s[-1].upper()
 
 
 class UserCreate(BaseModel):
@@ -27,6 +47,21 @@ class UserCreate(BaseModel):
     department_ids: list[str] = Field(default_factory=list)
     role: str = "employee"  # 主角色 code
     extra_roles: list[str] = Field(default_factory=list)  # 附加角色 code
+    id_card: str | None = None
+
+    @field_validator("phone")
+    @classmethod
+    def _phone(cls, v: str) -> str:
+        """校验大陆 11 位手机号。"""
+        if not _PHONE_CN_RE.match(v or ""):
+            raise ValueError("手机号须为 11 位大陆号")
+        return v
+
+    @field_validator("id_card")
+    @classmethod
+    def _id_card(cls, v: str | None) -> str | None:
+        """归一化并校验身份证号。"""
+        return normalize_id_card(v)
 
 
 class UserUpdate(BaseModel):
@@ -40,6 +75,23 @@ class UserUpdate(BaseModel):
     main_department_id: str | None = None
     department_ids: list[str] | None = None
     extra_roles: list[str] | None = None
+    id_card: str | None = None
+
+    @field_validator("phone")
+    @classmethod
+    def _phone(cls, v: str | None) -> str | None:
+        """更新时若传手机号则校验格式。"""
+        if v is None:
+            return None
+        if not _PHONE_CN_RE.match(v):
+            raise ValueError("手机号须为 11 位大陆号")
+        return v
+
+    @field_validator("id_card")
+    @classmethod
+    def _id_card(cls, v: str | None) -> str | None:
+        """更新时归一化身份证号（含清空为 None）。"""
+        return normalize_id_card(v)
 
 
 class UserOut(BaseModel):
@@ -59,6 +111,8 @@ class UserOut(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
     last_login_at: datetime | None = None
+    last_login_ip: str | None = None
+    id_card: str | None = None
     created_by: str | None = None
 
     model_config = {"from_attributes": True}

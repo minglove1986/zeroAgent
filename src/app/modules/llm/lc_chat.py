@@ -71,6 +71,91 @@ class _MockChatModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content=content))])
 
 
+def _delta_reasoning_from_openai_chunk(chunk: dict[str, Any]) -> str:
+    """从 OpenAI 兼容流式 chunk 抽出 MiniMax/DeepSeek 非标思考增量。
+
+    ChatOpenAI 官方只认 OpenAI 字段，会丢掉 delta.reasoning_content；
+    LiteLLM 代理 MiniMax 深度思考时必须自行保留，否则前端思考区为空。
+
+    @author 赵振明
+    @date 2026-08-19 11:16:09
+    """
+    if not isinstance(chunk, dict):
+        return ""
+    nested = chunk.get("chunk")
+    nested_choices = nested.get("choices") if isinstance(nested, dict) else None
+    choices = chunk.get("choices") or nested_choices or []
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    delta = first.get("delta") or {}
+    if not isinstance(delta, dict):
+        return ""
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        val = delta.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    return ""
+
+
+class _LiteLLMChatOpenAI(ChatOpenAI):
+    """经 LiteLLM 的 ChatOpenAI：保留第三方 reasoning_content。
+
+    @author 赵振明
+    @date 2026-08-19 11:16:09
+    """
+
+    def _convert_chunk_to_generation_chunk(
+        self,
+        chunk: dict,
+        default_chunk_class: type,
+        base_generation_info: dict | None,
+    ) -> Any:
+        """在官方转换之后，把非标思考增量写入 additional_kwargs。
+
+        @author 赵振明
+        @date 2026-08-19 11:16:09
+        """
+        gen = super()._convert_chunk_to_generation_chunk(
+            chunk, default_chunk_class, base_generation_info
+        )
+        if gen is None:
+            return None
+        reasoning = _delta_reasoning_from_openai_chunk(chunk)
+        if not reasoning:
+            return gen
+        message = getattr(gen, "message", None)
+        extra = getattr(message, "additional_kwargs", None)
+        if isinstance(extra, dict):
+            extra["reasoning_content"] = reasoning
+        elif message is not None:
+            message.additional_kwargs = {"reasoning_content": reasoning}
+        return gen
+
+
+def _catalog_supports_reasoning(model_name: str) -> bool | None:
+    """查热缓存：True/False；目录空或未命中返回 None（尊重调用方）。
+
+    @author 赵振明
+    @date 2026-08-19 16:19:46
+    """
+    from app.modules.llm import models_cache
+
+    catalog = models_cache.get_models_catalog()
+    if not catalog or not isinstance(catalog.get("models"), list):
+        return None
+    name = (model_name or "").strip()
+    if not name:
+        return None
+    for item in catalog["models"]:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("model_name") or "") != name:
+            continue
+        return item.get("supports_reasoning") is True
+    return None
+
+
 def get_chat_model(
     *,
     model: str | None = None,
@@ -78,35 +163,36 @@ def get_chat_model(
 ) -> BaseChatModel:
     """返回 LangChain Chat 模型；MOCK_EXTERNAL 时不发真实网络请求。
 
-    enable_thinking：是否打开上游 thinking（MiniMax 等）；默认关闭，
-    避免 reasoning 占满 max_tokens 导致正文为空。
+    enable_thinking：请求侧统一发 reasoning_effort（none|medium）。
+    目录明确不支持思考时强制 none，防前端误传。
 
     @author 赵振明
-    @date 2026-08-03 14:59:17
+    @date 2026-08-19 16:19:46
     """
     settings = get_settings()
     use_model = model or settings.litellm_model
+    want_think = bool(enable_thinking)
+    catalog_flag = _catalog_supports_reasoning(use_model)
+    if catalog_flag is False:
+        want_think = False
+    effort = "medium" if want_think else "none"
     logger.info(
-        "llm.get_chat_model model=%s thinking=%s",
+        "llm.get_chat_model model=%s thinking=%s effort=%s",
         use_model,
-        "enabled" if enable_thinking else "disabled",
+        "enabled" if want_think else "disabled",
+        effort,
     )
 
     if settings.mock_external:
         return _MockChatModel()
 
-    # MiniMax-M3：thinking.type 仅允许 adaptive | disabled（enabled 会 400）
-    return ChatOpenAI(
+    return _LiteLLMChatOpenAI(
         base_url=_litellm_openai_base_url(settings.litellm_proxy_url),
         api_key=settings.litellm_master_key,
         model=use_model,
-        max_tokens=4096 if enable_thinking else 2048,
+        max_tokens=4096 if want_think else 2048,
         stream_usage=True,
-        extra_body={
-            "thinking": {
-                "type": "adaptive" if enable_thinking else "disabled"
-            }
-        },
+        extra_body={"reasoning_effort": effort},
     )
 
 

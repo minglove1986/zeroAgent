@@ -102,6 +102,26 @@ async def test_list_users_filter_by_status(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_users_filter_by_multiple_status(client: AsyncClient) -> None:
+    """多 status 查询参数（管理端默认 active+disabled）须返回并集。
+
+    @author 赵振明
+    @date 2026-08-11 14:41:25
+    """
+    resp = await client.get(
+        "/api/v1/users?status=active&status=disabled",
+        headers=_super_admin_headers(),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    assert body["data"]["total"] >= 1
+    statuses = {u["status"] for u in body["data"]["items"]}
+    assert statuses <= {"active", "disabled"}
+    assert "active" in statuses
+
+
+@pytest.mark.asyncio
 async def test_list_users_filter_by_search(client: AsyncClient) -> None:
     """按用户名模糊搜索。"""
     resp = await client.get("/api/v1/users?search=admin", headers=_super_admin_headers())

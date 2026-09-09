@@ -90,6 +90,30 @@ _EXACT: dict[str, IntentDecision] = {
         reason="chitchat",
         features=["mock:fixture", "mock:chitchat"],
     ),
+    "我的手机号是：15011586502，邮箱是28154232@qq.com。": IntentDecision(
+        intent="chitchat",
+        confidence=0.85,
+        funnel_layer="L3",
+        query="我的手机号是：15011586502，邮箱是28154232@qq.com。",
+        reason="contact_info",
+        features=["mock:fixture", "mock:contact_info", "memory_candidate"],
+    ),
+    "我没说请假": IntentDecision(
+        intent="chitchat",
+        confidence=0.9,
+        funnel_layer="L3",
+        query="我没说请假",
+        reason="deny_leave",
+        features=["mock:fixture", "mock:deny_leave"],
+    ),
+    "我没让你总结": IntentDecision(
+        intent="chitchat",
+        confidence=0.9,
+        funnel_layer="L3",
+        query="我没让你总结",
+        reason="user_correction",
+        features=["mock:fixture", "mock:user_correction"],
+    ),
 }
 
 
