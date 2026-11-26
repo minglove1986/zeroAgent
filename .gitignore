@@ -21,7 +21,18 @@ htmlcov/
 *.swp
 .DS_Store
 .codegraph/
-.cursor/
+.cursor/*
+!.cursor/rules/
 .claude/
-tests/
+
+# 前端依赖、构建产物与本地环境变量（admin-web 无独立 .gitignore，统一在根忽略）
+node_modules/
+.next/
+.env*.local
+
+# 本地临时与运行时产物（不入库）
+.backup/
+.tmp_*
+tmp_meta.json
+celerybeat-schedule.*
 

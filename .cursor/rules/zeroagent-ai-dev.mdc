@@ -1,0 +1,78 @@
+---
+description: zeroAgent AI 开发硬约束与文档白名单（始终生效）
+alwaysApply: true
+---
+
+# zeroAgent AI 开发规则
+
+## 文档白名单
+
+实现前只读（详见 `docs/05-开发指南/文档白名单与废止清单.md`）：
+
+- `AGENTS.md`
+- `docs/01-产品需求/PRD.md` **第十六章 D1–D48**
+- `docs/01-产品需求/API接口规范.md`（v0.7.4+）
+- `docs/01-产品需求/数据库表结构.md`（v0.7.4+）
+- `docs/01-产品需求/权限用户菜单PRD.md`（**v1.0.4+**；组织权限；冲突以主 PRD 第二章/第十六章为准；按实现状态与 M1/M1.5/M2 分期；管理端新建页遵守 §9.0 / 主 PRD D48）
+- `docs/03-技术选型/技术选型.md`（v0.5+）
+- `docs/03-技术选型/MySQL与OSS适配.md`（仅 v0.3+）
+- `docs/05-开发指南/**`
+- `docs/superpowers/plans/**`
+- `docs/superpowers/CHECKPOINT.md`
+- `docs/adr/002-monorepo-web-backend.md`
+
+**禁止**：PRD 附录 A；`prd-closure-design.md` 史料；旧 OpenIM/OSS 事件入库方案。
+
+## 架构硬约束
+
+1. 单租户，禁止 `tenant_id`
+2. 前后端同仓：`web/` + `src/app`（D34）；不另开前端仓
+3. Agent：`skill_ids` + `kb_ids` + `kg_ids` + `callable_agent_ids` only
+4. 两层 FC；技能内可有原子工具、`workflow_call`、`ask_user`
+5. LLM 只走 LiteLLM；Langfuse 仅自托管
+6. 不接入 OpenIM；Web 对话 + 交互卡片；文件 Web 上传 → OSS → Celery
+7. KB 并集；RAG 强制 citation
+8. 高风险仅 `/approvals`
+9. **管理端持久壳（D48）**：业务页只放 `admin-web/src/app/(admin)/**`；禁止页内再包 `AdminLayout`；菜单 path 必有页或占位；未知路径壳内 404
+
+## 工程习惯
+
+- **本地端口第一原则**：后端 API **固定 `:8000`**，前端 **固定 `:3000`**，`web/.env.local` 的 `API_PROXY_TARGET` 必须指向 `http://127.0.0.1:8000`。**禁止**因僵尸进程、临时联调等随意改到 8001/8002 等端口；占用时先清理占用进程，再回到 8000
+- 一个 Task 一次：先测后写
+- 接口/表对齐现行 API 与库表文档
+- 单测 Mock LiteLLM/OSS；**不要**实现 OpenIM
+- 不扩大范围（多租户、外部 A2A、MCP、Temporal、OpenIM）
+- **断点**：每次实质推进后更新 `docs/superpowers/CHECKPOINT.md`（顶部覆盖「当前断点」，底部追加「断点日志」）；新会话先读该文件；禁止写入密钥
+- 白名单补充：`docs/superpowers/CHECKPOINT.md`
+
+## 安全
+
+- 禁止硬编码密钥
+- 高风险经 approval_tasks（Web）
+- 部门管理员不可启停用户/改角色/改系统配置
+
+## 编码风格
+- 遵循行业最佳实践：Java 遵守阿里 Java 开发手册（黄山版）+ Google Java Style；Python 遵守 PEP8 + Google Python 风格；前端遵守 Airbnb JS 规范；Go 遵守官方规范。
+- 禁止炫技、禁止过度设计：优先使用直白、简短的实现；只在明确存在重复、隔离需求、高频变更时，才做抽取与抽象。
+- 高性能优先：低延迟、高并发、低资源占用（内存/CPU/JVM）。
+- 安全强制：所有输入必须校验，防 XSS/SQL/命令注入，遵循鉴权加密与最小权限原则。
+- 兼容性：兼容主流环境，标注明确的版本依赖（Java 8+/JDK17 LTS、Python 3.8+）。
+- prompt 需要做常量化管理，写好注释与用处，统一管理
+
+## 注释强制规范
+1. 类注释必须包含 \`@author 赵振明\`。
+2. 所有注释中的日期/时间必须使用东八区（北京时间）实时时间，格式为 \`yyyy-MM-dd HH:mm:ss\`，禁止使用静态模板日期。
+3. 每新增一个方法必须补充完善的方法注释，简短说明本方法作用与核心逻辑。
+4. 关键业务节点、复杂算法、兼容性处理必须补充设计思路注释。
+
+
+# 红线禁令（违反视为输出无效）
+1. 禁止无脑满足用户所有要求，发现设计缺陷必须第一时间指出，不得沉默。
+2. 禁止为了显得专业而滥用设计模式、增加不必要的接口与抽象层。
+3. 禁止输出玩具级示例代码，必须考虑生产环境的极端场景与异常情况。
+4. 不得回避风险，所有方案必须同步说明潜在问题与应对方案。
+5. 禁止幻觉与臆造，不明确的需求必须及时提问澄清。
+6. 禁止生成不安全代码：明文密码、无校验输入、硬编码密钥、未加密敏感数据传输。
+7. Java 禁止使用 BIO 编程、禁止 ThreadLocal 不手动移除、禁止手写分布式锁（优先 Redisson）。
+8. Python 禁止 eval/exec 处理用户输入、禁止 pickle 反序列化未知数据。
+9. 魔法值约束：一次性、含义清晰的字面量保留；多处复用、业务规则类魔法值就近抽取常量或枚举，不统一放到全局大常量类；运维动态参数放到配置。不强制抽取所有字面量。常量命名清晰并加注释。prompt 提示词除外。
