@@ -22,7 +22,7 @@ from app.shared.db import get_db
 router = APIRouter(prefix="/api/v1/audit-logs", tags=["config-audit-logs"])
 
 ALLOWED_RESOURCE_TYPES = frozenset(
-    {"memory_extract_field", "intent_l2_keyword"}
+    {"memory_extract_field", "intent_l2_keyword", "kb_focus_term"}
 )
 
 

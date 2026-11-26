@@ -63,8 +63,13 @@ async def _run(document_id: str) -> dict:
     if result.get("status") == "failed" and result.get("reason") in {
         "unsupported_extension",
         "pdf_parse_error",
+        "docx_parse_error",
+        "xlsx_parse_error",
+        "docx_dependency_missing",
+        "xlsx_dependency_missing",
         "oss_missing",
         "not_found",
+        "empty_text",
     }:
         return result  # 业务失败不重试
     if result.get("status") == "error":

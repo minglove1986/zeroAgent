@@ -170,7 +170,10 @@ def get_chat_model(
     @date 2026-08-19 16:19:46
     """
     settings = get_settings()
-    use_model = model or settings.litellm_model
+    from app.modules.llm.model_resolve import resolve_chat_model_name
+
+    # 禁止 model=None 时静默回落 LITELLM_MODEL(MiniMax)
+    use_model = resolve_chat_model_name(model)
     want_think = bool(enable_thinking)
     catalog_flag = _catalog_supports_reasoning(use_model)
     if catalog_flag is False:

@@ -45,7 +45,11 @@ type TestResult = {
   intent?: string;
   confidence?: number;
   reason?: string;
-  match?: { phrase?: string };
+  match?: { phrase?: string; candidate_intent?: string };
+  gate_action?: string | null;
+  gate_reason?: string | null;
+  would_short_circuit?: boolean;
+  clarify_kind?: string | null;
 };
 
 /** 固定分类：界面只展示中文名与用途，code 仅作提交值。 */
@@ -617,8 +621,24 @@ export default function L2KeywordsPage() {
                   {testResult.layer}
                 </p>
                 <p style={{ margin: 0 }}>
-                  <strong>最终意图：</strong>
+                  <strong>候选意图：</strong>
+                  {testResult.match?.candidate_intent || testResult.intent || "—"}
+                </p>
+                <p style={{ margin: 0 }}>
+                  <strong>门槛后意图：</strong>
                   {testResult.intent}
+                </p>
+                <p style={{ margin: 0 }}>
+                  <strong>门槛：</strong>
+                  {testResult.gate_action || "—"}
+                  {testResult.gate_reason ? `（${testResult.gate_reason}）` : ""}
+                </p>
+                <p style={{ margin: 0 }}>
+                  <strong>是否短路：</strong>
+                  {testResult.would_short_circuit ? "是" : "否"}
+                  {testResult.clarify_kind
+                    ? ` → 澄清 ${testResult.clarify_kind}`
+                    : ""}
                 </p>
                 <p style={{ margin: 0 }}>
                   <strong>置信度：</strong>
@@ -631,6 +651,9 @@ export default function L2KeywordsPage() {
                 <p style={{ margin: 0 }}>
                   <strong>原因：</strong>
                   {testResult.reason || "—"}
+                </p>
+                <p style={{ margin: 0, opacity: 0.75, fontSize: 12 }}>
+                  试跑无会话文档检索上下文；文档类门槛按「未解析」预测澄清，与生产可能略有差异。
                 </p>
               </Space>
             ) : (

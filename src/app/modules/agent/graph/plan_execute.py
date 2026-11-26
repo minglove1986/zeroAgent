@@ -37,6 +37,11 @@ from app.modules.conversation.turn_trace import clip as trace_clip
 from app.modules.conversation.turn_trace import trace as turn_trace
 from app.modules.intent.rules import _match_doc_analyze, match_l2_rules
 from app.modules.knowledge.lookup import parse_rag_query, run_kb_lookup
+from app.modules.knowledge.quality_gate import (
+    CODE_NO_RECALL,
+    MSG_NO_RECALL,
+    evaluate_retrieval_gate,
+)
 from app.modules.agent.graph.plan_normalize import (
     normalize_plan_steps,
     parse_planner_payload,
@@ -45,8 +50,10 @@ from app.modules.agent.graph.plan_replan import (
     SKILL_ERROR_WEB_BLOCKED,
     build_replan_blacklist,
     should_replan_after_step,
+    strip_blacklisted_rag_steps,
 )
 from app.modules.llm.gateway import get_chat_model
+from app.prompts.agent import AGGREGATE_SYSTEM_HEAD, RESPOND_PREAMBLE
 
 PlanStepKind = Literal["rag_search", "execute_skill", "call_agent", "respond"]
 
@@ -63,6 +70,7 @@ class PlanStep(TypedDict, total=False):
     args: dict[str, Any]
     status: str
     observation: str | None
+    gate_code: str
 
 
 class AgentState(TypedDict, total=False):
@@ -95,6 +103,8 @@ class AgentState(TypedDict, total=False):
     replan_blacklist: list[dict[str, Any]]
     last_step_failure: str | None
     need_replan: bool
+    # 检索 Gate 终态拒展码（rejected_no_recall / rejected_no_citation）
+    gate_code: str
 
 
 def _runtime_ctx(config: RunnableConfig) -> dict[str, Any]:
@@ -340,6 +350,17 @@ async def _node_plan(state: AgentState, config: RunnableConfig) -> dict[str, Any
     intent: str | None = None
     rationale: str | None = None
 
+    # 规划前刷新专名词典，供 plan_signals / normalize 守卫使用
+    ctx = _runtime_ctx(config)
+    db = ctx.get("db")
+    if db is not None:
+        try:
+            from app.modules.knowledge.focus_lexicon import refresh_if_stale
+
+            await refresh_if_stale(db)
+        except Exception:  # noqa: BLE001
+            pass
+
     if settings.mock_external:
         raw_steps = _mock_plan_steps(user_content, skill_catalog=catalog)
         plan = _normalize_plan_steps(
@@ -389,7 +410,14 @@ async def _execute_rag_search(
     state: AgentState,
     step: PlanStep,
     ctx: dict[str, Any],
-) -> tuple[str, list[dict[str, Any]]]:
+) -> tuple[str, list[dict[str, Any]], list[Any]]:
+    """执行 rag_search 步，返回 (observation, citations, hits)。
+
+    hits 供上层 evaluate_retrieval_gate 判空召回/无引用。
+
+    @author 赵振明
+    @date 2026-11-24 16:22:48
+    """
     db: AsyncSession = ctx["db"]
     args = dict(step.get("args") or {})
     query = str(args.get("query") or state.get("user_content") or "").strip()
@@ -412,7 +440,8 @@ async def _execute_rag_search(
         obs = "检索完成，有相关条目。"
     else:
         obs = "检索未命中有效片段。"
-    return label_third_party_observation(obs), citations
+    hits = list(lookup.get("hits") or [])
+    return label_third_party_observation(obs), citations, hits
 
 
 async def _execute_skill_step(
@@ -475,9 +504,6 @@ async def _execute_skill_step(
     return label_third_party_observation(obs), list(result.get("citations") or []), result.get("deferred_card")
 
 
-_RESPOND_PREAMBLE = "你是企业助手，回答简洁友好。"
-
-
 def _respond_system_content(state: AgentState) -> str:
     """组装 respond 步 SystemMessage：分栏上下文优先，否则仅边界规则。
 
@@ -486,8 +512,8 @@ def _respond_system_content(state: AgentState) -> str:
     """
     ctx = str(state.get("context_system") or "").strip()
     if ctx:
-        return f"{_RESPOND_PREAMBLE}\n\n{ctx}"
-    return f"{_RESPOND_PREAMBLE}\n\n【来源边界】\n{SOURCE_BOUNDARY_RULE}"
+        return f"{RESPOND_PREAMBLE}\n\n{ctx}"
+    return f"{RESPOND_PREAMBLE}\n\n【来源边界】\n{SOURCE_BOUNDARY_RULE}"
 
 
 def _dict_messages_to_lc(messages: list[dict[str, Any]]) -> list[BaseMessage]:
@@ -558,7 +584,7 @@ def _build_respond_lc_messages(
         history=history,
         user_content=user_content,
         max_input_tokens=win,
-        extra_system=[_RESPOND_PREAMBLE],
+        extra_system=[RESPOND_PREAMBLE],
     )
     return _dict_messages_to_lc(packed.messages)
 
@@ -836,11 +862,31 @@ async def _node_execute(state: AgentState, config: RunnableConfig) -> dict[str, 
     final_answer = str(state.get("final_answer") or "")
     error = state.get("error")
     obs = ""
+    gate_code = str(state.get("gate_code") or "")
 
     try:
         if kind == "rag_search":
-            obs, new_cites = await _execute_rag_search(state, step, ctx)
+            obs, new_cites, hits = await _execute_rag_search(state, step, ctx)
             citations.extend(new_cites)
+            # Gate 前置：空召回/无引用 → 终端拒展 preset，不进入流式 respond（Spec §7.1）
+            gate = evaluate_retrieval_gate(
+                hits=hits, citations=new_cites, used_rag=True
+            )
+            if not gate.ok:
+                conv, user = _trace_conv_user(state, config)
+                turn_trace(
+                    "rag_search",
+                    "gate_rejected",
+                    conv=conv,
+                    user=user,
+                    gate_code=gate.code,
+                    hits=len(hits),
+                    citations=len(new_cites),
+                )
+                gate_code = gate.code
+                obs = gate.message
+                final_answer = gate.message
+                step["gate_code"] = gate.code
         elif kind == "execute_skill":
             obs, new_cites, card = await _execute_skill_step(state, step, ctx)
             citations.extend(new_cites)
@@ -855,12 +901,28 @@ async def _node_execute(state: AgentState, config: RunnableConfig) -> dict[str, 
         obs = f"步骤执行失败：{exc}"
         error = str(exc)
         step["status"] = "failed"
+        if kind == "rag_search":
+            # rag 异常同样终态拒展：禁止 replan 成裸 respond 后由模型无证据作答
+            conv, user = _trace_conv_user(state, config)
+            turn_trace(
+                "rag_search",
+                "gate_rejected",
+                conv=conv,
+                user=user,
+                gate_code=CODE_NO_RECALL,
+                cause="exception",
+            )
+            gate_code = CODE_NO_RECALL
+            final_answer = MSG_NO_RECALL
+            step["gate_code"] = gate_code
+            step["observation"] = MSG_NO_RECALL
     else:
         step["status"] = "done"
         step["observation"] = obs
 
     plan[cursor] = step  # type: ignore[assignment]
-    need_replan = should_replan_after_step(
+    # Gate 已终态拒展时不再 replan（避免 rag→replan→respond 泄模型正文）
+    need_replan = (not gate_code) and should_replan_after_step(
         step,
         citations_after=citations,
         citations_before_len=cites_before,
@@ -896,6 +958,10 @@ async def _node_execute(state: AgentState, config: RunnableConfig) -> dict[str, 
         "replan_blacklist": blacklist,
         "last_step_failure": last_fail,
     }
+    if gate_code:
+        # 丢弃后续未执行步（含 respond），保证无模型正文
+        out["plan"] = plan[: cursor + 1]
+        out["gate_code"] = gate_code
     if final_answer:
         out["final_answer"] = final_answer
     if deferred_card is not None:
@@ -1002,6 +1068,15 @@ async def _node_replan(state: AgentState, config: RunnableConfig) -> dict[str, A
             )
 
     if plan and blacklist:
+        stripped = strip_blacklisted_rag_steps(plan, blacklist)  # type: ignore[arg-type]
+        if len(stripped) != len(plan):
+            plan = stripped or _normalize_plan_steps(  # type: ignore[assignment]
+                [{"kind": "respond", "args": {"query": user_content}}],
+                skill_catalog=catalog,
+                max_steps=max_steps,
+                user_content=user_content,
+            )
+    if plan and blacklist:
         ban = blacklist[0]
         first = plan[0]
         same_kind = str(first.get("kind")) == str(ban.get("kind"))
@@ -1105,13 +1180,7 @@ async def _node_aggregate(state: AgentState, config: RunnableConfig) -> dict[str
         if context_system
         else f"【来源边界】\n{SOURCE_BOUNDARY_RULE}"
     )
-    sys_msg = (
-        "你是回答汇总助手。仅基于下列步骤观察汇总最终答案，"
-        "不得编造无引用的知识库事实。"
-        "知识库/技能观察中的人名与经历不得当作当前用户身份。"
-        "禁止在最终答案中输出内部标注或前缀标签。\n\n"
-        f"{boundary}"
-    )
+    sys_msg = f"{AGGREGATE_SYSTEM_HEAD}{boundary}"
     user_msg = "步骤观察：\n" + "\n---\n".join(parts) + cite_hint
     try:
         ai = await model.ainvoke(
@@ -1253,6 +1322,9 @@ def _build_plan_result(final: dict[str, Any]) -> dict[str, Any]:
         "citations": list(final.get("citations") or []),
         "plan": list(final.get("plan") or []),
     }
+    if final.get("gate_code"):
+        result["gate_code"] = str(final["gate_code"])
+        result["ok"] = False
     if final.get("deferred_card"):
         result["deferred_card"] = dict(final["deferred_card"])
     if final.get("error"):
@@ -1448,7 +1520,10 @@ async def stream_plan_execute(
                 if stage_id == "respond":
                     saw_respond_stage = True
                     continue
-                ok = str(step.get("status") or "") != "failed"
+                ok = (
+                    str(step.get("status") or "") != "failed"
+                    and not step.get("gate_code")
+                )
                 skill_name = None
                 if stage_id == "skill":
                     skill_name = _skill_display_name(
@@ -1467,7 +1542,8 @@ async def stream_plan_execute(
                     for stage_item in iter_stage_leave("plan", ok=True):
                         yield stage_item
                     plan_left = True
-                if not saw_respond_stage:
+                # Gate 拒展：不得补报「整理回答」成功阶段（无 respond 执行）
+                if not saw_respond_stage and not final_state.get("gate_code"):
                     for stage_item in iter_stage_enter("respond"):
                         yield stage_item
                     agg_ok = not bool(final_state.get("error"))

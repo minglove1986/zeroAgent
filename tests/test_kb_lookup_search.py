@@ -111,6 +111,25 @@ async def test_run_kb_lookup_returns_citations(client_and_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_kb_lookup_observability_fields_and_trace(
+    client_and_factory, caplog
+) -> None:
+    """lookup 返回 degrade_level/reason_codes/used_milvus，并输出 scope_resolved trace。"""
+    _client, factory = client_and_factory
+    await _seed_travel_kb(factory)
+    with caplog.at_level("DEBUG"):
+        async with factory() as db:
+            result = await run_kb_lookup(
+                db, query="差旅 市内交通 发票", top_k=3, is_platform_admin=True
+            )
+    assert isinstance(result["degrade_level"], str)
+    assert isinstance(result["reason_codes"], list)
+    assert isinstance(result["used_milvus"], bool)
+    lines = [r.getMessage() for r in caplog.records if "scope_resolved" in r.getMessage()]
+    assert lines and "node=kb_lookup" in lines[0] and "degrade_level=" in lines[0]
+
+
+@pytest.mark.asyncio
 async def test_execute_kb_lookup_async(client_and_factory) -> None:
     _client, factory = client_and_factory
     await _seed_travel_kb(factory)
@@ -141,7 +160,7 @@ async def test_rag_without_citation_rejects(client_and_factory) -> None:
     names = [n for n, _ in events]
     assert "citation" not in names
     end = next(p for n, p in events if n == "message_end")
-    assert end["status"] == "rejected_no_citation"
+    assert end["status"] in ("rejected_no_recall", "rejected_no_citation")
 
 
 @pytest.mark.asyncio

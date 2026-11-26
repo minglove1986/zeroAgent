@@ -56,7 +56,9 @@ async def stream_chat_completion(
     @date 2026-08-03 11:21:06
     """
     settings = get_settings()
-    use_model = model or settings.litellm_model
+    from app.modules.llm.model_resolve import resolve_chat_model_name
+
+    use_model = resolve_chat_model_name(model)
     logger.info("llm.stream_chat model=%s via=langchain", use_model)
 
     if settings.mock_external:
@@ -150,14 +152,15 @@ async def stream_chat_completion_with_fallback(
 
     yield: (chunk, meta) meta.event = delta | model_used | usage
     """
-    settings = get_settings()
+    from app.modules.llm.model_resolve import resolve_chat_model_name
+
     chain: list[str] = []
     for m in models or []:
         name = (m or "").strip()
         if name and name not in chain:
             chain.append(name)
     if not chain:
-        chain = [settings.litellm_model]
+        chain = [resolve_chat_model_name(None)]
 
     last_err: Exception | None = None
     for use_model in chain:
@@ -199,7 +202,9 @@ async def chat_completion_with_tools(
     @date 2026-08-03 11:21:06
     """
     settings = get_settings()
-    use_model = model or settings.litellm_model
+    from app.modules.llm.model_resolve import resolve_chat_model_name
+
+    use_model = resolve_chat_model_name(model)
     logger.info("llm.chat_with_tools model=%s via=langchain", use_model)
     tool_names = {
         (t.get("function") or {}).get("name")
@@ -398,7 +403,9 @@ async def chat_completion_json(
     @date 2026-08-03 11:21:06
     """
     settings = get_settings()
-    use_model = model or settings.litellm_model
+    from app.modules.llm.model_resolve import resolve_chat_model_name
+
+    use_model = resolve_chat_model_name(model)
     logger.info("llm.chat_json model=%s via=langchain", use_model)
 
     if settings.mock_external:

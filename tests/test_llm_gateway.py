@@ -110,28 +110,44 @@ async def test_gateway_chat_json_delegates(
 
 
 @pytest.mark.asyncio
-async def test_gateway_resolve_defaults_to_settings_model(
+async def test_gateway_resolve_uses_system_default_not_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """无会话选模时 resolve 回落到 LITELLM_MODEL（骨架阶段）。"""
-    monkeypatch.setenv("MOCK_EXTERNAL", "true")
+    """无会话选模时 resolve 用治理系统默认，不回落 LITELLM_MODEL。"""
+    monkeypatch.setenv("MOCK_EXTERNAL", "false")
     monkeypatch.setenv("LITELLM_MODEL", "default-model-x")
     get_settings.cache_clear()
-
+    from app.modules.llm import models_cache
     from app.modules.llm.gateway import LlmGateway
 
+    models_cache.set_models_catalog_fallback(
+        {
+            "system_default": "spark-x2.6",
+            "models": [
+                {
+                    "model_name": "spark-x2.6",
+                    "display_name": "spark",
+                    "enabled": True,
+                    "allow_system_chat": True,
+                    "is_system_default": True,
+                    "source_status": "active",
+                }
+            ],
+        }
+    )
     gw = LlmGateway()
     conv = SimpleNamespace(agent_id=None, selected_model=None)
     resolved = await gw.resolve_for_conversation(db=None, conversation=conv)
-    assert resolved.model_name == "default-model-x"
+    assert resolved.model_name == "spark-x2.6"
     assert resolved.fallback_models == []
+    models_cache.reset_models_catalog_for_tests()
     get_settings.cache_clear()
 
 
-def test_gateway_list_available_returns_default(
+def test_gateway_list_available_empty_without_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """无目录缓存时 list_available 至少返回全局默认模型。"""
+    """无目录缓存时 list_available 返回空，禁止伪造 LITELLM_MODEL。"""
     monkeypatch.setenv("MOCK_EXTERNAL", "true")
     monkeypatch.setenv("LITELLM_MODEL", "default-model-y")
     get_settings.cache_clear()
@@ -143,8 +159,7 @@ def test_gateway_list_available_returns_default(
 
     gw = LlmGateway()
     items = gw.list_available_from_cache(agent_id=None)
-    assert len(items) >= 1
-    assert items[0].model_name == "default-model-y"
+    assert items == []
     get_settings.cache_clear()
 
 

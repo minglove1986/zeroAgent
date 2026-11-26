@@ -21,12 +21,14 @@ from app.modules.llm.catalog_models import LlmModel, LlmModelAgentBinding
 from app.models.conversation import Conversation, Message, MessageCard, MessageFeedback
 from app.models.department import Department, UserDepartment
 from app.models.intent_l2 import IntentL2Keyword
+from app.models.kb_focus_term import KbFocusTerm
 from app.models.knowledge import (
     DocCategory,
     Document,
     DocumentCategory,
     DocumentChunk,
     DocumentQaPair,
+    DocumentVersion,
     KbPermission,
     KnowledgeBase,
 )
@@ -51,6 +53,7 @@ __all__ = [
     "Document",
     "DocumentChunk",
     "DocumentQaPair",
+    "DocumentVersion",
     "Agent",
     "AgentSkill",
     "AgentCallableAgent",
@@ -72,6 +75,7 @@ __all__ = [
     "PromptTemplateVersion",
     "ApprovalTask",
     "IntentL2Keyword",
+    "KbFocusTerm",
     "ConfigAuditLog",
     "SystemPersonaSetting",
     "LlmModel",

@@ -19,6 +19,7 @@ from app.core.response import fail, ok
 from app.modules.admin.dependencies import require_platform_admin
 from app.modules.audit import service as audit_service
 from app.modules.llm.catalog_models import (
+    SOURCE_ACTIVE,
     SOURCE_INCOMPLETE,
     SOURCE_MISSING,
     LlmModel,
@@ -72,12 +73,14 @@ def _row_to_dict(row: LlmModel) -> dict[str, Any]:
 
 
 def _can_enable(row: LlmModel) -> str | None:
-    """校验可否启用；不可用时返回错误文案。"""
+    """校验可否启用；不可用时返回错误文案。
+
+    设计思路（2026-11-19 10:23:08）：incomplete 仅表示远端缺窗口；
+    若本库已有有效 max_input_tokens（管理员补全或历史同步），应允许启用。
+    """
     if row.source_status == SOURCE_MISSING:
         return "model missing in LiteLLM; cannot enable"
     if row.max_input_tokens is None or int(row.max_input_tokens) <= 0:
-        return "max_input_tokens required before enable"
-    if row.source_status == SOURCE_INCOMPLETE:
         return "model incomplete; fill max_input_tokens first"
     return None
 
@@ -177,7 +180,7 @@ async def patch_llm_model(
     if body.max_input_tokens is not None:
         row.max_input_tokens = int(body.max_input_tokens)
         if row.source_status == SOURCE_INCOMPLETE and row.max_input_tokens:
-            row.source_status = "active"
+            row.source_status = SOURCE_ACTIVE
     if body.max_output_tokens is not None:
         row.max_output_tokens = int(body.max_output_tokens)
     if body.allow_system_chat is not None:
@@ -207,6 +210,9 @@ async def patch_llm_model(
             if err:
                 return JSONResponse(status_code=400, content=fail(40001, err))
             row.enabled = 1
+            # 窗口已齐却仍标 incomplete（常见于同步回写）时，启用顺带升为 active
+            if row.source_status == SOURCE_INCOMPLETE:
+                row.source_status = SOURCE_ACTIVE
         else:
             row.enabled = 0
 

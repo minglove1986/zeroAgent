@@ -21,6 +21,7 @@ from app.modules.memory.service import (
     load_short_memory,
     short_key,
 )
+from app.prompts.conversation import CONTEXT_COMPRESS_SYSTEM
 
 logger = logging.getLogger(__name__)
 
@@ -183,13 +184,6 @@ def _truncate_to_tokens(text: str, max_tokens: int) -> str:
     return text[:cut].rstrip() + "…"
 
 
-_COMPRESS_SYSTEM = (
-    "你是会话摘要助手。仅根据给定的多轮对话写出简体中文要点摘要。"
-    "禁止编造未出现的事实；不要输出 JSON；不要使用 Markdown 标题。"
-    "控制篇幅，突出未完成事项、用户偏好与关键结论。"
-)
-
-
 async def compress_short_memory(
     *,
     user_id: str,
@@ -237,14 +231,19 @@ async def compress_short_memory(
 
     use_model = (settings.context_compress_model or "").strip() or None
     if not use_model:
-        use_model = settings.litellm_model
+        from app.modules.llm.model_resolve import peek_system_default_model_name
+
+        # 禁止回落 LITELLM_MODEL(MiniMax)；用模型治理系统默认
+        use_model = peek_system_default_model_name()
+    if not use_model:
+        return {"ok": False, "reason": "no_system_default_model"}
 
     from app.modules.llm.gateway import chat_json
 
     try:
         raw = await chat_json(
             messages=[
-                {"role": "system", "content": _COMPRESS_SYSTEM},
+                {"role": "system", "content": CONTEXT_COMPRESS_SYSTEM},
                 {
                     "role": "user",
                     "content": (

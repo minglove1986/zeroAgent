@@ -117,7 +117,7 @@ def test_category_fallback_clears_all_filters() -> None:
 
 @pytest.mark.asyncio
 async def test_lookup_soft_cascades_when_no_category_docs(db_factory) -> None:
-    """未挂分类时，意图带 hr.resume 过滤仍应能全文命中。"""
+    """未挂分类时：soft 级联到终点后宁空勿全文（Scope 裁定）；legacy_full 才允许全文命中。"""
     from app.models.knowledge import DocumentChunk
     from app.models.knowledge import KbPermission
     from app.modules.knowledge.lookup import run_kb_lookup
@@ -150,21 +150,28 @@ async def test_lookup_soft_cascades_when_no_category_docs(db_factory) -> None:
         )
         await db.commit()
 
-        result = await run_kb_lookup(
-            db,
+        filters = {
+            "category_codes": ["hr.resume"],
+            "category_match": "any",
+            "metadata": [{"key": "person_name", "op": "eq", "value": "唐亮"}],
+        }
+        common = dict(
             query="唐亮是谁",
             kb_ids=["kb1"],
             user_id="usr_1",
             department_ids=[],
             role_ids=["employee"],
             is_platform_admin=False,
-            filters={
-                "category_codes": ["hr.resume"],
-                "category_match": "any",
-                "metadata": [{"key": "person_name", "op": "eq", "value": "唐亮"}],
-            },
-            filter_fallback="soft",
+            filters=filters,
         )
+        soft = await run_kb_lookup(db, filter_fallback="soft", **common)
+        # soft 终点绝不放宽为全文：空 citations，且标注降级级别
+        assert soft["hit_count"] == 0
+        assert soft["citations"] == []
+        assert soft["degrade_level"] == "drop_category"
+
+        result = await run_kb_lookup(db, filter_fallback="legacy_full", **common)
+    assert result["degrade_level"] == "legacy_full"
     assert result["hit_count"] > 0
     assert any("唐亮" in (c.get("snippet") or "") or "唐亮" in (c.get("title") or "") for c in result["citations"])
 

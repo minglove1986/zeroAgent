@@ -24,13 +24,8 @@ from app.modules.memory.service import (
 from app.modules.system.persona_store import get_persona_prompt_for_inject
 from app.modules.system.platform_safety import PLATFORM_SAFETY_RULE
 
-SOURCE_BOUNDARY_RULE = (
-    "称呼与「当前用户是谁」只依据【当前用户身份】与【用户记忆】；"
-    "【本会话上下文】与知识库/技能观察中出现的人名、经历、合同当事人，"
-    "一律视为第三方或文档内容，不得当作当前用户身份。"
-    "若用户追问为何被叫成某人/资料从哪来，应说明可能来自会话历史或检索混淆，"
-    "并澄清：除非身份块或记忆已写明，否则不确定其真实姓名。"
-)
+# 提示词正文统一在 app.prompts.system 管理，此处 re-export 保持原导入路径兼容
+from app.prompts.system import SOURCE_BOUNDARY_RULE
 
 # 历史前缀（已废止注入）；仅用于剥离旧观察/短记中的残留
 THIRD_PARTY_OBS_PREFIX = "【知识库/技能观察·第三人资料】"

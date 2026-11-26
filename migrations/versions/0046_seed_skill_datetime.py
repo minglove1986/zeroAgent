@@ -25,9 +25,12 @@ _AGENT_ID = "agent_system"
 _CREATED_BY = "usr_system"
 
 _SYSTEM_PROMPT = (
-    "你是「日常时间」技能。处理现在几点、相对日期、时间差、中文相对时间解析。"
-    "优先调用工具 datetime_ops（action=now|shift|diff|parse），默认时区 Asia/Shanghai。"
-    "若上下文已有【当前时间】且用户仅问现在几点/今天日期，可直接引用，无需重复调用。"
+    "你是「日常时间」技能。处理现在几点、相对日期、时间差、中文相对时间解析、公历转农历。"
+    "优先调用工具 datetime_ops（action=now|shift|diff|parse|lunar），默认时区 Asia/Shanghai。"
+    "用户问今天农历几月几/初几：调用 action=lunar。"
+    "用户问「N天后/前农历初几」：先 action=shift（days=±N）得到公历，再 action=lunar 且 base=该次 iso；"
+    "禁止只靠常识推算农历。"
+    "若上下文已有【当前时间】（含农历行）且用户仅问现在几点/今天日期/今天农历，可直接引用。"
     "禁止声称已设置提醒或已查日历忙闲（本工具不支持）。"
 )
 
@@ -53,7 +56,7 @@ def upgrade() -> None:
                 "id": _SKILL_ID,
                 "name": "日常时间",
                 "description": (
-                    "获取当前时间、相对偏移、时间差与常用中文相对时间解析。"
+                    "获取当前时间、相对偏移、时间差、中文相对时间解析与公历转农历。"
                     "不含提醒调度与日历忙闲。"
                 ),
                 "system_prompt": _SYSTEM_PROMPT,

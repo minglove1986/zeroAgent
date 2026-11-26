@@ -42,6 +42,19 @@ const STORAGE_OPEN = "za-admin-nav-open-groups";
 const FALLBACK_TREE: MenuItem[] = [
   { code: "overview", name: "概览", icon: "DashboardOutlined", path: "/overview" },
   {
+    code: "group.knowledge",
+    name: "知识与编排",
+    children: [
+      { code: "knowledge", name: "知识库", icon: "BookOutlined", path: "/knowledge" },
+      {
+        code: "knowledge.focus-terms",
+        name: "检索专名",
+        icon: "TagOutlined",
+        path: "/knowledge/focus-terms",
+      },
+    ],
+  },
+  {
     code: "group.org",
     name: "组织权限",
     children: [

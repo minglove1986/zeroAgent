@@ -21,7 +21,7 @@
   Restart Web only.
 
 @author 赵振明
-@date 2026-07-30 17:01:38
+@date 2026-11-19 15:41:53
 #>
 [CmdletBinding()]
 param(
@@ -66,6 +66,37 @@ function Test-ProtectedProcess {
         "vmmemWSL"
     )
     return ($protected -contains $name)
+}
+
+function Stop-UvicornOrphanWorkers {
+    <#
+    .SYNOPSIS
+      清理 uvicorn --reload 留下的 multiprocessing 孤儿 worker。
+
+    .NOTES
+      父进程被杀后，spawn 子进程仍占 :8000 并继续以旧环境（如 MOCK_EXTERNAL=true）应答，
+      导致重启脚本「看起来成功」但实际仍打到旧 Mock 进程。
+      @author 赵振明
+      @date 2026-11-19 15:55:02
+    #>
+    $workers = @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -eq "python.exe" -and
+                (
+                    $_.CommandLine -match "multiprocessing\.spawn" -or
+                    $_.CommandLine -match "uvicorn app\.main:app"
+                )
+            }
+    )
+    foreach ($w in $workers) {
+        $parentAlive = $null -ne (Get-Process -Id $w.ParentProcessId -ErrorAction SilentlyContinue)
+        $isMain = $w.CommandLine -match "uvicorn app\.main:app"
+        if ($isMain -or -not $parentAlive) {
+            Write-Step "Kill uvicorn/orphan pid=$($w.ProcessId) parent=$($w.ParentProcessId)"
+            Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Stop-ListenPort {
@@ -118,6 +149,10 @@ function Stop-ListenPort {
             Write-Warning "Failed to kill PID=$procId : $($_.Exception.Message)"
         }
     }
+
+    if ($Port -eq $ApiPort) {
+        Stop-UvicornOrphanWorkers
+    }
 }
 
 function Ensure-ApiProxyTarget {
@@ -157,6 +192,52 @@ function Ensure-ApiProxyTarget {
     Write-Step "Proxy OK: $EnvLocal -> $ProxyTarget"
 }
 
+function Get-DeployEnvValue {
+    <#
+    .SYNOPSIS
+      从 deploy/.env 读取单个键；无文件或无键时返回 $null。
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Key
+    )
+
+    $deployEnv = Join-Path $RepoRoot "deploy\.env"
+    if (-not (Test-Path $deployEnv)) {
+        return $null
+    }
+    $pattern = "^\s*" + [regex]::Escape($Key) + "\s*=\s*(.+?)\s*$"
+    foreach ($line in Get-Content -LiteralPath $deployEnv) {
+        if ($line -match "^\s*#" -or [string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+        if ($line -match $pattern) {
+            return $Matches[1].Trim().Trim('"').Trim("'")
+        }
+    }
+    return $null
+}
+
+function Sync-MockExternalFromDeploy {
+    <#
+    .SYNOPSIS
+      用 deploy/.env 的 MOCK_EXTERNAL 覆盖当前进程环境，避免 Cursor/Agent 壳污染。
+
+    .NOTES
+      pydantic 优先读进程环境；Agent 会话常残留 MOCK_EXTERNAL=true，
+      会盖过 deploy/.env=false，导致 API 回显「收到：…」。
+      @author 赵振明
+      @date 2026-11-19 15:41:53
+    #>
+    $fromFile = Get-DeployEnvValue -Key "MOCK_EXTERNAL"
+    if ($null -eq $fromFile -or [string]::IsNullOrWhiteSpace($fromFile)) {
+        Write-Warning "deploy/.env missing MOCK_EXTERNAL; leave process env as-is ($($env:MOCK_EXTERNAL))"
+        return
+    }
+    $prev = $env:MOCK_EXTERNAL
+    $env:MOCK_EXTERNAL = $fromFile
+    Write-Step "MOCK_EXTERNAL: process='$prev' -> deploy/.env='$fromFile'"
+}
+
 function Start-DevWindow {
     param(
         [Parameter(Mandatory = $true)][string]$Title,
@@ -168,9 +249,12 @@ function Start-DevWindow {
         throw "WorkingDirectory missing: $WorkingDirectory"
     }
 
+    # 设计思路：子窗口继承父进程环境；显式写入 MOCK_EXTERNAL，防止 Agent 壳 true 污染。
+    $mockVal = if ($env:MOCK_EXTERNAL) { $env:MOCK_EXTERNAL } else { "false" }
     $script = @"
 Set-Location -LiteralPath '$WorkingDirectory'
 `$Host.UI.RawUI.WindowTitle = '$Title'
+`$env:MOCK_EXTERNAL = '$mockVal'
 $Command
 "@
     $bytes = [System.Text.Encoding]::Unicode.GetBytes($script)
@@ -224,6 +308,7 @@ foreach ($p in ($portsToFree | Select-Object -Unique)) {
 Start-Sleep -Seconds 1
 
 Ensure-ApiProxyTarget
+Sync-MockExternalFromDeploy
 
 if ($WithDeps) {
     $deployDir = Join-Path $RepoRoot "deploy"

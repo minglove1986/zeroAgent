@@ -139,6 +139,29 @@ class OssUploadUtil:
         self._put(object_key, data, ctype)
         return self.to_public_url(object_key)
 
+    def download(self, object_key: str) -> bytes:
+        """按 object_key 下载对象字节；不存在抛 FileNotFoundError。
+
+        @author 赵振明
+        @date 2026-11-23 17:02:48
+        """
+        if not object_key or object_key.startswith("/"):
+            raise ValueError("object_key 非法")
+        if self._use_local_fallback or self._bucket is None:
+            local = Path(".data/oss") / object_key
+            if not local.is_file():
+                raise FileNotFoundError(object_key)
+            return local.read_bytes()
+        try:
+            result = self._bucket.get_object(object_key)
+            data = result.read()
+        except Exception as exc:  # noqa: BLE001
+            # oss2 对缺失对象通常抛 NoSuchKey / OssError
+            raise FileNotFoundError(object_key) from exc
+        if data is None:
+            raise FileNotFoundError(object_key)
+        return bytes(data)
+
     def close(self) -> None:
         """释放底层客户端（oss2 Bucket 无显式 close，占位对齐 Java shutdown）。"""
         self._bucket = None

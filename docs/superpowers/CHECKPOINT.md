@@ -10,13 +10,12 @@
 
 | 项 | 值 |
 |---|---|
-| 更新时间 | 2026-09-09 15:22:34（东八区） |
-| 能力 | L2 种子去重：线索短词不入库；砍冗余金句 |
-| 改动 | `l2_seed`/`policy`；迁移 `0052`；管理端 hint；相关测 |
-| 测 | L2 相关 36 passed |
-| 下一步 | API 热更 + alembic 0052；硬刷管理端看 leave 无「请假」短词种子 |
-| 备注 | 线索仍走 `LEAVE_CLUE_PHRASES` 常量 |
-
+| 更新时间 | 2026-11-26 10:15:10（东八区） |
+| 能力 | Prompt 统一常量管理：新增 `src/app/prompts/`（system/intent/memory/conversation/agent/knowledge），16 处内联提示词已迁入并标注出处/作用 |
+| 改动 | 14 个业务模块改为导入常量；`context_blocks`/`persona_seed`/`platform_safety` 保留 re-export 兼容旧路径；文本逐字符不变 |
+| 测 | 新增 `tests/test_prompts_constants.py`（re-export、拼装、花括号安全、禁止内联「你是」）4 passed；相关集合存量失败见备注 |
+| 下一步 | 后续新增 prompt 一律进 `app/prompts` 并更新其 `__init__` 索引表；部署需 `deploy-update` 后验证 |
+| 备注 | 存量失败（与本次无关）：test_system_persona 试聊 fake_llm 缺 model 参数、test_context_source_boundary rag 解包、test_doc_analyze_graph×2、test_kb_metadata_filter_p2、test_user_memory×2、test_context_compress 模型默认值；未迁移：段落标题标签（【系统人格】等）、`# 技能指令`/`# 用户记忆` 标题、DB 内用户可配 prompt |
 ### 新会话开场（复制）
 
 ```text
@@ -79,6 +78,99 @@ $env:PYTHONPATH = "src"
 ---
 
 ## 断点日志（只追加）
+
+### 2026-11-26 10:15:10
+- 新增 `src/app/prompts/` 统一管理代码内置 prompt（`__init__` 含索引表与新增流程；每个常量标注出处/作用/输出约束）。
+- 迁移：意图 L3、记忆抽取头、KB 答复/问句改写/短记忆压缩/系统助手前导、Planner 头与规则、respond 前导、汇总头、KB 元数据/父块摘要/评测问答/切块清洗/整篇文档分析（含 user 模板）、平台安全/来源边界/默认人格。
+- 与 HEAD 对照 8 项文本一致；`generate_qa` 的 HEAD 为旧版，迁移的是工作区（用户未提交）新版。
+- 未迁移（有意）：段落标题标签、技能/记忆块标题、DB 用户可配 prompt（prompt_templates / skills.system_prompt / 系统人格）。
+- **下一刀**：修存量失败测试，或用户另指。
+
+### 2026-11-25 10:44:24
+- `deploy-update.ps1` 完成：备份 `backup-20261125-103346`；重建并滚动重启 beat/worker/api/admin_web/web。
+- 验收：API/Admin 就绪；`GET .../file` PDF 冒烟通过。
+- **下一刀**：管理端文档详情点「预览原始文件」。
+
+### 2026-11-25 10:26:45
+- 管理端文档详情「预览原始文件」：`GET .../file` + status 预览元信息；Drawer 内 PDF/图/文本/MD（源码|渲染）；docx/xlsx 下载。
+- admin-web 依赖 `react-markdown` + `remark-gfm`；API v0.9.13。
+- **下一刀**：用户点预览验收；正式环境需热更/重建 API 镜像。
+
+### 2026-11-25 10:13:58
+- 接入 Metadata LLM 补空（C4）：`metadata_llm.extract_document_metadata`；规则非空优先，LiteLLM 只补空；失败保留规则。
+- ingest + `POST .../metadata/refill`（`use_llm`/`force_llm`）已接线；配置 `kb_metadata_llm_enabled/max_chars`；API v0.9.12。
+- 单测 12 passed；实文档 force_llm refill：`llm_used=true` / `rule+llm` / person=高扬。
+- **下一刀**：管理端「重抽」勾选 LLM；新入库自动补空。
+
+### 2026-11-25 09:43:28
+- 用户指出「写死技术词表」无抽象：已改为 `CoreMetadata` 通用对象 + 标签/列表/标识符常识抽取，去掉 Vue 白名单。
+- 新增 `POST .../metadata/refill`；该简历 refill 后 person=高扬，keywords 为标识符向。
+- **下一刀**：用户刷新面板；可选管理端按钮接 refill。
+
+### 2026-11-25 09:34:32
+- 简历 Metadata 人名空、关键词碎片：规则只认「姓名：」/首行；关键词对中文散文乱切。
+- 已增强标题/独立成行人名 + 技术词表；该文档重抽 person_name=高扬 并 reembed 13 块。
+- **下一刀**：用户刷新 Metadata 面板验收。
+
+### 2026-11-25 09:28:30
+- 父块摘要卡在「已提交后台队列 0/4」：任务已入 Celery，Worker 因全局 async engine 跨多次 `asyncio.run` 绑旧事件循环崩溃。
+- 已修 `async_bridge` dispose；重试耗尽写 failed 进度；重投 `doc_bd6caaa249e04126` → 4/4 done、4 条摘要已嵌入。
+- **下一刀**：用户刷新文档页；正式环境 rebuild worker。
+
+### 2026-11-24 17:27:44
+- 用户反馈确认卡后仍 D14：根因是专名 `project_name==好友买` 硬过滤，切块/Milvus 标量为空 → ANN 权威零命中。
+- 已修：`scope` 专名先按标题收成 `document_id in`；入索引标题∩词典推断 `project_name`；好友买两文档 meta+reembed。
+- **实测**：HTTP `.tmp_e2e_chat.py` PASS，cites=4，无确认卡；相关单测 36 passed。
+- **下一刀**：用户新开对话再问「对于好友买你了解多少」。
+
+### 2026-11-24 17:07:30
+- 亲测拒展「未召回」：Milvus 无 `za_kb_chunks_v3`（向量仍在 v2），且集合缺失被当成权威零命中。
+- 已 reembed 好友买两文档至 v3；修复 search 对 None/[] 语义；系统助手绑 KB+文档理解。探针 5 hits。
+- **下一刀**：用户再问「关于好友买，你了解多少」验收。
+
+### 2026-11-24 16:57:01
+- LiteLLM 宿主连不上 + 对话报「尚未配置系统对话可用模型」：容器长期 unhealthy（healthcheck 用了镜像没有的 wget）；spark 被标 `missing_in_litellm` 且全部 enabled=0。
+- 已重建 litellm、改 healthcheck、同步并启用 spark-x2.6（系统默认）+ MiniMax-M3，绑定系统/测试 Agent。
+- **下一刀**：用户刷新对话验证；继续亲测好友买检索。
+
+### 2026-11-24 16:49:54
+- 亲测前置：关 mock、种子 Agent `agt_haoyoumai_kb_test`（好友买 KB + 文档理解）、compose 容器 Embed 改服务名；api/worker/beat 已 recreate。
+- 根因：进程环境 `MOCK_EXTERNAL=true` 覆盖 compose `${MOCK_EXTERNAL}`；系统对话无 KB → 无法测检索。
+- **下一刀**：Web 选「好友买知识助手」亲测；根据结果再排 Phase A 缺陷或 Phase B。
+
+### 2026-11-24 14:56:35
+- Spec 二次自检修订：visibility 按 §8.2 三态；category/keywords CSV 禁假等值；Gate 只判空证据；拒展禁无限 replan。
+- Phase A 计划：`docs/superpowers/plans/2026-11-24-kb-retrieval-architecture-phase-a.md`（7 Task）。
+- **下一刀**：用户选 subagent-driven 或 inline 执行。
+
+### 2026-11-24 14:52:25
+- 检索架构自我反思定稿：方案 1（A 契约闭环 → B 闸门 → C 稳定）；Metadata 增强并进 A（分槽/分类下推/keywords 加权）。
+- Spec：`docs/superpowers/specs/2026-11-24-kb-retrieval-architecture-design.md`。
+- **下一刀**：用户审定 spec 后 writing-plans（Phase A）。
+
+### 2026-11-23 16:35:26
+- 检索主路径改为向量主召回→SQL 回表→候选 BM25；切块核心 metadata（迁移 0061）同步 Milvus v3 标量；管理端可编辑/同步/回填；单测 9 passed；API v0.9.10。
+
+### 2026-11-19 10:23:08
+- 启用 `spark-x2.6` 返回 40001「fill max_input_tokens」：实际已有窗口 1000000，但 `source_status=incomplete`（sync 远端无窗口会回写）。修启用校验 + sync 保留本库窗口；LiteLLM config 补 `max_input_tokens`；单测 9 passed，模型已启用。
+
+### 2026-11-19 09:59:21
+- 管理端 `/api/v1/auth/login` 间歇 500：根因 SQLAlchemy+aiomysql `pool_pre_ping` 探活 `ping()` 缺 `reconnect` 抛 TypeError；改 `pool_pre_ping=False` + `pool_recycle=3600`；压测 login/me/3001 代理通过。
+
+### 2026-11-19 09:41:05
+- LiteLLM 接入讯飞 MaaS：模型 `spark-x2.6`（OpenAI 兼容 `api_base=…/v2`），密钥走 `XFYUN_API_KEY` 环境变量；容器已重建，代理调用成功。勿在文档写入密钥明文。
+
+### 2026-11-19 09:35:42
+- 修复 `skill_react.py`：`from __future__ import annotations` 前误插了 `BaseMessage` 导入导致 SyntaxError；删除重复导入后 `create_app` 可正常导入，并冒烟验证 runtime 的 request_id 贯通。
+
+### 2026-11-19 09:34:17
+- 修复 request_id 未贯通：中间件写入 `request.state` + ContextVar；`ok/fail` 与审计同值；响应头 `X-Request-Id`；`tests/core/test_request_id.py` 7 passed。另发现既有 `skill_react.py` `__future__` 语法错误阻塞 create_app 导入（未在本次修复范围内）。
+
+### 2026-11-18 08:56:15
+- Web 接口与 `API接口规范.md`(v0.8.5) 匹配性核实（无代码改动）：基础对话/知识库/审批/系统人格/L2关键词/LLM治理等已落地且路径一致；**/tools、/kg/*、/providers 三大模块文档要求但代码未实现**；Agent publish/rollback/archive/copy、技能 rollback/test、文档 confirm-upload/batch-import、/auth/refresh-token、/users/batch-enable、/system-config/webhooks、/api-keys、/usage/user/export 等缺失；change-password（实为 POST /users/me/password）与 conversations/messages 路径不一致；已实现但文档未记录：会话管理、联网搜索、LiteLLM 用量、记忆抽取开关、切块/QA/命中测试等。下一步待用户裁定补齐或修订文档。
+
+### 2026-09-09 16:11:39
+- L2 门槛+澄清 P0–P2：`apply_gates` / `doc_pick` / 弱查库 / 试跑门槛字段；相关测 90 passed
 
 ### 2026-09-09 15:22:34
 - L2 种子去重：线索短词（请假/年假…）改常量不入库；去掉提交/办理请假、请两/三天假、我没让你总结/概括。
@@ -1020,3 +1112,186 @@ $env:PYTHONPATH = "src"
 - 根因2：`/spend/logs?summarize=true` 返回 `models: {name: spend}`，flatten 未识别 → 空表。
 - 修：`LITELLM_UI_BASE_URL` + flatten 顶层 models；测 7 passed。
 - **下一刀**：rebuild/restart api 后手验用量与控制台链接。
+
+### 2026-11-19 10:52:35
+- 农历：`datetime_ops` 增 `action=lunar`（`zhdate`）；上下文【当前时间】附农历行；技能提示词 + 迁移 `0053`。
+- 测：datetime/context/persona **35 passed**；本机 DB 已 upgrade。
+- **下一刀**：重启 API 手验「今天农历初几」；第二项空答案兜底 UX。
+
+### 2026-11-19 11:33:13
+- Query Rewrite：Spec `2026-11-19-query-rewrite-design.md` + Plan `2026-11-19-query-rewrite.md`。
+- 插入点：`intent_node` 漏斗前；门控后 LLM；有效句进下游，原句进短记忆。
+- **下一刀**：按计划 Task1 纯函数单测起步；空答案兜底另开。
+
+### 2026-11-19 14:30:22
+- Query Rewrite 落地：L0 规则优先；漏斗低置信/澄清/回落可二次改写一次；handoff 用有效句。
+- 测：`test_query_rewrite` 等 **24 passed**。
+- **下一刀**：手验追问农历；空答案兜底另开。
+
+### 2026-11-19 15:03:04
+- 修复「是吗？那十天后是初几」：L0 扩 anaphora/相对追问/主题追问；技能 shift→lunar；`0054_dt_rel_lunar_prompt`。
+- 测：`test_query_rewrite` **11 passed**；API 已重启。
+- **下一刀**：同会话手验三连问；空答案兜底另开。
+
+### 2026-11-19 15:13:39
+- 「农历」再进 KB：改写调 MiniMax 402 余额不足，回退原句后被漏斗打成 kb_lookup。
+- 修：确定性 `_rule_rewrite` 优先于 LLM；API 已重启；测 11 passed。
+- **下一刀**：手验今天是多少号→农历。
+
+### 2026-11-19 15:25:48
+- 改写/Intent：`resolve_turn_llm_model` 用会话所选或系统默认；无模型不调 `get_chat_model`（禁 MiniMax 回落）。
+- 测：13 passed；API 已重启。
+- **下一刀**：手验选中模型后追问农历。
+
+### 2026-11-19 15:42:30
+- 「今天几号」回「收到：…」：非模型解析逻辑坏，是重启时 Agent 壳 `MOCK_EXTERNAL=true` 盖过 deploy/.env。
+- 修：`restart-dev.ps1` 同步并注入子窗口；API 已 false 重启。
+- **下一刀**：手验今天几号。
+
+### 2026-11-19 15:55:02
+- 再验仍 Mock：多个 `--reload` 孤儿 worker 占 :8000，runtime 一直 true；改写把上轮「收到：」拼进问句。
+- 修：杀掉孤儿 + `Stop-UvicornOrphanWorkers`；runtime 已 `false`。
+- **下一刀**：新会话测今天几号。
+
+### 2026-11-20 13:50:52
+- 产品裁定：SSE 断链要 **方案 A 服务端缓冲续播**；本期不实现，仅预留。
+- 文档：`docs/superpowers/specs/2026-11-20-sse-resume-buffer-design.md`。
+- **下一刀**：主线照旧；续播开工前先拍 TTL/断联是否继续烧 LLM/Abort 语义。
+
+### 2026-11-20 14:22:56
+- 裁定：管理端 B3 + 切块 C2 + docx/xlsx + LlamaIndex 父子 + 版本；员工端知识库下线；优先开源。
+- 波次 0：admin 知识库路由骨架；`0055_kb_admin_submenus`；员工端导航移除 + 下线页。
+- 文档：`specs/2026-11-20-admin-kb-maintenance-design.md`、`plans/2026-11-20-admin-kb-maintenance.md`。
+- **下一刀**：波次 1 接 KB/文档/权限/分类 API。
+
+### 2026-11-20 14:27:01
+- 波次 1：admin KB 列表/新建/详情上传发布/权限编辑/分类只读列表已接现有 API。
+- **下一刀**：波次 2 切块台 + C2 结构操作 API。
+
+### 2026-11-20 14:38:34
+- 波次 2–5：C2 API+切块台；docx/xlsx；父子分块（LlamaIndex/native）；版本表与 API；API 文档已补。
+- 测：相关套件 **33 passed**；迁移至 `0057_document_versions`。
+- **下一刀**：管理端登录手验上传→切块 C2→确认→QA→发布；可选分类 CRUD。
+
+### 2026-11-20 14:55:51
+- 分类 CRUD：`ensure_seed_categories` 改为只补缺不覆盖；service 创建/更新/启停/删除（引用保护）；API `GET?include_disabled` + POST/PATCH/DELETE；管理端树形页。
+- 测：`test_doc_category_crud` + `test_doc_categories_p1` **8 passed**；API 规范已补。
+- **下一刀**：手验 `/knowledge/categories`；审计/缓存页后置。
+
+### 2026-11-20 15:07:22
+- 文档补齐：`API接口规范` → **v0.9.1**（分类字段/错误码/版本日志）；`数据库表结构` 补 `doc_categories`/`document_categories` DDL；知识库 PRD G8→🟢 已实现。
+- **下一刀**：手验分类页；审计/缓存后置。
+
+### 2026-11-20 15:32:30
+- KB 详情：列表区改为搜索；「上传文档」弹「入库内容」；分类一级→二级联动（叶子根可直接挂）。
+- **下一刀**：手验入库弹窗；审计/缓存后置。
+
+### 2026-11-20 15:40:00
+- 入库卡住：本机无 Celery；队列积压 14；拉起 worker 后旧文档入队成功；新文档 Celery 侧 aiomysql/event-loop 噪音失败，手动补跑成功。
+- 两文档均 `pending_review`（42 / 90 切块）。
+- **下一刀**：日常用 `restart-dev.ps1 -WithCelery`；可后置修 worker 会话关闭噪音。
+
+### 2026-11-20 16:06:00
+- 上传切块模式：智能/粗/均衡/细/自定义；按字数推荐并估算父/子块数；`documents.chunk_config_json`；默认子块 200→500。
+- API v0.9.2；测 6 passed。
+- **下一刀**：手验新上传粒度；Celery 需在跑。
+
+### 2026-11-20 16:24:20
+- P1 父块摘要：`document_chunks.summary`；confirm 时 LLM/抽取式生成；向量双写子块+父摘要；检索并集按父系去重；切块台展示摘要。
+- API v0.9.3；测 20 passed；迁移 `0059`。
+- **下一刀**：手验确认后摘要；已发布旧文档打回再确认。
+
+### 2026-11-20 16:31:46
+- 文档详情切块台增加「重新切块」：可选 auto/粗/均衡/细/自定义；`POST /documents/{id}/rechunk` 默认同步重跑 ingest。
+- published/ready 会进入 pending_review；软删拒绝；`test_rechunk` 3 passed；API v0.9.4。
+- **下一刀**：手验重新切块→确认→发布。
+
+### 2026-11-20 16:36:12
+- 父块摘要展示加强：父块卡片顶部常显「检索摘要」字段；工具栏「已摘要 x/y」；折叠标题「摘要未生成/已摘要」。
+- 库内现有父块 summary 均为空（待审未确认）；确认后才会写入。
+- **下一刀**：对待审文档点「确认切块」验摘要出现。
+
+### 2026-11-20 16:41:28
+- 确认切块遇 MiniMax `insufficient_balance`：摘要 LLM 熔断并回落抽取式，确认不再被拖死。
+- 测 5 passed。需重启本机/容器 API 后重试确认。
+- **下一刀**：充值 MiniMax 后可得 LLM 摘要；否则抽取式摘要可用。
+
+### 2026-11-20 16:49:13
+- 根因：`chat_json`/`get_chat_model` 在 `model=None` 时静默回落 `LITELLM_MODEL=MiniMax-M3`（治理中未启用）。
+- 现库系统默认 `spark-x2.6`；已改为一律走模型治理；清掉 client/gateway/chain/摘要/QA/清理/压缩/试聊等同路径。
+- 测 22 passed。**下一刀**：重启 API 后确认切块验模型名。
+
+### 2026-11-20 17:01:54
+- 确认 500：直调约 150s 成功，前端代理先超时；根因是串行 LLM 摘要过慢。
+- 改为并行（≤4）+ 单条 12s 超时回落抽取式；已重启 API；milvus 已 up；样例文档已 ready。
+- **下一刀**：刷新详情看摘要；新确认应更快返回。
+
+### 2026-11-20 17:07:03
+- 按产品要求取消抽取式：confirm 同步只嵌子块→ready；父块摘要 Celery 异步 LLM（系统默认模型）。
+- 失败重试不回落抽取式；UI 轮询「后台生成中」。测 6 passed。
+- **下一刀**：手验确认后摘要异步出现。
+
+### 2026-11-20 17:14:26
+- 摘要未成功：旧 Celery 未加载新任务；已改为 API BackgroundTasks 稳跑 LLM；样例摘要已写入。
+- 管理端 `SystemNotifyProvider`：右上角深色卡片 + WebAudio 提示音；切块台静默轮询，完成后系统通知。
+- **下一刀**：刷新管理端；可打回再确认验通知。
+
+### 2026-11-20 17:25:11
+- 父块摘要进度：`parent_summary_progress`（Redis/内存）+ 逐条生成回写 done/total；API `GET .../parent-summary-progress`、`POST .../parent-summary/run`。
+- 切块台 Progress 条展示「已处理 x / 共 y」；轮询 progress 接口，仅 done 变化时静默刷新切块，避免整页闪烁。
+- API 规范 v0.9.6。**下一刀**：刷新管理端 → 点「生成摘要」看进度。
+
+### 2026-11-20 17:30:08
+- 样例 `doc_ea08…` 已生成 3/3 摘要并嵌入；进度 status=done。
+- 根因：模型治理中系统默认 `spark-x2.6` 等均为 enabled=0，已重新启用。
+- **下一刀**：刷新管理端切块台验摘要展示与进度条。
+
+### 2026-11-23 09:30:02
+- 提高命中：生成 QA 后强制 hint 对齐原文（去反引号/改写）；命中测试用语料=子块+父摘要，TopK=8。
+- 页面：问答表增加「命中」列与原因、Top 召回预览；status 带回 `last_hit_test`。
+- 样例文档重生后 5/5、hit_rate=1.0。测 12 passed。**下一刀**：刷新详情页发布。
+
+### 2026-11-23 10:29:44
+- 文档详情 UX：顶部发布条件清单 + Steps；四 Tab（切块/质量评测/发布/版本）。
+- `POST .../hit-test/one`：未保存可测本条，不改总 hit_rate；行内「测本条」按钮。
+- 测 8 passed。**下一刀**：刷新管理端验布局。
+
+### 2026-11-23 11:08:17
+- `doc_944a…` 父摘要卡在「排队生成中」：确认后 BackgroundTasks 未跑；已手动补跑 6/6。
+- 入队改为优先 Celery，失败再退 BackgroundTasks。**下一刀**：刷新页面看摘要。
+
+### 2026-11-23 14:52:08
+- 检索低分丢弃：`drop_low_score_hits`（相对 top1 + 可选绝对下限）接入 `search_kb_chunks`。
+- 配置：`KB_HIT_SCORE_RELATIVE_MIN` 默认 0.55；`KB_HIT_SCORE_ABSOLUTE_MIN` 默认 0。
+- 测：`tests/test_kb_score_gate.py` + `test_kb_search` 11 passed；顺手修正 rerank 单测对 `_bm25_rank_ids_from_scores` 的 patch。
+- **下一刀**：重启 API 用「关于好友买项目你知道多少」看 citation 是否少简历；再议专名硬过滤。
+
+### 2026-11-23 15:05:33
+- 仅低分不够（简历 RRF 贴近 top1）；补项目专名硬过滤。
+- `extract_focus_terms`：识别「好友买项目」→ 焦点词「好友买」；`filter_chunks_by_focus_docs` 支持标题匹配。
+- 测 16 passed；`deploy-update -SkipFrontends` 已重启。**下一刀**：复测「搜索下好友买项目的文档」。
+
+### 2026-11-23 15:23:50
+- 检索专名词典完整能力：`kb_focus_terms` + `/api/v1/knowledge/focus-terms` CRUD/reload/test/sync-from-titles。
+- 管理端 `/knowledge/focus-terms`；菜单 `knowledge.focus-terms`；命中规范名/别名后硬过滤。
+- 测 13 passed；API/库表文档 v0.9.9。**下一刀**：迁移部署后录入「好友买」。
+
+### 2026-11-24 15:50:00
+- 生成系统拓扑图/架构图（draw.io）：`docs/02-架构设计/zeroagent-topology.drawio`、`zeroagent-architecture.drawio`，同步渲染 PNG。
+- 新增校验：`scripts/validate_drawio.py`（XML 结构/引用完整性，TDD 先坏样例后实现）、`scripts/check_layout.py`（盒子重叠/越界/文字溢出几何检查）。
+- 生成器：`scripts/gen_topology_drawio.py` / `gen_architecture_drawio.py` + `drawio_common.py`（内嵌源码盘点：31 路由 / 19 模型 / 20 模块 / 15 compose 服务）。
+- 本机无 draw.io CLI，已用 winget 装 draw.io 桌面 32.7.4 完成无头 PNG 渲染；备份至 `.backup/`。
+- **下一刀**：KB 检索 Phase A 计划（见 14:56 断点），或用户另指。
+
+### 2026-11-24 16:27:45
+- KB 检索 Phase A Task 7：lookup 返回补 `used_milvus`（search_kb_chunks 增 `diag` 出参）；`turn_trace` 新增 `scope_resolved`（run_kb_lookup）/ `gate_rejected`（kb_lookup handler + plan_execute rag 闸门与异常分支）。
+- spec 状态 → Phase A 已实现；plan 勾选 Task 1–7（T4S4/T5S3/T6S4 未勾，原因见当前断点备注）。
+- 测：knowledge+rag 聚焦集 113 passed；存量失败 test_kb_search×4、rag SSE×4（模型目录为空）、langgraph_flag×1。**下一刀**：修存量测试后进 Phase B。
+
+### 2026-11-24 16:45:00
+- 拓扑图/架构图布局重构：用户反馈"两张图很杂乱，内容与线重叠"。根因：跨多层边过多，正交路由自动绕行穿过盒子。
+- 策略：层高含标签空间（标签24 + 上边距30 + 盒子 + 下边距30），盒子距层边 ≥30px，层间留 40px 走线间隙；边用 `<Array as="points">` 显式路径点精确绕开盒子；边数精简（拓扑 15→8、架构 23→12），非核心连接改为盒子内文字标注。
+- `drawio_common.py` edge() 升级：新增 `points`/`src_pt`/`dst_pt` 参数输出显式路径点。
+- `check_layout.py` 升级：新增边路径穿越检测（sourcePoint→Array points→targetPoint 是否穿越非端点节点盒子），并跳过 `_lbl` 标签节点（非物理元素）。
+- 校验结果：结构校验 + 布局检查（重叠/越界/溢出/穿越）双图全绿；draw.io 桌面 32.7.4 无头渲染 PNG 成功。
+- **下一刀**：KB 检索 Phase A 存量测试修复（见 16:27 断点），或用户另指。

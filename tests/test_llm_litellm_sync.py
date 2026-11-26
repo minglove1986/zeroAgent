@@ -81,6 +81,50 @@ async def test_sync_incomplete_when_missing_max_input(
 
 
 @pytest.mark.asyncio
+async def test_sync_preserves_admin_filled_window_when_remote_incomplete(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """远端仍缺窗口时，不得把管理员已补全的 max_input_tokens 打回 incomplete。
+
+    @author 赵振明
+    @date 2026-11-19 10:23:08
+    """
+    from app.modules.llm import litellm_sync as sync_mod
+
+    db_session.add(
+        LlmModel(
+            id="llm_admin_filled",
+            model_name="m-admin-filled",
+            display_name="m-admin-filled",
+            max_input_tokens=1_000_000,
+            enabled=1,
+            source_status=SOURCE_ACTIVE,
+            revision=2,
+        )
+    )
+    await db_session.commit()
+
+    async def fake_fetch():
+        return [_remote("m-admin-filled", max_input=None)]
+
+    monkeypatch.setattr(sync_mod, "fetch_litellm_remote_models", fake_fetch)
+    monkeypatch.setenv("MOCK_EXTERNAL", "false")
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+
+    result = await sync_mod.sync_llm_models_from_litellm(db_session)
+    assert result["incomplete"] == 0
+
+    row = await db_session.get(LlmModel, "llm_admin_filled")
+    assert row is not None
+    assert row.max_input_tokens == 1_000_000
+    assert row.source_status == SOURCE_ACTIVE
+    assert row.enabled == 1
+    get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
 async def test_sync_marks_missing_in_litellm(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -25,6 +25,7 @@ celery_app = Celery(
         "app.workers.tasks.compress_context",
         "app.workers.tasks.expire_approvals",
         "app.workers.tasks.process_message_feedback",
+        "app.workers.tasks.parent_summary",
     ],
 )
 

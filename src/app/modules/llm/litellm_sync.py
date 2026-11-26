@@ -278,12 +278,18 @@ async def sync_llm_models_from_litellm(db: AsyncSession) -> dict[str, Any]:
             row.source_status = SOURCE_ACTIVE
             row.enabled = was_enabled  # 管理员关闭保持关闭
         else:
-            # 远端缺窗口：标记 incomplete，强制不可用
-            if max_in is None:
-                pass
-            row.source_status = SOURCE_INCOMPLETE
-            row.enabled = 0
-            counts["incomplete"] += 1
+            # 远端缺窗口：若本库已有管理员补全的有效窗口，保留 active/启停，勿打回 incomplete
+            # （2026-11-19 10:23:08：避免「补窗口→同步→又 incomplete→无法启用」循环）
+            local_ok = (
+                row.max_input_tokens is not None and int(row.max_input_tokens) > 0
+            )
+            if local_ok:
+                row.source_status = SOURCE_ACTIVE
+                row.enabled = was_enabled
+            else:
+                row.source_status = SOURCE_INCOMPLETE
+                row.enabled = 0
+                counts["incomplete"] += 1
         row.supports_reasoning = supports_reasoning
         row.litellm_raw_json = raw_json
         row.revision = int(row.revision or 1) + 1

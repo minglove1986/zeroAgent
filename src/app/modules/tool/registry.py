@@ -108,9 +108,9 @@ _BUILTIN: dict[str, dict[str, Any]] = {
         "function": {
             "name": DATETIME_OPS,
             "description": (
-                "日常时间工具：获取当前时间、相对偏移、时间差、中文相对时间解析。"
-                "action=now|shift|diff|parse；默认时区 Asia/Shanghai。"
-                "问「现在几点」时可优先依据上下文【当前时间】；需精确计算时调用本工具。"
+                "日常时间工具：获取当前时间、相对偏移、时间差、中文相对时间解析、公历转农历。"
+                "action=now|shift|diff|parse|lunar；默认时区 Asia/Shanghai。"
+                "问「现在几点」时可优先依据上下文【当前时间】；问农历初几/几月几用 action=lunar。"
                 "不做提醒落库、不做日历忙闲。"
             ),
             "parameters": {
@@ -118,7 +118,7 @@ _BUILTIN: dict[str, dict[str, Any]] = {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["now", "shift", "diff", "parse"],
+                        "enum": ["now", "shift", "diff", "parse", "lunar"],
                     },
                     "timezone": {
                         "type": "string",
@@ -128,7 +128,10 @@ _BUILTIN: dict[str, dict[str, Any]] = {
                         "type": "string",
                         "enum": ["iso", "date", "time", "full"],
                     },
-                    "base": {"type": "string", "description": "基准 ISO 时间；缺省当前"},
+                    "base": {
+                        "type": "string",
+                        "description": "基准 ISO 时间；缺省当前（lunar/shift/parse 可用）",
+                    },
                     "years": {"type": "integer"},
                     "months": {"type": "integer"},
                     "days": {"type": "integer"},

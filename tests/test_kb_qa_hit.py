@@ -176,6 +176,47 @@ async def test_hit_test_writes_rate(db_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_hit_test_one_does_not_change_hit_rate(db_factory) -> None:
+    """单条测可用未入库问答，且不改写 documents.hit_rate。"""
+    async with db_factory() as db:
+        await _seed_ready_doc(db)
+        doc = await db.get(Document, "doc_1")
+        assert doc is not None
+        doc.hit_rate = Decimal("0.6000")
+        await db.commit()
+
+    async with _http_client(db_factory) as client:
+        r = await client.post(
+            "/api/v1/documents/doc_1/hit-test/one",
+            headers={"X-Role": "platform_admin", "X-User-Id": "usr_admin"},
+            json={
+                "question": "报销限额是多少",
+                "expected_chunk_hint": "单笔限额五千元",
+            },
+        )
+        assert r.status_code == 200
+        data = r.json()["data"]
+        assert data["hit"] is True
+        assert data["reason"] == "hit"
+
+        bad = await client.post(
+            "/api/v1/documents/doc_1/hit-test/one",
+            headers={"X-Role": "platform_admin", "X-User-Id": "usr_admin"},
+            json={
+                "question": "限额",
+                "expected_chunk_hint": "完全不存在的暗示词XYZ",
+            },
+        )
+        assert bad.status_code == 200
+        assert bad.json()["data"]["hit"] is False
+
+    async with db_factory() as db:
+        doc = await db.get(Document, "doc_1")
+        assert doc is not None
+        assert float(doc.hit_rate) == 0.6
+
+
+@pytest.mark.asyncio
 async def test_hit_test_miss_when_hint_wrong(db_factory) -> None:
     async with db_factory() as db:
         await _seed_ready_doc(db)

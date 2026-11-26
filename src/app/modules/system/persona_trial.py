@@ -52,11 +52,25 @@ async def run_persona_trial(
         raise ValueError("system_prompt max 4000 chars")
 
     system_text, used_persona = build_trial_system_prompt(candidate_prompt=system_prompt)
+    from app.modules.llm.model_resolve import (
+        ModelResolveError,
+        peek_system_default_model_name,
+        resolve_chat_model_name,
+    )
+
+    # 试聊走模型治理系统默认，禁止静默 MiniMax
+    try:
+        use_model = resolve_chat_model_name(None)
+    except ModelResolveError:
+        use_model = peek_system_default_model_name()
+    if not use_model:
+        raise ValueError("尚未配置系统默认模型，请在「模型治理」中启用并设为系统默认")
     reply = await chat_json(
         messages=[
             {"role": "system", "content": system_text},
             {"role": "user", "content": msg},
-        ]
+        ],
+        model=use_model,
     )
     return {
         "reply": str(reply or "").strip(),

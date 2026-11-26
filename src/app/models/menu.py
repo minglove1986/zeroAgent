@@ -47,6 +47,8 @@ BUILTIN_MENUS: tuple[tuple, ...] = (
     ("knowledge", "知识库", "BookOutlined", "/knowledge", "group.knowledge", 31, "admin"),
     ("workflows", "工作流", "BranchesOutlined", "/workflows", "group.knowledge", 32, "admin"),
     ("kg", "知识图谱", "NodeIndexOutlined", "/knowledge-graph", "group.knowledge", 33, "admin"),
+    ("knowledge.focus-terms", "检索专名", "TagOutlined",
+     "/knowledge/focus-terms", "group.knowledge", 36, "admin"),
     ("group.system", "系统治理", None, None, None, 40, "admin"),
     ("system.memory-fields", "记忆抽取白名单", "FilterOutlined",
      "/system/memory-fields", "group.system", 41, "admin"),

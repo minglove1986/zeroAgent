@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
   zeroAgent 一键重启前端：员工端 :3000 + 管理端 :3001。
@@ -247,16 +247,16 @@ function Wait-HttpReady {
 Write-Step "Repo: $RepoRoot"
 
 if ($SkipWeb -and $SkipAdmin) {
-    throw "SkipWeb 与 SkipAdmin 不能同时指定。"
+    throw "SkipWeb and SkipAdmin cannot both be set."
 }
 
 Write-Step "Stopping frontends..."
 if (-not $SkipWeb) {
-    Stop-NextByPath -Marker "zeroAgent\web\"
+    Stop-NextByPath -Marker 'zeroAgent\web\'
     Stop-ListenPort -Port $WebPort
 }
 if (-not $SkipAdmin) {
-    Stop-NextByPath -Marker "zeroAgent\admin-web\"
+    Stop-NextByPath -Marker 'zeroAgent\admin-web\'
     Stop-ListenPort -Port $AdminPort
 }
 Start-Sleep -Seconds 1

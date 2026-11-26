@@ -41,6 +41,8 @@ class TurnState(TypedDict, total=False):
     agent_id: str | None
     effective_agent_id: str
     user_content: str
+    user_content_original: str
+    rewrite: dict[str, Any]
     intent: dict[str, Any]
     route: dict[str, Any]
     dispatch: str

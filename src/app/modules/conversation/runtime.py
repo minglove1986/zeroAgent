@@ -151,6 +151,7 @@ def build_route_clarify_card(
         "intent_confirm",
         "agent_pick",
         "handle_or_ask",
+        "doc_pick",
     }:
         kind = slot_kind
     elif route_kind == "clarify_kb":
@@ -196,6 +197,33 @@ def build_route_clarify_card(
             {"id": "kb_lookup", "label": "是，去检索"},
             {"id": "chitchat", "label": "否，随便聊聊"},
         ]
+    elif kind == "doc_pick":
+        title = "要分析哪份文档？"
+        if candidates and any(
+            str(c.get("id") or "").startswith("doc:") for c in candidates
+        ):
+            body_md = (
+                f"找到多份可能相关的文档（关于「{query or '该主题'}」）。"
+                f"请选择要分析的文档（也可在下方用自己的话说明意图）："
+            )
+        else:
+            body_md = (
+                f"暂时找不到可直接分析的文档（关于「{query or '该主题'}」）。"
+                f"请选择下一步（也可在下方用自己的话说明意图）："
+            )
+        options = [
+            {
+                "id": str(c.get("id")),
+                "label": str(c.get("name") or c.get("id")),
+            }
+            for c in candidates
+            if c.get("id")
+        ]
+        if not options:
+            options = [
+                {"id": "kb_lookup", "label": "先去知识库找"},
+                {"id": "chitchat", "label": "随便聊聊"},
+            ]
     else:
         title = "请选择要使用的助手"
         body_md = "多个助手可能都适合，请选择其一继续（也可在下方用自己的话说明意图）："
@@ -246,6 +274,8 @@ def build_route_clarify_card(
                 "filters": slots.get("filters") or {},
                 "form": slots.get("form"),
                 "skill_id": slots.get("skill_id"),
+                "task": slots.get("task"),
+                "doc_candidates": slots.get("doc_candidates") or [],
                 "original_user_content": original,
                 "allow_free_intent": True,
             },
@@ -261,10 +291,6 @@ def should_trigger_ask_user(content: str) -> bool:
 def should_trigger_rag(content: str) -> bool:
     """兼容旧调用：意图漏斗判定为知识库检索。"""
     return evaluate_intent_funnel(content).intent == "kb_lookup"
-
-
-def rag_stub_has_citation(content: str) -> bool:
-    return "无引用" not in content
 
 
 def _looks_like_leaked_tool_call(text: str) -> bool:
@@ -545,10 +571,28 @@ async def _stream_via_turn_graph(
             else:
                 continue
             # 主图 memory_schedule 已调度；此处禁止二次 extract
+            # Plan-Execute 必须吃改写后的有效句（state.user_content），禁止闭包原句
+            handoff_state = dict((payload or {}).get("state") or {})
+            pe_user_content = str(
+                handoff_state.get("user_content") or user_content or ""
+            ).strip() or user_content
+            pe_original = str(
+                handoff_state.get("user_content_original") or user_content or ""
+            ).strip() or user_content
+            pe_model = str(
+                handoff_state.get("model") or model or ""
+            ).strip() or model
+            rewrite_meta = handoff_state.get("rewrite")
+            if isinstance(rewrite_meta, dict) and rewrite_meta:
+                meta = {
+                    **meta,
+                    "rewrite": dict(rewrite_meta),
+                    "user_content_original": pe_original,
+                }
             async for ev in _stream_plan_execute(
                 db,
                 conversation_id=conversation_id,
-                user_content=user_content,
+                user_content=pe_user_content,
                 user_id=user_id,
                 memory_access=memory_access,
                 allow_memory_write=allow_memory_write,
@@ -557,7 +601,7 @@ async def _stream_via_turn_graph(
                 department_ids=department_ids,
                 role_ids=role_ids,
                 is_platform_admin=is_platform_admin,
-                model=model,
+                model=pe_model,
                 skip_memory_extract=True,
                 enable_thinking=enable_thinking,
                 skip_understand_stage=True,
@@ -574,11 +618,15 @@ async def _stream_via_turn_graph(
             route_raw = dict(final_state.get("route") or {})
             answer = str(final_state.get("final_answer") or "")
             deferred = final_state.get("deferred_card")
+            # 澄清卡 / 落库展示用原句；检索 query 用有效句（route.query 已来自漏斗）
+            display_user = str(
+                final_state.get("user_content_original") or user_content or ""
+            ).strip() or user_content
             card_payload = None
             if isinstance(deferred, dict) and deferred.get("_build") == "route_clarify":
                 route = RouteDecision(
                     kind=route_raw.get("kind") or "clarify_kb",  # type: ignore[arg-type]
-                    query=str(route_raw.get("query") or user_content),
+                    query=str(route_raw.get("query") or final_state.get("user_content") or user_content),
                     confidence=float(route_raw.get("confidence") or 0),
                     layer=str(route_raw.get("layer") or ""),
                     reason=str(route_raw.get("reason") or ""),
@@ -587,7 +635,7 @@ async def _stream_via_turn_graph(
                     features=list(route_raw.get("features") or []),
                 )
                 card_payload = build_route_clarify_card(
-                    route, original_user_content=user_content
+                    route, original_user_content=display_user
                 )
             elif isinstance(deferred, dict) and deferred.get("_build") == "ask_form":
                 card_payload = ask_user_to_card_payload(mock_leave_ask_user_args())
@@ -1036,12 +1084,32 @@ async def _stream_plan_execute(
     used_rag = any(str(s.get("kind") or "") == "rag_search" for s in plan)
     citations = list(result.get("citations") or [])
 
-    if used_rag and not evaluate_rag_citation_gate(used_rag=True, citations=citations):
-        for item in iter_stage_leave("retrieve", ok=False):
-            yield item
-        notice = "本轮检索未产生有效引用，已拒绝展示最终答案（D14）。"
-        for ch in notice:
-            yield "content_delta", {"delta": ch}
+    gate_code = str(result.get("gate_code") or "")
+    if gate_code or (
+        used_rag and not evaluate_rag_citation_gate(used_rag=True, citations=citations)
+    ):
+        # 主路径：图内 Gate 已终态拒展（answer 即拒展文案，且无模型正文）。
+        # 兜底：图未拦住且已流出模型正文时仍按拒展落库，不得当作成功（无法撤回已发 delta）。
+        # 图内 Gate 已在 stream 阶段报过 retrieve 失败，此处仅兜底分支补报，避免重复 leave
+        if not gate_code:
+            for item in iter_stage_leave("retrieve", ok=False):
+                yield item
+        notice = (
+            str(result.get("answer") or "")
+            if gate_code
+            else "本轮检索未产生有效引用，已拒绝展示最终答案（D14）。"
+        ) or "本轮检索未产生有效引用，已拒绝展示最终答案（D14）。"
+        if content_streamed and not gate_code:
+            turn_trace(
+                "runtime",
+                "gate_leak",
+                conv=conversation_id,
+                user=user_id,
+                path="plan_execute",
+            )
+        elif not content_streamed:
+            for ch in notice:
+                yield "content_delta", {"delta": ch}
         msg_id, _ = await persist_assistant_and_card(
             db,
             conversation_id=conversation_id,
@@ -1055,12 +1123,12 @@ async def _stream_plan_execute(
             conv=conversation_id,
             user=user_id,
             path="plan_execute",
-            status="rejected_no_citation",
+            status=gate_code or "rejected_no_citation",
         )
         yield "message_end", {
             "message_id": msg_id,
-            "status": "rejected_no_citation",
-            "reason": "D14",
+            "status": gate_code or "rejected_no_citation",
+            "reason": "D14" if gate_code in ("", "rejected_no_citation") else gate_code,
             "path": "plan_execute",
         }
         return
@@ -1198,6 +1266,12 @@ async def stream_mock_reply(
         await refresh_lexicon_if_stale(db)
     except Exception:  # noqa: BLE001
         pass
+    try:
+        from app.modules.knowledge.focus_lexicon import refresh_if_stale as refresh_focus
+
+        await refresh_focus(db)
+    except Exception:  # noqa: BLE001
+        pass
 
     from app.core.config import get_settings
 
@@ -1209,6 +1283,18 @@ async def stream_mock_reply(
             if name:
                 primary = name
                 break
+    # model_ids 为空时按会话所选/系统默认解析，禁止静默 LITELLM_MODEL(MiniMax)
+    if not primary:
+        from app.modules.conversation.turn_model import resolve_turn_llm_model
+
+        primary = await resolve_turn_llm_model(
+            db,
+            conversation_id=conversation_id,
+            agent_id=agent_id,
+            explicit_model=None,
+        )
+        if primary:
+            model_ids = [primary]
 
     # —— Turn Main Graph 唯一入口（可 TURN_RUNTIME=legacy 回滚）——
     if str(getattr(settings, "turn_runtime", "langgraph") or "").lower() == "langgraph":
@@ -1908,7 +1994,13 @@ async def stream_after_card_action(
     # 自由意图优先：拼装后走 Turn Graph，并抑制本轮再澄清
     if intent_text and (
         clarify_kind
-        in {"kb_confirm", "intent_confirm", "agent_pick", "handle_or_ask"}
+        in {
+            "kb_confirm",
+            "intent_confirm",
+            "agent_pick",
+            "handle_or_ask",
+            "doc_pick",
+        }
         or str(card_payload.get("type") or "") == "route_clarify"
     ):
         original = str(
@@ -2123,57 +2215,82 @@ async def stream_after_card_action(
 
     if clarify_kind == "kb_confirm":
         if choice == "kb_lookup":
-            query = str(meta.get("query") or "").strip() or "（空查询）"
-            filters = meta.get("filters") if isinstance(meta.get("filters"), dict) else None
+            query = str(meta.get("query") or "").strip()
+            original = str(meta.get("original_user_content") or "").strip()
+            # 优先完整原问句检索；短 query（如「好友买」）作辅
+            lookup_query = original or query or "（空查询）"
+            filters = (
+                meta.get("filters") if isinstance(meta.get("filters"), dict) else None
+            )
             intent_meta = {
                 "intent": "kb_lookup",
                 "confidence": 1.0,
                 "funnel_layer": "L1",
-                "query": query,
+                "query": lookup_query,
                 "reason": "card_kb_confirm",
                 "features": ["card:kb_confirm"],
                 "path": "rag",
             }
-            citations: list[dict[str, Any]] = []
-            lookup = await run_kb_lookup(
+            from app.modules.conversation.handlers.kb_lookup import (
+                execute_system_kb_lookup,
+            )
+            from app.modules.conversation.route import RouteDecision
+
+            route = RouteDecision(
+                kind="kb_lookup",
+                query=lookup_query,
+                confidence=1.0,
+                layer="L1",
+                reason="card_kb_confirm",
+                handler="system",
+                slots={"filters": filters or {}},
+                features=["card:kb_confirm"],
+            )
+            result = await execute_system_kb_lookup(
                 db,
-                query=query,
-                agent_id=agent_id,
-                top_k=5,
                 user_id=user_id,
+                user_content=lookup_query,
+                route=route,
+                agent_id=agent_id,
                 department_ids=department_ids,
                 role_ids=role_ids,
                 is_platform_admin=is_platform_admin,
-                filters=filters,
+                model=primary,
             )
-            citations = list(lookup.get("citations") or [])
-            if not evaluate_rag_citation_gate(used_rag=True, citations=citations):
-                notice = "本轮检索未产生有效引用，已拒绝展示最终答案（D14）。"
-                for ch in notice:
+            citations = list(result.get("citations") or [])
+            answer = str(result.get("answer") or "")
+            turn_status = str(result.get("turn_status") or "completed")
+            turn_trace(
+                "card_kb_confirm",
+                "lookup_done",
+                user=user_id,
+                agent=agent_id,
+                query=lookup_query[:80],
+                cites=len(citations),
+                status=turn_status,
+            )
+            if turn_status in ("rejected_no_citation", "rejected_no_recall"):
+                for ch in answer:
                     yield "content_delta", {"delta": ch}
                 msg_id, _ = await persist_assistant_and_card(
                     db,
                     conversation_id=conversation_id,
-                    assistant_text=notice,
+                    assistant_text=answer,
                     card_payload=None,
                     meta=intent_meta,
                 )
                 yield "message_end", {
                     "message_id": msg_id,
                     **intent_meta,
-                    "status": "rejected_no_citation",
-                    "reason": "D14",
+                    "status": turn_status,
+                    "reason": str(result.get("reason") or ""),
                 }
                 return
             for c in citations:
                 yield "citation", c
-            snippets = [str(c.get("snippet") or "") for c in citations if c.get("snippet")]
-            answer = "根据知识库：" + (
-                "；".join(snippets[:3]) if snippets else "已找到相关条目。"
-            )
             for ch in answer:
                 yield "content_delta", {"delta": ch}
-            msgs = [{"role": "user", "content": query}]
+            msgs = [{"role": "user", "content": lookup_query}]
             usage = estimate_turn_usage(msgs, answer)
             ctx = _context_info(msgs, model_name=primary)
             meta_out = {**intent_meta, "usage": usage, "context": ctx}
@@ -2240,6 +2357,227 @@ async def stream_after_card_action(
             },
         )
         yield "message_end", {"message_id": msg_id, "status": "completed", "path": "chitchat"}
+        return
+
+    if clarify_kind == "doc_pick":
+        original = str(
+            meta.get("original_user_content") or meta.get("query") or ""
+        ).strip()
+        task = str(meta.get("task") or "summarize").strip() or "summarize"
+        query = str(meta.get("query") or original or "").strip() or "（空查询）"
+        choice_s = str(choice or "").strip()
+        doc_id = ""
+        if choice_s.startswith("doc:"):
+            doc_id = choice_s[4:].strip()
+        elif choice_s and choice_s not in {"kb_lookup", "chitchat"}:
+            # 兼容：选项 id 直接为 doc_id
+            doc_id = choice_s
+
+        if doc_id:
+            intent_meta = {
+                "intent": "doc_analyze",
+                "confidence": 1.0,
+                "funnel_layer": "L1",
+                "query": query,
+                "reason": "card_doc_pick",
+                "features": ["card:doc_pick"],
+                "path": "doc_analyze",
+                "doc_id": doc_id,
+                "task": task,
+            }
+            result = await run_doc_analyze(
+                db,
+                doc_id=doc_id,
+                task=task,  # type: ignore[arg-type]
+                query=query,
+                user_id=user_id,
+                model=primary,
+            )
+            if not result.get("ok"):
+                err = str(result.get("error") or "doc_analyze_failed")
+                notice = f"文档理解失败：{err}"
+                for ch in notice:
+                    yield "content_delta", {"delta": ch}
+                msg_id, _ = await persist_assistant_and_card(
+                    db,
+                    conversation_id=conversation_id,
+                    assistant_text=notice,
+                    card_payload=None,
+                    meta=intent_meta,
+                )
+                yield "message_end", {
+                    "message_id": msg_id,
+                    "status": "failed",
+                    "path": "doc_analyze",
+                    **intent_meta,
+                }
+                return
+            citations = list(result.get("citations") or [])
+            if not evaluate_rag_citation_gate(used_rag=True, citations=citations):
+                notice = "文档理解未产生有效引用，已拒绝展示最终答案（D14）。"
+                for ch in notice:
+                    yield "content_delta", {"delta": ch}
+                msg_id, _ = await persist_assistant_and_card(
+                    db,
+                    conversation_id=conversation_id,
+                    assistant_text=notice,
+                    card_payload=None,
+                    meta=intent_meta,
+                )
+                yield "message_end", {
+                    "message_id": msg_id,
+                    "status": "rejected_no_citation",
+                    "reason": "D14",
+                    **intent_meta,
+                }
+                return
+            for c in citations:
+                yield "citation", c
+            answer = str(result.get("answer") or result.get("content") or "").strip()
+            if not answer:
+                answer = "已完成文档分析。"
+            for ch in answer:
+                yield "content_delta", {"delta": ch}
+            msgs = [{"role": "user", "content": query}]
+            usage = estimate_turn_usage(msgs, answer)
+            ctx = _context_info(msgs, model_name=primary)
+            meta_out = {**intent_meta, "usage": usage, "context": ctx}
+            msg_id, _ = await persist_assistant_and_card(
+                db,
+                conversation_id=conversation_id,
+                assistant_text=answer,
+                card_payload=None,
+                meta=meta_out,
+            )
+            yield "message_end", {
+                "message_id": msg_id,
+                "status": "completed",
+                "path": "doc_analyze",
+                "usage": usage,
+                "context": ctx,
+                **intent_meta,
+            }
+            return
+
+        if choice_s == "kb_lookup":
+            filters = (
+                meta.get("filters") if isinstance(meta.get("filters"), dict) else None
+            )
+            intent_meta = {
+                "intent": "kb_lookup",
+                "confidence": 1.0,
+                "funnel_layer": "L1",
+                "query": query,
+                "reason": "card_doc_pick_kb",
+                "features": ["card:doc_pick"],
+                "path": "rag",
+            }
+            lookup = await run_kb_lookup(
+                db,
+                query=query,
+                agent_id=agent_id,
+                top_k=5,
+                user_id=user_id,
+                department_ids=department_ids,
+                role_ids=role_ids,
+                is_platform_admin=is_platform_admin,
+                filters=filters,
+            )
+            citations = list(lookup.get("citations") or [])
+            if not evaluate_rag_citation_gate(used_rag=True, citations=citations):
+                notice = "本轮检索未产生有效引用，已拒绝展示最终答案（D14）。"
+                for ch in notice:
+                    yield "content_delta", {"delta": ch}
+                msg_id, _ = await persist_assistant_and_card(
+                    db,
+                    conversation_id=conversation_id,
+                    assistant_text=notice,
+                    card_payload=None,
+                    meta=intent_meta,
+                )
+                yield "message_end", {
+                    "message_id": msg_id,
+                    **intent_meta,
+                    "status": "rejected_no_citation",
+                    "reason": "D14",
+                }
+                return
+            for c in citations:
+                yield "citation", c
+            snippets = [
+                str(c.get("snippet") or "") for c in citations if c.get("snippet")
+            ]
+            answer = "根据知识库：" + (
+                "；".join(snippets[:3]) if snippets else "已找到相关条目。"
+            )
+            for ch in answer:
+                yield "content_delta", {"delta": ch}
+            msgs = [{"role": "user", "content": query}]
+            usage = estimate_turn_usage(msgs, answer)
+            ctx = _context_info(msgs, model_name=primary)
+            meta_out = {**intent_meta, "usage": usage, "context": ctx}
+            msg_id, _ = await persist_assistant_and_card(
+                db,
+                conversation_id=conversation_id,
+                assistant_text=answer,
+                card_payload=None,
+                meta=meta_out,
+            )
+            yield "message_end", {
+                "message_id": msg_id,
+                "status": "completed",
+                "path": "rag",
+                "usage": usage,
+                "context": ctx,
+                **intent_meta,
+            }
+            return
+
+        # 随便聊聊 / 其它：原问题续答
+        if original:
+            from app.modules.conversation.turn_state import SYSTEM_AGENT_ID
+
+            async for ev in _stream_plan_execute(
+                db,
+                conversation_id=conversation_id,
+                user_content=original,
+                user_id=user_id,
+                memory_access="all",
+                allow_memory_write=True,
+                msg_meta={
+                    "intent": "chitchat",
+                    "funnel_layer": "L1",
+                    "reason": "card_doc_pick_chitchat",
+                    "features": ["card:doc_pick", "card:chitchat_resume"],
+                    "original_user_content": original,
+                },
+                agent_id=SYSTEM_AGENT_ID,
+                department_ids=department_ids,
+                role_ids=role_ids,
+                is_platform_admin=is_platform_admin,
+                model=primary,
+            ):
+                yield ev
+            return
+        text = "好的。有其他问题可以直接问我。"
+        for ch in text:
+            yield "content_delta", {"delta": ch}
+        msg_id, _ = await persist_assistant_and_card(
+            db,
+            conversation_id=conversation_id,
+            assistant_text=text,
+            card_payload=None,
+            meta={
+                "intent": "chitchat",
+                "funnel_layer": "L1",
+                "reason": "card_doc_pick_skip",
+            },
+        )
+        yield "message_end", {
+            "message_id": msg_id,
+            "status": "completed",
+            "path": "chitchat",
+        }
         return
 
     if clarify_kind == "agent_pick" and choice:

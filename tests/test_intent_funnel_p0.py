@@ -11,12 +11,12 @@ import pytest
 from app.modules.intent.funnel import evaluate_intent_funnel
 
 
-def test_natural_person_lookup_is_kb() -> None:
+def test_natural_person_lookup_defers_to_l3() -> None:
+    """「看看…是谁」等弱搜人口吻：L2 不短路（种子已清空 person_search_verb）。"""
     d = evaluate_intent_funnel("帮我看看唐亮是谁")
-    assert d.intent == "kb_lookup"
-    assert d.confidence >= 0.75
-    assert "唐亮" in d.query
-    assert d.funnel_layer == "L2"
+    assert d.intent == "chitchat"
+    assert d.funnel_layer == "L4"
+    assert d.confidence < 0.75
 
 
 def test_explicit_kb_prefix_still_works() -> None:

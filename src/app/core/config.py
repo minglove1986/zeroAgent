@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     # Docker 内 proxy 常为 http://litellm:4000，须单独设本机 http://127.0.0.1:4000
     litellm_ui_base_url: str = ""
     litellm_master_key: str = "sk-litellm-dev"
+    # 仅作环境占位/健康检查展示；业务补全禁止静默回落本字段，须走模型治理系统默认
     litellm_model: str = "MiniMax-M3"
     litellm_embed_model: str = "text-embedding-3-small"
 
@@ -44,11 +45,31 @@ class Settings(BaseSettings):
     embed_service_url: str = ""  # 例 http://127.0.0.1:8088
     rerank_service_url: str = ""
     embed_dim: int = 512  # 与 bge-small-zh-v1.5 对齐；Mock 仍用 16
-    kb_milvus_collection: str = "za_kb_chunks_v2"
+    kb_milvus_collection: str = "za_kb_chunks_v3"
+    # 向量不可用时的降级：MySQL 候选切块上限（避免全库加载）
+    kb_search_fallback_chunk_cap: int = 2000
     hybrid_rrf_k: int = 60
     hybrid_candidate_n: int = 50
+    # 检索低分丢弃：相对 top1 比例下限（0=关闭）；兼容 RRF / Rerank
+    kb_hit_score_relative_min: float = 0.55
+    # 绝对分下限（0=关闭）；Rerank 0~1 时可设 0.15~0.3，纯 RRF 建议保持 0
+    kb_hit_score_absolute_min: float = 0.0
     kb_chunk_size: int = 800
     kb_chunk_overlap: int = 100
+    # llamaindex | native；父子分块默认开源 HierarchicalNodeParser
+    kb_chunker_backend: str = "llamaindex"
+    # 默认偏粗，减轻子块过碎对检索的稀释；上传可按文档覆盖
+    kb_chunk_parent_size: int = 1500
+    kb_chunk_child_size: int = 500
+    kb_chunk_child_overlap: int = 80
+    # 确认切块时为父块生成摘要并参与检索（子块∪父摘要）
+    kb_parent_summary_enabled: bool = True
+    kb_parent_summary_max_chars: int = 150
+    # 确认后由 Celery 异步 LLM 生成父块摘要（禁止抽取式兜底）
+    # 文档 Metadata：规则优先，空字段经 LiteLLM 补全（失败不阻断入库）
+    kb_metadata_llm_enabled: bool = True
+    kb_metadata_llm_max_chars: int = 6000
+
     memory_summary_char_threshold: int = 12000
     memory_dedupe_threshold: float = 0.9
     memory_extract_idle_seconds: int = 180

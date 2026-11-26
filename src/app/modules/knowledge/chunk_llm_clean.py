@@ -23,17 +23,12 @@ from app.modules.knowledge.chunk_ops import (
     _get_document,
     _load_chunks,
 )
+from app.prompts.knowledge import CHUNK_CLEAN_SYSTEM
 
 logger = logging.getLogger(__name__)
 
 _NOISE_LINE_RE = re.compile(r"^[0-9a-fA-F]{8,}[A-Za-z0-9_-]+~~$")
 _CONTRACT_KEYWORDS = ("合同", "甲方", "乙方", "条款", "签约", "协议")
-
-_CLEAN_SYSTEM = (
-    "你是企业知识库文档清洗助手。删除明显非正文噪声（重复无意义串、抽取乱码），"
-    "禁止改写事实（姓名、金额、日期、条款编号、甲乙方、电话邮箱）。"
-    "只输出 JSON 数组，每项含 chunk_id 与 proposed（清洗后全文）。不要输出其它文字。"
-)
 
 
 def is_contract_like(doc: Document, schema_codes: list[str]) -> bool:
@@ -104,6 +99,8 @@ def _parse_clean_json(raw: str) -> dict[str, str]:
 
 async def _propose_for_chunks(
     rows: list[DocumentChunk],
+    *,
+    model: str | None = None,
 ) -> dict[str, str]:
     """为切块生成 proposed 文本；Mock 走规则桩，真环境走 LiteLLM。"""
     settings = get_settings()
@@ -111,6 +108,12 @@ async def _propose_for_chunks(
         return {row.id: _mock_clean_content(row.content or "") for row in rows}
 
     from app.modules.llm.gateway import chat_json
+    from app.modules.llm.model_resolve import peek_system_default_model_name
+
+    use_model = (model or "").strip() or peek_system_default_model_name()
+    if not use_model:
+        logger.warning("llm_clean: no system default model")
+        return {row.id: _mock_clean_content(row.content or "") for row in rows}
 
     payload_items = [
         {"chunk_id": row.id, "content": (row.content or "")[:8000]} for row in rows
@@ -118,12 +121,13 @@ async def _propose_for_chunks(
     try:
         raw = await chat_json(
             messages=[
-                {"role": "system", "content": _CLEAN_SYSTEM},
+                {"role": "system", "content": CHUNK_CLEAN_SYSTEM},
                 {
                     "role": "user",
                     "content": json.dumps(payload_items, ensure_ascii=False),
                 },
-            ]
+            ],
+            model=use_model,
         )
         parsed = _parse_clean_json(raw)
     except Exception:  # noqa: BLE001
@@ -193,7 +197,18 @@ async def llm_clean_chunks(
     if mode == "apply" and contract and not force_apply:
         raise ChunkStatusConflictError("合同类文档须 force_apply 才能应用 LLM 清理")
 
-    proposed_map = await _propose_for_chunks(target_rows)
+    from app.modules.llm.model_resolve import (
+        ModelResolveError,
+        resolve_system_default_model,
+    )
+
+    use_model: str | None = None
+    try:
+        use_model = await resolve_system_default_model(db)
+    except ModelResolveError:
+        logger.warning("llm_clean: no system default model document_id=%s", document_id)
+
+    proposed_map = await _propose_for_chunks(target_rows, model=use_model)
     items = [
         {
             "chunk_id": row.id,

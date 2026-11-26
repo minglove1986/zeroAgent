@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 import app.models  # noqa: F401
 from app.core.config import get_settings
-from app.modules.llm.catalog_models import SOURCE_ACTIVE, LlmModel
+from app.modules.llm.catalog_models import SOURCE_ACTIVE, SOURCE_INCOMPLETE, LlmModel
 from app.modules.llm import models_cache
 from app.shared.db import Base, get_db
 
@@ -125,6 +125,49 @@ async def test_patch_enable_and_refresh_cache(client) -> None:
         assert row is not None
         assert row.enabled == 1
         assert row.revision == 2
+
+
+@pytest.mark.asyncio
+async def test_patch_enable_when_incomplete_but_window_filled(client) -> None:
+    """已补 max_input_tokens 时，即使 source_status=incomplete 也应可启用并升为 active。
+
+    @author 赵振明
+    @date 2026-11-19 10:23:08
+    """
+    ac, factory = client
+    async with factory() as db:
+        db.add(
+            LlmModel(
+                id="llm_incomplete_filled",
+                model_name="spark-like",
+                display_name="spark-like",
+                max_input_tokens=1_000_000,
+                max_output_tokens=None,
+                enabled=0,
+                source_status=SOURCE_INCOMPLETE,
+                allow_system_chat=0,
+                is_system_default=0,
+                revision=3,
+            )
+        )
+        await db.commit()
+
+    resp = await ac.patch(
+        "/api/v1/admin/llm-models/llm_incomplete_filled",
+        headers=_ADMIN_HEADERS,
+        json={"enabled": True},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["enabled"] is True
+    assert data["source_status"] == SOURCE_ACTIVE
+    assert data["max_input_tokens"] == 1_000_000
+
+    async with factory() as db:
+        row = await db.get(LlmModel, "llm_incomplete_filled")
+        assert row is not None
+        assert row.enabled == 1
+        assert row.source_status == SOURCE_ACTIVE
 
 
 @pytest.mark.asyncio

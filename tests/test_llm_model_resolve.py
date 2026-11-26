@@ -149,10 +149,12 @@ async def test_resolve_rejects_missing_source(db_session: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolve_empty_catalog_falls_back_env(db_session: AsyncSession) -> None:
-    """目录为空时降级 LITELLM_MODEL，避免未同步时全站不可用。"""
-    resolved = await resolve_conversation_model(
-        db_session,
-        SimpleNamespace(agent_id=None, selected_model=None),
-    )
-    assert resolved.model_name == "env-default"
+async def test_resolve_empty_catalog_no_env_fallback(db_session: AsyncSession) -> None:
+    """目录为空时禁止回落 LITELLM_MODEL，须先完成模型治理同步。"""
+    from app.modules.llm.model_resolve import ModelResolveError
+
+    with pytest.raises(ModelResolveError):
+        await resolve_conversation_model(
+            db_session,
+            SimpleNamespace(agent_id=None, selected_model=None),
+        )

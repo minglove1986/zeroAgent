@@ -1,7 +1,7 @@
 /**
  * 控制台顶栏导航。
  * @author 赵振明
- * @date 2026-07-29 16:29:19
+ * @date 2026-11-20 14:22:56
  */
 "use client";
 
@@ -11,7 +11,6 @@ import { BrandMark } from "@/components/BrandMark";
 
 const LINKS = [
   { href: "/chat", label: "系统对话" },
-  { href: "/knowledge", label: "知识库上传" },
   { href: "/agents", label: "Agent/技能" },
   { href: "/prompts", label: "Prompt模板" },
   { href: "/memories", label: "我的记忆" },

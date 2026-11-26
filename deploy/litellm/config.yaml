@@ -17,6 +17,16 @@ model_list:
     litellm_params:
       model: openai/gpt-4o-mini
       api_key: os.environ/OPENAI_API_KEY
+  # 科大讯飞 MaaS（OpenAI 兼容；Chat 基址需带 /v2）
+  - model_name: spark-x2.6
+    litellm_params:
+      model: openai/spark-x2.6
+      api_key: os.environ/XFYUN_API_KEY
+      api_base: os.environ/XFYUN_API_BASE
+    model_info:
+      supports_reasoning: true
+      # 供 /model/info → 业务库同步；缺省会被标 incomplete
+      max_input_tokens: 1000000
 
 litellm_settings:
   drop_params: true

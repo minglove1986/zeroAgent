@@ -3,7 +3,7 @@
 仅由 LlmGateway 编排调用；业务禁止绕过。
 
 @author 赵振明
-@date 2026-07-30 12:09:46
+@date 2026-11-20 16:46:42
 """
 
 from __future__ import annotations
@@ -27,6 +27,90 @@ from app.modules.llm.litellm_sync import refresh_models_cache_from_db
 
 class ModelResolveError(ValueError):
     """模型不可用 / 不在白名单（对应业务 400）。"""
+
+
+def peek_system_default_model_name() -> str | None:
+    """同步：从模型治理热缓存取系统默认（启用 + 系统白名单）。
+
+    **禁止**回落 ``settings.litellm_model``（常为未开启的 MiniMax）。
+    缓存未就绪时返回 None，调用方应 ``resolve_system_default_model(db)`` 回填。
+
+    @author 赵振明
+    @date 2026-11-20 16:46:42
+    """
+    payload = models_cache.get_models_catalog() or {}
+    sys_def = payload.get("system_default")
+    if isinstance(sys_def, str) and sys_def.strip():
+        name = sys_def.strip()
+        info = _find_in_catalog(name)
+        if (
+            info
+            and info.get("enabled")
+            and info.get("allow_system_chat")
+            and str(info.get("source_status") or "") != SOURCE_MISSING
+        ):
+            return name
+    for item in _catalog_models():
+        if not isinstance(item, dict):
+            continue
+        if (
+            item.get("is_system_default")
+            and item.get("enabled")
+            and item.get("allow_system_chat")
+            and item.get("source_status") != SOURCE_MISSING
+        ):
+            name = str(item.get("model_name") or "").strip()
+            if name:
+                return name
+    for item in _catalog_models():
+        if not isinstance(item, dict):
+            continue
+        if (
+            item.get("enabled")
+            and item.get("allow_system_chat")
+            and item.get("source_status") != SOURCE_MISSING
+        ):
+            name = str(item.get("model_name") or "").strip()
+            if name:
+                return name
+    return None
+
+
+async def resolve_system_default_model(db: AsyncSession) -> str:
+    """异步：确保目录缓存后返回系统默认模型名。
+
+    @author 赵振明
+    @date 2026-11-20 16:46:42
+    """
+    await _ensure_catalog(db)
+    name = peek_system_default_model_name()
+    if not name:
+        raise ModelResolveError(
+            "尚未配置系统默认模型，请在「模型治理」中启用并设为系统默认"
+        )
+    return name
+
+
+def resolve_chat_model_name(explicit: str | None = None) -> str:
+    """补全/非流式默认模型：显式名 → 治理系统默认；禁止静默 MiniMax 环境变量。
+
+    MOCK_EXTERNAL 下无目录时允许用 litellm_model 占位（不发真实请求）。
+
+    @author 赵振明
+    @date 2026-11-20 16:46:42
+    """
+    named = (explicit or "").strip()
+    if named:
+        return named
+    settings = get_settings()
+    if settings.mock_external:
+        return (settings.litellm_model or "mock").strip() or "mock"
+    peeked = peek_system_default_model_name()
+    if peeked:
+        return peeked
+    raise ModelResolveError(
+        "尚未配置系统默认模型，请在「模型治理」中启用并设为系统默认"
+    )
 
 
 def _catalog_models() -> list[dict[str, Any]]:
@@ -142,22 +226,25 @@ async def resolve_conversation_model(
 
     目录非空时强制白名单校验；目录为空时降级旧链，避免未同步阻断对话。
     """
-    settings = get_settings()
     catalog = await _ensure_catalog(db)
     agent_id = getattr(conversation, "agent_id", None)
     selected = getattr(conversation, "selected_model", None)
     selected_name = selected.strip() if isinstance(selected, str) else ""
 
-    # 目录为空：兼容旧行为
+    # 目录为空：兼容旧行为（仍禁止静默未治理的环境默认）
     if not catalog:
         if selected_name:
             return ResolvedModel(model_name=selected_name, fallback_models=[])
         chain = await resolve_agent_model_chain(
             db, str(agent_id) if agent_id else None
         )
-        return ResolvedModel(
-            model_name=chain[0] if chain else settings.litellm_model,
-            fallback_models=list(chain[1:]) if chain else [],
+        if chain:
+            return ResolvedModel(
+                model_name=chain[0],
+                fallback_models=list(chain[1:]),
+            )
+        raise ModelResolveError(
+            "模型目录为空且无可用模型链，请先在「模型治理」同步并设置系统默认"
         )
 
     require_system = not bool(agent_id)
@@ -247,19 +334,9 @@ async def resolve_conversation_model(
                 default_name = str(item.get("model_name") or "")
                 break
     if not default_name:
-        # 最后降级环境变量（若也在目录则校验）
-        env_name = settings.litellm_model
-        info = _find_in_catalog(env_name)
-        if info is not None:
-            _assert_usable(info, model_name=env_name, require_system=True)
-            return ResolvedModel(
-                model_name=env_name,
-                fallback_models=[],
-                max_input_tokens=info.get("max_input_tokens"),
-                max_output_tokens=info.get("max_output_tokens"),
-            )
+        # 禁止回落 LITELLM_MODEL（常为未开启的 MiniMax）
         raise ModelResolveError(
-            "尚未配置系统对话可用模型，请联系管理员在「模型治理」中启用并加入系统白名单"
+            "尚未配置系统对话可用模型，请联系管理员在「模型治理」中启用并设为系统默认"
         )
 
     info = _find_in_catalog(default_name)
@@ -281,15 +358,7 @@ async def list_available_models(
     """员工端可选列表：系统白名单或 Agent 绑定且启用。"""
     catalog = await _ensure_catalog(db)
     if not catalog:
-        settings = get_settings()
-        return [
-            {
-                "model_name": settings.litellm_model,
-                "display_name": settings.litellm_model,
-                "enabled": True,
-                "supports_reasoning": False,
-            }
-        ]
+        return []
 
     if agent_id:
         allowed = set(await _agent_allowed_names(db, str(agent_id)))

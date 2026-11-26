@@ -1,7 +1,7 @@
 """从文档切块自动生成问答对。
 
 @author 赵振明
-@date 2026-07-23 13:44:30
+@date 2026-11-23 09:25:20
 """
 
 from __future__ import annotations
@@ -16,18 +16,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.models.knowledge import DocumentChunk
+from app.modules.knowledge.qa_hint_align import align_qa_items_to_corpus
+from app.prompts.knowledge import GENERATE_QA_SYSTEM
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_COUNT = 5
 _MAX_CONTEXT_CHARS = 12000
-
-_GENERATE_SYSTEM = (
-    "你是企业知识库评测助手。根据给定文档片段生成用于召回评测的问答对。"
-    "只输出 JSON 数组，每项含 question 与 expected_chunk_hint；"
-    "expected_chunk_hint 必须是原文中连续出现的短句（10～40字），"
-    "question 用中文、可被该短句回答。不要输出其它文字。"
-)
 
 
 def _mock_generate_from_chunks(chunks: list[str], *, count: int) -> list[dict[str, str]]:
@@ -95,13 +90,22 @@ async def generate_qa_pairs_for_document(
             .order_by(DocumentChunk.ordinal.asc())
         )
     ).scalars().all()
-    contents = [r.content for r in rows if r.content]
+    # 优先子块（与线上可检索单元一致）；无子块再退回全部正文
+    child_contents = [
+        r.content
+        for r in rows
+        if r.content and (getattr(r, "chunk_role", None) or "child") != "parent"
+    ]
+    all_contents = [r.content for r in rows if r.content]
+    contents = child_contents or all_contents
     if not contents:
         return []
 
     settings = get_settings()
     if settings.mock_external:
-        return _mock_generate_from_chunks(contents, count=count)
+        return align_qa_items_to_corpus(
+            _mock_generate_from_chunks(contents, count=count), contents
+        )
 
     buf: list[str] = []
     total = 0
@@ -114,16 +118,29 @@ async def generate_qa_pairs_for_document(
     context = "\n\n---\n\n".join(buf)
 
     from app.modules.llm.gateway import chat_json
+    from app.modules.llm.model_resolve import (
+        ModelResolveError,
+        resolve_system_default_model,
+    )
+
+    try:
+        use_model = await resolve_system_default_model(db)
+    except ModelResolveError:
+        logger.warning("generate_qa: no system default model document_id=%s", document_id)
+        use_model = None
+    if not use_model:
+        return _mock_generate_from_chunks(contents, count=count)
 
     try:
         raw = await chat_json(
             messages=[
-                {"role": "system", "content": _GENERATE_SYSTEM},
+                {"role": "system", "content": GENERATE_QA_SYSTEM},
                 {
                     "role": "user",
                     "content": f"请生成 {count} 条问答对。\n\n文档片段：\n{context}",
                 },
-            ]
+            ],
+            model=use_model,
         )
         items = _parse_qa_json(raw)
     except Exception:  # noqa: BLE001
@@ -137,4 +154,5 @@ async def generate_qa_pairs_for_document(
             if len(items) >= count:
                 break
             items.append(it)
-    return items[:count]
+    # 强制 hint 落在原文，避免反引号/改写导致命中率虚低
+    return align_qa_items_to_corpus(items[:count], contents)

@@ -85,12 +85,29 @@ class Document(Base):
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     metadata_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
     metadata_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 上传时选定的切块配置 JSON：mode/parent_size/child_size/overlap
+    chunk_config_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    current_version_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_by: Mapped[str] = mapped_column(String(32), nullable=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
+
+
+class DocumentVersion(Base):
+    """文档版本快照（oss_key + 标题）。"""
+
+    __tablename__ = "document_versions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    document_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    version_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    oss_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class DocumentQaPair(Base):
@@ -112,4 +129,11 @@ class DocumentChunk(Base):
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     embedding_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # parent|child；空/NULL 视为旧数据叶子（可检索）
+    chunk_role: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    parent_chunk_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # 父块摘要（确认切块时 LLM 生成；检索可命中，回答仍用 content）
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 检索核心 metadata（schema_version=1；同步 Milvus 标量）
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

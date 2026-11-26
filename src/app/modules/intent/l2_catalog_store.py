@@ -426,17 +426,37 @@ async def test_match(
     text: str,
     candidates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """服务端真实试跑，candidates 为空时使用当前缓存目录。"""
+    """服务端真实试跑，candidates 为空时使用当前缓存目录。
+
+    命中后过本地门槛（无会话文档上下文时文档类按未解析处理）。
+    """
     from app.modules.intent import rules as l2_rules
+    from app.modules.intent.gates import GateContext, apply_gates
     from app.modules.intent.l2_catalog_cache import (
         reset_l2_catalog_for_tests,
         set_catalog_in_redis,
         set_fallback_catalog,
     )
 
+    def _run(raw: str) -> dict[str, Any]:
+        decision = l2_rules.match_l2_rules(raw)
+        if decision is None:
+            return _format_test_result(None, text=raw)
+        gated = apply_gates(
+            decision,
+            GateContext(docs_resolved=False),
+            original_text=raw,
+        )
+        return _format_test_result(
+            gated.decision,
+            text=raw,
+            candidate=decision,
+            gate_action=gated.action,
+            gate_reason=gated.gate_reason,
+        )
+
     if not candidates:
-        decision = l2_rules.match_l2_rules(text)
-        return _format_test_result(decision)
+        return _run(text)
 
     tmp_catalog: dict[str, list[dict[str, Any]]] = {k: [] for k in DEFAULT_SEED}
     for item in candidates:
@@ -455,34 +475,78 @@ async def test_match(
     set_fallback_catalog(tmp_catalog)
     set_catalog_in_redis(tmp_catalog)
     try:
-        decision = l2_rules.match_l2_rules(text)
-        return _format_test_result(decision)
+        return _run(text)
     finally:
         set_fallback_catalog(prev_fallback)
         reset_l2_catalog_for_tests()
 
 
-def _format_test_result(decision: Any) -> dict[str, Any]:
-    if decision is None:
+def _format_test_result(
+    decision: Any,
+    *,
+    text: str = "",
+    candidate: Any = None,
+    gate_action: str | None = None,
+    gate_reason: str | None = None,
+) -> dict[str, Any]:
+    """格式化试跑结果（含门槛可见字段）。
+
+    @author 赵振明
+    @date 2026-09-09 15:59:12
+    """
+    if decision is None and candidate is None:
         return {
             "matched": False,
             "layer": None,
             "intent": None,
+            "confidence": None,
             "reason": "L2 未命中，将继续进入 L3",
             "match": None,
+            "gate_action": None,
+            "gate_reason": None,
+            "would_short_circuit": False,
+            "clarify_kind": None,
         }
-    features = list(getattr(decision, "features", []) or [])
-    reason = getattr(decision, "reason", None)
+    src = candidate if candidate is not None else decision
+    features = list(getattr(src, "features", []) or [])
+    reason = getattr(decision, "reason", None) if decision is not None else None
+    final_intent = getattr(decision, "intent", None) if decision is not None else None
+    slots = dict(getattr(decision, "slots", None) or {}) if decision else {}
+    clarify_kind = slots.get("clarify_kind")
+    would_sc = bool(
+        final_intent
+        and final_intent != "route_clarify"
+        and gate_action == "pass"
+    )
+    phrase_hint = None
+    for f in features:
+        if isinstance(f, str) and f.startswith("rule:"):
+            phrase_hint = f.split(":", 2)[-1]
+            break
     return {
         "matched": True,
-        "layer": getattr(decision, "funnel_layer", "L2"),
-        "intent": getattr(decision, "intent", None),
-        "reason": reason,
+        "layer": getattr(decision, "funnel_layer", None)
+        or getattr(src, "funnel_layer", "L2"),
+        "intent": final_intent,
+        "confidence": float(
+            getattr(decision, "confidence", None)
+            or getattr(src, "confidence", 0.0)
+            or 0.0
+        ),
+        "reason": reason or getattr(src, "reason", None),
         "match": {
-            "phrase": features[0].split(":", 1)[-1] if features else None,
-            "category": _category_from_reason(reason),
-            "confidence": float(getattr(decision, "confidence", 0.0) or 0.0),
+            "phrase": phrase_hint,
+            "category": _category_from_reason(
+                getattr(src, "reason", None)
+            ),
+            "confidence": float(getattr(src, "confidence", 0.0) or 0.0),
+            "candidate_intent": getattr(src, "intent", None),
         },
+        "gate_action": gate_action,
+        "gate_reason": gate_reason,
+        "would_short_circuit": would_sc,
+        "clarify_kind": clarify_kind,
+        "text": text,
     }
 
 

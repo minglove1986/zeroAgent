@@ -83,7 +83,8 @@ async def test_rag_without_citation_rejects_final_answer(client: AsyncClient) ->
     deltas = "".join(p.get("delta", "") for n, p in events if n == "content_delta")
     assert "报销" not in deltas or "无法展示" in deltas or "拒绝" in deltas or deltas == ""
     end = next(p for n, p in events if n == "message_end")
-    assert end["status"] == "rejected_no_citation"
+    # Phase A：空召回 → rejected_no_recall（有 hits 无 cite 才是 no_citation）
+    assert end["status"] in ("rejected_no_recall", "rejected_no_citation")
 
 
 @pytest.mark.asyncio

@@ -57,7 +57,12 @@ async def _extract_with_ephemeral_engine(
     @date 2026-08-03 11:53:00
     """
     settings = get_settings()
-    eng = create_async_engine(settings.database_url, pool_pre_ping=True)
+    # 与 shared/db 一致：禁用 aiomysql 下会触发 TypeError 的 pool_pre_ping（2026-11-19 09:59:21）
+    eng = create_async_engine(
+        settings.database_url,
+        pool_pre_ping=False,
+        pool_recycle=3600,
+    )
     session_factory = async_sessionmaker(
         eng, expire_on_commit=False, class_=AsyncSession
     )

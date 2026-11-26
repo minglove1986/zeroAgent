@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.models.memory import UserMemory
+from app.prompts.memory import MEMORY_EXTRACT_SYSTEM_HEAD_LINES
 
 # Redis 不可用时回落进程内缓存（单测 / 无 Redis）
 _LOCAL_SHORT: dict[str, list[dict[str, str]]] = {}
@@ -489,14 +490,7 @@ def _build_extract_system_prompt() -> str:
     from app.modules.memory.extract_catalog_cache import get_extract_fields_catalog
 
     fields = get_extract_fields_catalog()
-    lines = [
-        "你是用户记忆抽取器。只抽取下列白名单字段；禁止发明其它 memory_key。",
-        "只输出 JSON 数组，不要 Markdown。无信息输出 []。",
-        "每项字段：memory_type, memory_key, memory_value, confidence(0~1)。",
-        "memory_type 必须与字段 category 一致（fact|preference|summary）。",
-        "禁止抽取第三人名、知识库检索意图、纠正/否定话术。",
-        "允许字段：",
-    ]
+    lines = list(MEMORY_EXTRACT_SYSTEM_HEAD_LINES)
     for f in fields:
         lines.append(
             f"- {f.get('field_key')} ({f.get('category')}): {f.get('label')} — {f.get('description')}"

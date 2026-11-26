@@ -24,16 +24,14 @@ def test_sync_funnel_remains_l2_only() -> None:
     assert d.funnel_layer == "L4"
 
 
-def test_sync_l2_person_search_prefix() -> None:
-    """「搜一下/搜索下 + 人名」应 L2 直通知识库。"""
+def test_sync_l2_person_search_prefix_defers() -> None:
+    """搜人短动词已不入库；同步漏斗无 L3 时回落闲聊。"""
     d = evaluate_intent_funnel("搜一下赵世龙")
-    assert d.intent == "kb_lookup"
-    assert d.funnel_layer == "L2"
-    assert "赵世龙" in (d.query or "")
+    assert d.intent == "chitchat"
+    assert d.funnel_layer == "L4"
     d2 = evaluate_intent_funnel("搜索下高扬")
-    assert d2.intent == "kb_lookup"
-    assert d2.funnel_layer == "L2"
-    assert d2.query == "高扬"
+    assert d2.intent == "chitchat"
+    assert d2.funnel_layer == "L4"
 
 
 @pytest.mark.asyncio
@@ -48,12 +46,12 @@ async def test_async_l2_high_skips_l3(monkeypatch: pytest.MonkeyPatch) -> None:
         "app.modules.intent.funnel.classify_intent_l3",
         _boom,
     )
-    d = await evaluate_intent_funnel_async("帮我看看唐亮是谁")
+    d = await evaluate_intent_funnel_async("查知识库：唐亮是谁")
     assert d.intent == "kb_lookup"
     assert d.confidence >= TAU_HIGH
     assert d.funnel_layer == "L2"
     assert called["n"] == 0
-
+    assert "唐亮" in (d.query or "")
 
 @pytest.mark.asyncio
 async def test_async_l2_miss_uses_l3_mock(

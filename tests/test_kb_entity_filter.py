@@ -24,6 +24,14 @@ def test_extract_person_from_search_prefix() -> None:
     assert "高扬" in extract_focus_terms("高扬")
 
 
+def test_extract_project_name_from_query() -> None:
+    """「好友买项目」须抽出专名，避免简历「项目经验」串进 citation。"""
+    assert extract_focus_terms("搜索下好友买项目的文档") == ["好友买"]
+    assert "好友买" in extract_focus_terms("关于好友买项目你知道多少")
+    assert "好友买" in extract_focus_terms("好友买项目")
+    assert "搜索下好友买" not in extract_focus_terms("搜索下好友买项目的文档")
+
+
 def test_filter_keeps_only_docs_with_name() -> None:
     class Row:
         def __init__(self, document_id: str, content: str) -> None:
@@ -39,3 +47,23 @@ def test_filter_keeps_only_docs_with_name() -> None:
     kept = filter_chunks_by_focus_docs(rows, ["唐亮"])
     assert {r.document_id for r in kept} == {"doc_tl"}
     assert len(kept) == 2
+
+
+def test_filter_matches_document_title() -> None:
+    """专名只在标题时也应锁定文档，避免软回退捞简历。"""
+
+    class Row:
+        def __init__(self, document_id: str, content: str) -> None:
+            self.document_id = document_id
+            self.content = content
+
+    rows = [
+        Row("doc_audit", "hoolebuy-apis Flask 审计"),
+        Row("doc_cv", "项目介绍：公考小程序"),
+    ]
+    kept = filter_chunks_by_focus_docs(
+        rows,
+        ["好友买"],
+        title_by_doc={"doc_audit": "好友买代码审计", "doc_cv": "高扬 6年-前端.pdf"},
+    )
+    assert {r.document_id for r in kept} == {"doc_audit"}

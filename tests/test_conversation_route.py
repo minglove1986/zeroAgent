@@ -79,6 +79,13 @@ async def test_agent_bound_kb_route_skips_system_kb(monkeypatch):
     """绑 Agent 时 kb 路由不得走系统拼片段。"""
     from app.modules.conversation import runtime as rt
 
+    # 本用例验证 legacy resolve_route 路径；turn_graph 另测
+    monkeypatch.setenv("TURN_RUNTIME", "legacy")
+    monkeypatch.setenv("AGENT_RUNTIME", "langgraph")
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+
     monkeypatch.setattr(
         rt,
         "resolve_route",
@@ -115,12 +122,6 @@ async def test_agent_bound_kb_route_skips_system_kb(monkeypatch):
 
     monkeypatch.setattr(rt, "_stream_plan_execute", fake_plan)
     monkeypatch.setattr(rt, "run_kb_lookup", AsyncMock(side_effect=boom_kb))
-
-    from app.core.config import get_settings
-
-    get_settings.cache_clear()
-    monkeypatch.setenv("AGENT_RUNTIME", "langgraph")
-    get_settings.cache_clear()
 
     events: list[tuple[str, dict]] = []
     async for ev, data in rt.stream_mock_reply(
@@ -161,6 +162,10 @@ def test_build_recent_summary_truncates(monkeypatch):
 @pytest.mark.asyncio
 async def test_resolve_route_receives_recent_summary(monkeypatch):
     from app.modules.conversation import runtime as rt
+    from app.core.config import get_settings
+
+    monkeypatch.setenv("TURN_RUNTIME", "legacy")
+    get_settings.cache_clear()
 
     captured: dict = {}
 
@@ -228,3 +233,4 @@ async def test_resolve_route_receives_recent_summary(monkeypatch):
 
     assert captured["summary"] == "user:hi\nassistant:yo"
     assert captured["model"] == "agnes-2.5-flash"
+    get_settings.cache_clear()

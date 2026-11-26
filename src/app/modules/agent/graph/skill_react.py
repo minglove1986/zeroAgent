@@ -1,7 +1,7 @@
 """技能内 ReAct 小图：reason → act 循环，仅暴露当前技能原子工具。
 
 @author 赵振明
-@date 2026-07-27 09:12:46
+@date 2026-11-19 09:35:42
 """
 
 from __future__ import annotations
@@ -108,7 +108,7 @@ async def _node_reason(state: SkillReactState, config: RunnableConfig) -> dict[s
     tools = list(state.get("openai_tools") or [])
     llm_name = _runtime_ctx(config).get("llm_model")
     model = get_chat_model(model=str(llm_name) if llm_name else None).bind_tools(tools)
-    messages = list(state.get("messages") or [])
+    messages = list[BaseMessage](state.get("messages") or [])
     try:
         ai_msg = await model.ainvoke(messages)
     except Exception as exc:  # noqa: BLE001

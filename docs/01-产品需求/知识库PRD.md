@@ -119,7 +119,7 @@
 | 发布闸门（qa ≥5 + hit_rate ≥0.8） | `src/app/modules/knowledge/publish.py` |
 | LLM 清洗 suggest/apply（含合同保护） | `src/app/modules/knowledge/chunk_llm_clean.py` |
 | QA 自动生成（LLM + Mock 兜底） | `src/app/modules/knowledge/generate_qa.py` |
-| 文档分类种子 | `src/app/modules/knowledge/categories.py` |
+| 文档分类种子 + CRUD | `src/app/modules/knowledge/categories.py`（种子 insert-only；`POST/PATCH/DELETE /doc-categories`） |
 | 对话侧 kb_lookup（handlers + Turn Graph 子图） | `src/app/modules/conversation/handlers/kb_lookup.py`、`subgraphs/kb_lookup.py` |
 | API 路由（`/api/v1/knowledge-bases`、`/documents`、`/chunks`、`/qa-pairs`、`/hit-test`、`/generate-qa`、`/publish`、`/upload`、`/doc-categories`） | `src/app/api/v1/knowledge.py` |
 | Milvus 写入 best-effort + 集合 `za_kb_chunks_v2` | `src/app/modules/knowledge/kb_milvus.py` |
@@ -204,7 +204,7 @@
 
 #### `doc_categories`（沿用 + 后台化）
 
-不修改表结构，但**取消硬编码种子**——分类改为后台 CRUD，初始化时通过迁移脚本写入。
+不修改表结构。分类走后台 CRUD（管理端 `/knowledge/categories`）；进程启动/`ensure_seed_categories` **仅补缺、不覆盖**已有行（保护人工改名/启停）。
 
 ### 4.2 新增表
 
@@ -2026,7 +2026,7 @@ def expire_kb_documents():
 | **G5 admin-web 批量上传** | 部分失败可重试 | 🟡 规划中 | P1 |
 | **G6 admin-web 审计页** | 18 类事件筛选 + 详情 | 🟡 规划中 | P1 |
 | **G7 admin-web 缓存页** | 命中率 + 手动失效 | 🟡 规划中 | P1 |
-| **G8 admin-web 分类 CRUD** | 树形 CRUD；启用/停用 | 🟡 规划中 | P1 |
+| **G8 admin-web 分类 CRUD** | 树形 CRUD；启用/停用；删除保护 | 🟢 已实现 | P1 |
 | **G9 系统对话侧 kb_lookup** | Turn Graph 子图；流式 | 🟢 已实现 | P0 |
 | **G10 交互卡片** | ask_choice（澄清）/ ask_form（缺口）/ actions（重试/反馈） | 🟢 部分实现 | P0 |
 | **G11 引用展示** | title / snippet / 跳转原文 | 🟢 已实现 | P0 |

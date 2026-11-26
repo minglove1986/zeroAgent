@@ -16,6 +16,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from app.api.v1.router import api_router
 from app.core.config import get_settings
+from app.core.request_id import RequestIdMiddleware
 from app.modules.admin.dependencies import _AuthError, admin_auth_error_handler
 from app.core.permissions import AuthzError, authz_error_handler
 
@@ -158,6 +159,8 @@ def create_app() -> FastAPI:
         same_site="lax",
         https_only=False,
     )
+    # 最后 add → 最先执行：贯通 request.state / 响应体 / 审计 request_id
+    app.add_middleware(RequestIdMiddleware)
     app.add_exception_handler(_AuthError, admin_auth_error_handler)
     app.add_exception_handler(AuthzError, authz_error_handler)
     app.include_router(api_router)

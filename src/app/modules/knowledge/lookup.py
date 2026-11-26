@@ -13,11 +13,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import AgentKb
 from app.models.knowledge import Document, KnowledgeBase
-from app.modules.knowledge.permissions import list_accessible_kb_ids
+from app.modules.conversation.turn_trace import trace as turn_trace
 from app.modules.knowledge.retrieval_plan import (
     apply_category_fallback,
     apply_soft_fallback,
-    filter_documents_by_plan,
+)
+from app.modules.knowledge.scope import (
+    DEGRADE_DROP_CATEGORY,
+    DEGRADE_DROP_META,
+    DEGRADE_LEGACY_FULL,
+    RetrievalScope,
+    resolve_retrieval_scope,
 )
 from app.modules.knowledge.search import search_kb_chunks
 
@@ -122,63 +128,113 @@ async def run_kb_lookup(
 ) -> dict[str, Any]:
     """执行知识库检索并返回工具结果（含 citations）。
 
-    非管理员：Agent 范围 ∩ 用户有权 KB；无授权行的库不可搜。
-    platform_admin：跳过权限过滤。
-    filters：分类 / Metadata 预过滤；空集合时按 filter_fallback 降级。
+    核心逻辑：先 resolve_retrieval_scope（绑定 / 权限 / 过滤 / 可见性 / soft 降级），
+    再以 Scope 调 search_kb_chunks。scope.kb_ids 为空或 document_ids==[] 时直接返回
+    空 citations，不放宽为全库检索（宁空勿全文）；filter_fallback 原样透传给 resolve。
+
+    @author 赵振明
+    @date 2026-11-24 15:46:19
     """
     q = (query or "").strip()
-    allowed = await resolve_kb_ids_for_agent(db, agent_id)
-    if kb_ids:
-        wanted = {str(x) for x in kb_ids}
-        ids = [x for x in allowed if x in wanted]
-    else:
-        ids = list(allowed)
-
-    if not is_platform_admin:
-        if not user_id:
-            ids = []
-        else:
-            accessible = set(
-                await list_accessible_kb_ids(
-                    db,
-                    user_id=user_id,
-                    department_ids=list(department_ids or []),
-                    role_ids=list(role_ids or []),
-                )
-            )
-            ids = [x for x in ids if x in accessible]
-
-    if not q or not ids:
-        return {"ok": True, "citations": [], "query": q, "hit_count": 0}
-
-    doc_scope = await filter_documents_by_plan(db, kb_ids=ids, filters=filters)
-    used_filters = filters
-    if doc_scope is not None and len(doc_scope) == 0 and filter_fallback == "soft" and filters:
-        # 1) 放宽 metadata，保留分类
-        used_filters = apply_soft_fallback(filters)
-        doc_scope = await filter_documents_by_plan(db, kb_ids=ids, filters=used_filters)
-    if doc_scope is not None and len(doc_scope) == 0 and filter_fallback == "soft" and filters:
-        # 2) 分类也放宽（兼容未挂分类的旧文档）
-        used_filters = apply_category_fallback(filters)
-        doc_scope = await filter_documents_by_plan(db, kb_ids=ids, filters=used_filters)
-    if doc_scope is not None and len(doc_scope) == 0:
-        # 过滤后仍空：退回权限内全文检索（document_ids=None）
-        doc_scope = None
-        used_filters = None
-
-    hits = await search_kb_chunks(
-        db=db,
-        kb_ids=ids,
+    if not q:
+        # 空 query 无需解析范围（省 DB 往返）；filters 原样返回
+        return {
+            "ok": True,
+            "citations": [],
+            "hits": [],
+            "query": q,
+            "hit_count": 0,
+            "filters": filters,
+            "document_scope_count": None,
+            "degrade_level": "none",
+            "reason_codes": [],
+            "used_milvus": False,
+        }
+    scope = await resolve_retrieval_scope(
+        db,
         query=q,
-        top_k=top_k,
-        document_ids=doc_scope,
+        agent_id=agent_id,
+        kb_ids=kb_ids,
+        user_id=user_id,
+        department_ids=department_ids,
+        role_ids=role_ids,
+        is_platform_admin=is_platform_admin,
+        filters=filters,
+        filter_fallback=filter_fallback,
+    )
+
+    # 观测：范围解析结果（仅计数与码，不含 query 原文/密钥）
+    _trace_scope_resolved(scope, user_id=user_id)
+
+    if not scope.kb_ids or scope.document_ids == []:
+        return {
+            "ok": True,
+            "citations": [],
+            "hits": [],
+            "query": q,
+            "hit_count": 0,
+            "filters": _used_filters(filters, scope.degrade_level),
+            "document_scope_count": None if scope.document_ids is None else 0,
+            "degrade_level": scope.degrade_level,
+            "reason_codes": list(scope.reason_codes),
+            "used_milvus": False,
+        }
+
+    diag: dict[str, Any] = {}
+    hits = await search_kb_chunks(
+        db=db, scope=scope, query=q, top_k=top_k, diag=diag
     )
     citations = await hits_to_citations(db, hits)
     return {
         "ok": True,
         "citations": citations,
+        # 原始切块命中（citation 转换前），供 Gate 区分空召回与无引用
+        "hits": hits,
         "query": q,
-        "hit_count": len(citations),
-        "filters": used_filters,
-        "document_scope_count": None if doc_scope is None else len(doc_scope),
+        "hit_count": len(hits),
+        "filters": _used_filters(filters, scope.degrade_level),
+        "document_scope_count": (
+            None if scope.document_ids is None else len(scope.document_ids)
+        ),
+        "degrade_level": scope.degrade_level,
+        "reason_codes": list(scope.reason_codes),
+        "used_milvus": bool(diag.get("used_milvus")),
     }
+
+
+def _trace_scope_resolved(scope: RetrievalScope, *, user_id: str | None) -> None:
+    """输出 scope_resolved 观测：KB/文档范围规模、降级级别、原因码（Spec §7.3）。
+
+    @author 赵振明
+    @date 2026-11-24 16:24:34
+    """
+    turn_trace(
+        "kb_lookup",
+        "scope_resolved",
+        user=user_id,
+        kb_ids_count=len(scope.kb_ids),
+        document_scope_count=(
+            None if scope.document_ids is None else len(scope.document_ids)
+        ),
+        degrade_level=scope.degrade_level,
+        reason_codes=",".join(scope.reason_codes) or None,
+    )
+
+
+def _used_filters(
+    filters: dict[str, Any] | None, degrade_level: str
+) -> dict[str, Any] | None:
+    """按降级级别还原实际生效的 filters（供返回体展示）。
+
+    @author 赵振明
+    @date 2026-11-24 15:46:19
+    """
+    if not filters:
+        return filters
+    if degrade_level == DEGRADE_DROP_META:
+        return apply_soft_fallback(filters)
+    if degrade_level == DEGRADE_DROP_CATEGORY:
+        return apply_category_fallback(filters)
+    if degrade_level == DEGRADE_LEGACY_FULL:
+        return None
+    return filters

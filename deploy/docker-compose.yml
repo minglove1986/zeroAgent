@@ -95,6 +95,9 @@ services:
       MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
       MINIMAX_API_BASE: ${MINIMAX_API_BASE:-https://api.minimaxi.com/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      XFYUN_API_KEY: ${XFYUN_API_KEY:-}
+      # 官方 Chat：…/v2/chat/completions → OpenAI 兼容 api_base 为 …/v2
+      XFYUN_API_BASE: ${XFYUN_API_BASE:-https://maas-api.cn-huabei-1.xf-yun.com/v2}
     volumes:
       - ./litellm/config.yaml:/app/config.yaml:ro
     command: ["--config", "/app/config.yaml", "--port", "4000"]
@@ -102,7 +105,14 @@ services:
       litellm-db:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4000/health/liveliness"]
+      # 镜像无 wget；用 python 探活（此前 wget 缺失导致长期 unhealthy）
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=3)",
+        ]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -195,7 +205,16 @@ services:
       LITELLM_PROXY_URL: http://litellm:4000
       # 管理端「打开 LiteLLM 控制台」给浏览器用，须宿主机可达地址
       LITELLM_UI_BASE_URL: ${LITELLM_UI_BASE_URL:-http://127.0.0.1:4000}
+      # 注意：${MOCK_EXTERNAL} 优先吃「进程环境」；Agent/Cursor 壳常残留 true，会盖掉 .env
       MOCK_EXTERNAL: ${MOCK_EXTERNAL:-false}
+      # 容器内连 compose 服务名；宿主机本机开发仍可用 .env 的 127.0.0.1:19530
+      MILVUS_URI: http://milvus:19530
+      # .env 写 127.0.0.1:8088 仅适本机 uvicorn；容器内必须走服务名
+      EMBED_SERVICE_URL: http://embed-rerank:8088
+      RERANK_SERVICE_URL: http://embed-rerank:8088
+    # 本地对象镜像目录：宿主机上传与容器入库共用，避免 oss_missing
+    volumes:
+      - ../.data/oss:/app/.data/oss
     depends_on:
       mysql:
         condition: service_healthy
@@ -276,6 +295,11 @@ services:
       DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-zeroagent}:${MYSQL_PASSWORD:-zeropass}@mysql:3306/${MYSQL_DATABASE:-zeroagent}
       LITELLM_PROXY_URL: http://litellm:4000
       MOCK_EXTERNAL: ${MOCK_EXTERNAL:-false}
+      MILVUS_URI: http://milvus:19530
+      EMBED_SERVICE_URL: http://embed-rerank:8088
+      RERANK_SERVICE_URL: http://embed-rerank:8088
+    volumes:
+      - ../.data/oss:/app/.data/oss
     command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
     depends_on:
       rabbitmq:
@@ -299,6 +323,8 @@ services:
       DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-zeroagent}:${MYSQL_PASSWORD:-zeropass}@mysql:3306/${MYSQL_DATABASE:-zeroagent}
       LITELLM_PROXY_URL: http://litellm:4000
       MOCK_EXTERNAL: ${MOCK_EXTERNAL:-false}
+      EMBED_SERVICE_URL: http://embed-rerank:8088
+      RERANK_SERVICE_URL: http://embed-rerank:8088
     command: celery -A app.workers.celery_app beat --loglevel=info
     depends_on:
       rabbitmq:

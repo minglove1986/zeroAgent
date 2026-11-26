@@ -15,9 +15,19 @@ from app.modules.conversation.process_narration import (
     iter_stage_leave,
 )
 from app.modules.conversation.route import RouteDecision
+from app.modules.conversation.turn_trace import trace as turn_trace
 from app.modules.knowledge.lookup import parse_rag_query, run_kb_lookup
+from app.modules.knowledge.quality_gate import (
+    CODE_NO_CITATION,
+    CODE_NO_RECALL,
+    evaluate_retrieval_gate,
+)
 from app.modules.llm.tokens import estimate_turn_usage
 from app.modules.memory.service import append_short_memory
+from app.prompts.conversation import (
+    KB_LOOKUP_ANSWER_SYSTEM,
+    KB_LOOKUP_ANSWER_USER_TEMPLATE,
+)
 
 _SNIPPET_MAX = 120
 _MAX_CITES = 3
@@ -74,17 +84,14 @@ async def synthesize_kb_answer(
         messages=[
             {
                 "role": "system",
-                "content": (
-                    "你是企业内部助手。仅根据下列知识库引用作答，禁止编造。"
-                    "用简体中文，2～6 句，条理清晰。不要输出 JSON。"
-                ),
+                "content": KB_LOOKUP_ANSWER_SYSTEM,
             },
             {
                 "role": "user",
-                "content": (
-                    f"用户问题：{user_content}\n"
-                    f"检索词：{query}\n"
-                    f"引用：\n{cite_block}"
+                "content": KB_LOOKUP_ANSWER_USER_TEMPLATE.format(
+                    user_content=user_content,
+                    query=query,
+                    cite_block=cite_block,
                 ),
             },
         ],
@@ -116,10 +123,10 @@ async def execute_system_kb_lookup(
     @author 赵振明
     @date 2026-08-03 11:09:55
     """
-    from app.modules.conversation import runtime as rt
-
     citations: list[dict[str, Any]] = []
-    if db is not None and rt.rag_stub_has_citation(user_content):
+    hits: list[Any] = []
+    # 不再按用户文本（如「无引用」）短路；有 db 一律真实检索
+    if db is not None:
         lookup = await run_kb_lookup(
             db,
             query=route.query or parse_rag_query(user_content),
@@ -132,13 +139,25 @@ async def execute_system_kb_lookup(
             filters=(route.slots or {}).get("filters"),
         )
         citations = list(lookup.get("citations") or [])
+        # 用原始 hits 判定：有 hits 无 citations 才能走 D14 分支
+        hits = list(lookup.get("hits") or [])
 
-    if not rt.evaluate_rag_citation_gate(used_rag=True, citations=citations):
+    # Gate 必须先于合成 LLM：空召回/无引用不得调用 synthesize
+    gate = evaluate_retrieval_gate(hits=hits, citations=citations, used_rag=True)
+    if not gate.ok:
+        turn_trace(
+            "kb_lookup",
+            "gate_rejected",
+            user=user_id,
+            gate_code=gate.code,
+            hits=len(hits),
+            citations=len(citations),
+        )
         return {
-            "answer": "本轮检索未产生有效引用，已拒绝展示最终答案（D14）。",
+            "answer": gate.message,
             "citations": [],
-            "turn_status": "rejected_no_citation",
-            "reason": "D14",
+            "turn_status": gate.code,
+            "reason": "D14" if gate.code == CODE_NO_CITATION else "G1",
         }
 
     answer = await synthesize_kb_answer(
@@ -203,7 +222,7 @@ async def handle_system_kb_lookup(
     answer = str(result.get("answer") or "")
     turn_status = str(result.get("turn_status") or "completed")
 
-    if turn_status == "rejected_no_citation":
+    if turn_status in (CODE_NO_CITATION, CODE_NO_RECALL):
         for item in iter_stage_leave("retrieve", ok=False):
             yield item
         for ch in answer:
@@ -217,8 +236,8 @@ async def handle_system_kb_lookup(
         )
         yield "message_end", {
             "message_id": msg_id,
-            "status": "rejected_no_citation",
-            "reason": "D14",
+            "status": turn_status,
+            "reason": str(result.get("reason") or ""),
             **route_meta,
         }
         return

@@ -18,6 +18,16 @@ from app.core.config import get_settings
 from app.models.knowledge import Document, DocumentChunk
 from app.modules.llm.gateway import get_chat_model
 from app.modules.llm.tokens import estimate_tokens
+from app.prompts.knowledge import (
+    DOC_ANALYZE_SYSTEM_CRITIQUE,
+    DOC_ANALYZE_SYSTEM_DUMP,
+    DOC_ANALYZE_SYSTEM_SUMMARY,
+    DOC_ANALYZE_USER_HEAD,
+    DOC_ANALYZE_USER_QUERY_LINE,
+    DOC_ANALYZE_USER_TAIL_CRITIQUE,
+    DOC_ANALYZE_USER_TAIL_DUMP,
+    DOC_ANALYZE_USER_TAIL_SUMMARY,
+)
 
 TaskKind = Literal["dump", "summarize", "critique"]
 PathKind = Literal["dump", "single", "map_reduce"]
@@ -88,22 +98,24 @@ def _split_segments(text: str, *, max_tokens: int) -> list[str]:
 
 def _task_system_prompt(task: TaskKind) -> str:
     if task == "dump":
-        return "你是文档整理助手，输出原文要点拼接，不要编造未出现的信息。"
+        return DOC_ANALYZE_SYSTEM_DUMP
     if task == "critique":
-        return "你是文档审查助手，指出不合理、风险或矛盾之处，需基于原文。"
-    return "你是文档摘要助手，用简洁中文总结要点，不要编造未出现的信息。"
+        return DOC_ANALYZE_SYSTEM_CRITIQUE
+    return DOC_ANALYZE_SYSTEM_SUMMARY
 
 
 def _task_user_prompt(*, task: TaskKind, title: str, body: str, query: str) -> str:
     q = (query or "").strip()
-    head = f"文档标题：{title}\n任务：{task}\n"
+    head = DOC_ANALYZE_USER_HEAD.format(title=title, task=task)
     if q:
-        head += f"用户问题：{q}\n"
+        head += DOC_ANALYZE_USER_QUERY_LINE.format(query=q)
     if task == "dump":
-        return f"{head}\n请整理并输出以下文档正文（保持信息完整，可适度分段）：\n\n{body}"
-    if task == "critique":
-        return f"{head}\n请审查以下文档并指出问题：\n\n{body}"
-    return f"{head}\n请总结以下文档：\n\n{body}"
+        tail = DOC_ANALYZE_USER_TAIL_DUMP
+    elif task == "critique":
+        tail = DOC_ANALYZE_USER_TAIL_CRITIQUE
+    else:
+        tail = DOC_ANALYZE_USER_TAIL_SUMMARY
+    return head + tail.format(body=body)
 
 
 async def _llm_complete(

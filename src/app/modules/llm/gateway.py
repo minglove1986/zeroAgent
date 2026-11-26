@@ -3,11 +3,10 @@
 业务模块禁止直接 import ``app.modules.llm.client`` 的补全接口；
 ``client.py`` / ``lc_chat.py`` 仅供本门面内部委托。
 
-骨架阶段：resolve/list/sync 为薄实现（默认 LITELLM_MODEL）；
-完整白名单、目录同步与上下文打包在后续治理 Task 中替换。
+默认模型一律经模型治理系统默认解析，禁止静默 LITELLM_MODEL(MiniMax)。
 
 @author 赵振明
-@date 2026-07-30 11:15:53
+@date 2026-11-20 16:46:42
 """
 
 from __future__ import annotations
@@ -18,7 +17,6 @@ from typing import Any, AsyncIterator
 from langchain_core.language_models.chat_models import BaseChatModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import get_settings
 from app.modules.llm import client as _llm_client
 from app.modules.llm.lc_chat import get_chat_model as _get_chat_model
 
@@ -84,16 +82,22 @@ class LlmGateway:
         db: AsyncSession | None,
         conversation: Any,
     ) -> ResolvedModel:
-        """解析会话应用模型（白名单校验）；``db`` 为空时仅回落环境默认。"""
+        """解析会话应用模型（白名单校验）；``db`` 为空时用治理系统默认。"""
         if db is None:
-            settings = get_settings()
             selected = getattr(conversation, "selected_model", None)
             if isinstance(selected, str) and selected.strip():
                 return ResolvedModel(model_name=selected.strip(), fallback_models=[])
-            return ResolvedModel(
-                model_name=settings.litellm_model,
-                fallback_models=[],
+            from app.modules.llm.model_resolve import (
+                ModelResolveError,
+                peek_system_default_model_name,
             )
+
+            name = peek_system_default_model_name()
+            if not name:
+                raise ModelResolveError(
+                    "尚未配置系统默认模型，请在「模型治理」中启用并设为系统默认"
+                )
+            return ResolvedModel(model_name=name, fallback_models=[])
         from app.modules.llm.model_resolve import resolve_conversation_model
 
         return await resolve_conversation_model(db, conversation)
@@ -108,12 +112,8 @@ class LlmGateway:
         from app.modules.llm.catalog_models import SOURCE_MISSING
 
         catalog = models_cache.get_models_catalog()
-        settings = get_settings()
         if not catalog or not isinstance(catalog.get("models"), list):
-            name = settings.litellm_model
-            return [
-                ModelInfo(model_name=name, display_name=name, enabled=True)
-            ]
+            return []
 
         out: list[ModelInfo] = []
         for item in catalog["models"]:
@@ -136,11 +136,6 @@ class LlmGateway:
                     max_input_tokens=item.get("max_input_tokens"),
                 )
             )
-        if not out:
-            name = settings.litellm_model
-            return [
-                ModelInfo(model_name=name, display_name=name, enabled=True)
-            ]
         return out
 
     def pack_messages(

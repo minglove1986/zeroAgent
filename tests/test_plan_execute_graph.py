@@ -195,7 +195,11 @@ async def test_plan_execute_respond_step(db_factory) -> None:
 
 @pytest.mark.asyncio
 async def test_runtime_langgraph_flag(monkeypatch: pytest.MonkeyPatch, db_factory) -> None:
-    """AGENT_RUNTIME=langgraph 且有 agent → plan_execute；legacy → skill_fc。"""
+    """默认 Turn Graph → plan_execute；TURN_RUNTIME+AGENT_RUNTIME 均 legacy → skill_fc。
+
+    仅改 AGENT_RUNTIME 不够：turn_runtime 默认 langgraph 会先走 Turn Graph，
+    不会落到命令式 skill_fc 分支。
+    """
     monkeypatch.setenv("MOCK_EXTERNAL", "true")
     from app.core.config import get_settings
 
@@ -228,6 +232,7 @@ async def test_runtime_langgraph_flag(monkeypatch: pytest.MonkeyPatch, db_factor
         cid = conv.json()["data"]["id"]
 
         monkeypatch.setenv("AGENT_RUNTIME", "langgraph")
+        monkeypatch.setenv("TURN_RUNTIME", "langgraph")
         get_settings.cache_clear()
         resp_lg = await client.post(
             "/api/v1/messages/send",
@@ -244,6 +249,7 @@ async def test_runtime_langgraph_flag(monkeypatch: pytest.MonkeyPatch, db_factor
         cid2 = conv2.json()["data"]["id"]
 
         monkeypatch.setenv("AGENT_RUNTIME", "legacy")
+        monkeypatch.setenv("TURN_RUNTIME", "legacy")
         get_settings.cache_clear()
         resp_legacy = await client.post(
             "/api/v1/messages/send",

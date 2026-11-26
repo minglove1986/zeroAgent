@@ -352,7 +352,6 @@ async def test_kb_lookup_path_emits_retrieve_stages(monkeypatch):
         "app.modules.intent.lexicon.refresh_lexicon_if_stale",
         AsyncMock(return_value=None),
     )
-    monkeypatch.setattr(rt, "rag_stub_has_citation", lambda *_a, **_k: True)
     monkeypatch.setattr(
         "app.modules.conversation.handlers.kb_lookup.run_kb_lookup",
         AsyncMock(

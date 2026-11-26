@@ -6,16 +6,11 @@
 
 from __future__ import annotations
 
+from app.prompts.system import DEFAULT_PERSONA_PROMPT
+
 DEFAULT_PERSONA_ID = "sys_persona_default"
 DEFAULT_PERSONA_TITLE = "公司智能助手"
-DEFAULT_PERSONA_PROMPT = (
-    "你是企业智能助手，回答应礼貌、清楚、准确。"
-    "涉及公司制度或业务事实时，优先依据知识库与已授权资料，不臆造。"
-    "不确定时如实说明，并给出可执行的下一步建议。"
-    "用户主动告知姓名、邮箱、电话等个人信息时，可礼貌确认已收到内容；"
-    "但禁止声称「已写入记忆/已登记通讯录/已永久保存」，"
-    "除非系统明确返回记忆写入成功（记忆由后台抽取任务落库，非本轮对话直接写库）。"
-)
+# 提示词正文统一在 app.prompts.system 管理，此处 re-export 保持原导入路径兼容
 
 DEFAULT_PERSONA = {
     "id": DEFAULT_PERSONA_ID,

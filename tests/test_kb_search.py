@@ -155,9 +155,16 @@ async def test_search_milvus_hydrates_content_from_db(
 
     async with factory() as db:
         await _seed_two_chunks(db)
-        with patch(
-            "app.modules.knowledge.search._search_milvus_kb_chunks",
-            return_value=fake_milvus_hits,
+        with (
+            patch("app.modules.knowledge.search.milvus_enabled", return_value=True),
+            patch(
+                "app.modules.knowledge.search.embed_texts",
+                new=AsyncMock(return_value=[[0.1, 0.2]]),
+            ),
+            patch(
+                "app.modules.knowledge.search.search_kb_chunk_ids",
+                return_value=fake_milvus_hits,
+            ),
         ):
             hits = await search_kb_chunks(
                 db=db,
@@ -175,11 +182,12 @@ async def test_search_milvus_hydrates_content_from_db(
 
 
 @pytest.mark.asyncio
-async def test_search_milvus_failure_falls_back_local(
+async def test_search_milvus_exception_falls_back_local(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Milvus 异常属基础设施不可用：降级到受限 MySQL 候选 + 本地稠密/BM25。"""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("MOCK_EXTERNAL", "false")
+    monkeypatch.setenv("MOCK_EXTERNAL", "true")
     monkeypatch.setenv("MILVUS_URI", "http://127.0.0.1:19530")
     monkeypatch.delenv("RERANK_SERVICE_URL", raising=False)
     from app.core.config import get_settings
@@ -190,9 +198,12 @@ async def test_search_milvus_failure_falls_back_local(
 
     async with factory() as db:
         await _seed_two_chunks(db)
-        with patch(
-            "app.modules.knowledge.search._search_milvus_kb_chunks",
-            return_value=[],
+        with (
+            patch("app.modules.knowledge.search.milvus_enabled", return_value=True),
+            patch(
+                "app.modules.knowledge.search.search_kb_chunk_ids",
+                side_effect=ConnectionError("milvus down"),
+            ),
         ):
             hits = await search_kb_chunks(
                 db=db,
@@ -253,13 +264,20 @@ async def test_hybrid_bm25_lifts_keyword_chunk(
         )
         await db.commit()
 
-        # 稠密故意把通用块排第一；RRF 同分时靠 BM25 抬升专有词
-        async def fake_dense(**_kwargs):  # noqa: ANN001
-            return ["chk_generic", "chk_jargon"]
-
-        with patch(
-            "app.modules.knowledge.search._dense_rank_ids",
-            new=AsyncMock(side_effect=fake_dense),
+        # Milvus 稠密召回故意把通用块排第一；RRF 融合时靠 BM25 抬升专有词
+        with (
+            patch("app.modules.knowledge.search.milvus_enabled", return_value=True),
+            patch(
+                "app.modules.knowledge.search.embed_texts",
+                new=AsyncMock(return_value=[[0.1, 0.2]]),
+            ),
+            patch(
+                "app.modules.knowledge.search.search_kb_chunk_ids",
+                return_value=[
+                    {"chunk_id": "chk_generic", "document_id": "doc_g", "kb_id": "kb_1", "score": 0.9},
+                    {"chunk_id": "chk_jargon", "document_id": "doc_j", "kb_id": "kb_1", "score": 0.8},
+                ],
+            ),
         ):
             hits = await search_kb_chunks(
                 db=db,
@@ -294,12 +312,20 @@ async def test_rerank_reorders_candidates(
             return [{"index": 1, "score": 0.99}, {"index": 0, "score": 0.1}][:top_n]
 
         with (
+            patch("app.modules.knowledge.search.milvus_enabled", return_value=True),
             patch(
-                "app.modules.knowledge.search._dense_rank_ids",
-                new=AsyncMock(return_value=["chk_alpha001", "chk_beta002"]),
+                "app.modules.knowledge.search.embed_texts",
+                new=AsyncMock(return_value=[[0.1, 0.2]]),
             ),
             patch(
-                "app.modules.knowledge.search._bm25_rank_ids",
+                "app.modules.knowledge.search.search_kb_chunk_ids",
+                return_value=[
+                    {"chunk_id": "chk_alpha001", "document_id": "doc_a", "kb_id": "kb_1", "score": 0.9},
+                    {"chunk_id": "chk_beta002", "document_id": "doc_b", "kb_id": "kb_1", "score": 0.8},
+                ],
+            ),
+            patch(
+                "app.modules.knowledge.search._bm25_rank_ids_from_scores",
                 return_value=["chk_alpha001", "chk_beta002"],
             ),
             patch(

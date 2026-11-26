@@ -18,6 +18,7 @@ from app.api.v1 import (
     health,
     departments,
     intent_l2_keywords,
+    kb_focus_terms,
     knowledge,
     llm_models_admin,
     llm_models_public,
@@ -46,6 +47,7 @@ api_router.include_router(auth.router)
 api_router.include_router(sessions.router)
 api_router.include_router(departments.router)
 api_router.include_router(knowledge.router)
+api_router.include_router(kb_focus_terms.router)
 api_router.include_router(agents.router)
 api_router.include_router(messages.router)
 api_router.include_router(llm_models_public.router)
